@@ -1,0 +1,15 @@
+1. jwt = header + value + signature
+neu thay doi value giua chung -> thay doi thong tin ve user, authorize -> big problem
+
+2. cho day 1 gom 100 int, day 2 gom 99/100 int cua day 1, tim so con thieu trong day 2?
+-> tinh tong 2 day roi tru cho nhau de tim ra so con thieu
+-> *** nen tim cach giai quyet ma khong phu thuoc code truoc
+-> check contains trong hashset O(1) sẽ nhanh hơn nhiều so với list.contains O(N)
+
+3. spring cloud -> hoc them
+	Easiest practice: Download file from S3
+
+4. pros and con of websocket? compare with others message broker like kafka?
+
+5. after refactoring a query, how to check if the new query return the correct data?
+

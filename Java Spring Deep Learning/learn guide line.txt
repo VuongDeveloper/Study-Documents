@@ -1,0 +1,34 @@
+1. Spring Mail
+	Optimize for huge number of mails
+2. Messaging
+	WebSocket
+	Stomp protocol
+	Compare with other message brocker like Kafka, etc
+	* Step 11
+3. Spring Scheduler
+	Optimize when scale up
+4. Asynchronous
+	Spring Asynchronous
+	Asynchronous API
+5. Logging system
+	Optimize for easy debug on product environment, etc
+7. Design Pattern
+9. Spring Security
+10. Global transaction - Local transaction - Java Transaction API (JTA)
+11. Message brockers: Topic, consumer, ...
+12. CI/CD 
+13. AWS
+14. Cloud
+
+Finished:
+1. DI
+	Bean
+	Component
+	Dependency Injection
+2. Spring Data JPA
+	Native query, lazy loading
+	UUID for table id
+	Spring specification
+	Spring projection
+	QueryDSL
+	jOOQ

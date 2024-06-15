@@ -1,0 +1,56 @@
+***	Spring boot - Dependency Injection ***
+0. IoC - Inversion of Controll
+	a. Definition
+		. IoC is a process in which an object defines its dependencies without creating them. 
+		 -> This object delegates the job of constructing such dependencies to an IoC container.
+		
+		. Spring Bean:
+			A bean is an object that is instantiated, assembled, and otherwise managed by a Spring IoC container.
+			
+	b. Dependency Injection
+	* Objects use their dependent objects without a need to define or create them is called dependency injection
+		. Types:
+			Field injection
+			Constructor injection
+			Setter injection
+		. Differences:
+			. Field Injection:
+				. Use @Autowire at field
+				. Why should not use Field Injection?
+					. Null-safe?
+						-> if the dependencies are not created correctly, this may lead to NullPointerException at runtime
+						-> replace by constructor injection, dependencies must be provided for the constructor. This change runtime -> compile time exception
+					. Using the field injection, we are unable to create immutable classes.
+						-> Reason: 	Spring performs autowiring once the constructors have been called.
+									We need to instantiate the final fields when they’re declared or through the constructor.
+									-> it’s impossible to autowire the final fields using field injection.
+					. Single Responsibility Violation (need to explain)
+					. The use of field injection can result in circular dependencies going unnoticed
+					. Unit testing: if the field injection strategy fails, Mockito won’t report the failure.
+					
+			. Constructor Injection
+				. Use @Autowire at constructor
+				. Bean creation must be in order, e.g: If A depends on B, bean of type B will be created before A
+				. Injected bean will be injected to target via constructor
+				. Cant resolve circular dependency
+				
+			. Setter Injection
+				. Use @Autowire at setter
+				. Beans just are created, but not injected right away.
+				. The injection will occur while the setter methods are called
+					-> we can create a method bean, taking beans as parameters, doing the injection by calling setters
+						-> when this method bean is created, it will automatically take created bean of parameters, then do the injection
+						-> this only use for singleton design pattern, as if there is only one bean of each parameters' type
+								
+1. @Bean
+	. Method level annotation
+	. Indicate that a method produces a bean to be managed by the Spring IoC container
+	* How it works?
+		. Annotate method with @Bean 
+			-> register a bean definition within an ApplicationContext of the type specified as the method’s return value
+
+2. @Component
+	. Class level annotation
+	. Indicate that the annotated class is a component to be managed by Spring IoC container
+	. How it works? 
+		the same as @Bean

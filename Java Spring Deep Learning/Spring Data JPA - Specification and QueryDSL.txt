@@ -1,0 +1,79 @@
+1. JPA, Hibernate and Spring Data JPA
+*** None of them do create the connection with database, making connection is the work of JDBC
+	* JPA
+		JPA is a specification for object-relational mapping (ORM) in Java. 
+		It defines a set of concepts and APIs for managing relational data in Java applications. 
+		JPA itself is not a framework but a set of interfaces and annotations.
+		JPQL
+	* Hibernate
+		Hibernate is an ORM framework that implements the JPA specification but also provides additional features beyond the standard JPA functionality
+			. Criteria API and HQL
+	* Spring data JPA
+		Spring Data JPA is an abstraction layer that sits on top of JPA and ORM providers like Hibernate.
+		Introduces the concept of repositories, which are interfaces that provide CRUD operations without the need to write implementations.
+		JPQL, HQL, native SQL, or the QueryDSL framework.
+		
+*** Differences and How They Fit Together
+	* Level of Abstraction:
+		JPA: 
+			Specification level. Defines the standard for ORM in Java.
+		Hibernate: 
+			Implementation level. Provides a concrete implementation of JPA along with extra features.
+		Spring Data JPA: 
+			Abstraction and productivity level. Simplifies JPA-based data access with repositories and query methods.
+	* Usage:
+		JPA: 
+			Used when you want to stick to standard APIs and need flexibility to switch between different JPA providers.
+		Hibernate: 
+			Used when you need advanced ORM features and optimizations provided by Hibernate, either via its native API or as a JPA provider.
+		Spring Data JPA: 
+			Used in Spring applications to minimize boilerplate code and leverage Spring’s powerful features for dependency injection, transaction management, and more.
+	* Configuration and Integration:
+		JPA: 
+			Can be configured and used with or without Spring. Requires more boilerplate code for setup and operations.
+		Hibernate: 
+			Can be used standalone or as a JPA provider. Requires configuration but offers more advanced features.
+		Spring Data JPA: 
+			Requires Spring Framework. Simplifies configuration and reduces boilerplate through conventions and repository interfaces.
+
+2. Specification
+	* Purpose: It defines a specification as a predicate over an entity
+	* Implementation example:
+		* Create class to define Specification for any Entity
+		public CustomerSpecifications {
+		
+		  public static Specification<Customer> customerHasBirthday() {
+			return new Specification<Customer> {
+			  public Predicate toPredicate(Root<T> root, CriteriaQuery query, CriteriaBuilder cb) {
+				return cb.equal(root.get(Customer_.birthday), today);
+			  }
+			};
+		  }
+
+		  public static Specification<Customer> isLongTermCustomer() {
+			return new Specification<Customer> {
+			  public Predicate toPredicate(Root<T> root, CriteriaQuery query, CriteriaBuilder cb) {
+				return cb.lessThan(root.get(Customer_.createdAt), new LocalDate.minusYears(2));
+			  }
+			};
+		  }
+		}
+		
+		*Repository layer
+		public interface CustomerRepository extends JpaRepository<Customer>, JpaSpecificationExecutor<Customer> {
+		  // Your query methods here
+		}
+		
+3. QueryDSL
+	* Purpose: Create BooleanExpression as a predicate for entities without having to create Specification classes
+	* Requires: mvn repo of QueryDSL (jpa and apt), besides config in plugin
+	
+	
+4. jOOQ
+
+
+	
+5. How Hikari connection pooling works?
+	a. What is HikariCP?
+		. A JDBC DataSource implementation that provides a connection pooling mechanism
+		. Compared to other implementations, it promises to be lightweight and better performing.

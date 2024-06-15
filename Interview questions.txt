@@ -1,0 +1,105 @@
+1. The Four Pillars of Object-Oriented Programming
+	. Abstraction: To abstract something away means to hide away the implementation details inside something – sometimes a prototype, sometimes a function
+	. Encapsulation: private fields with getter and setter
+		. control over how data is accessed
+			e.g: normally, a setter maybe "this.value = value", but we can also "this.value = value * 2,...."
+		. read only or write only fields
+	. Inheritance: Inheritance lets one object acquire the properties and methods of another object
+	. Polymorphism: The real power of polymorphism is sharing behaviours, and allowing custom overrides. 
+		E.g: child object has all functions from parents, but can also override by its own behavior
+
+
+2. JPA, Hibernate and Spring Data JPA
+*** None of them do create the connection with database, making connection is the work of JDBC
+	* JPA
+		JPA is a specification for object-relational mapping (ORM) in Java. 
+		It defines a set of concepts and APIs for managing relational data in Java applications. 
+		JPA itself is not a framework but a set of interfaces and annotations.
+		JPQL
+	* Hibernate
+		Hibernate is an ORM framework that implements the JPA specification but also provides additional features beyond the standard JPA functionality
+			. Criteria API and HQL
+	* Spring data JPA
+		Spring Data JPA is an abstraction layer that sits on top of JPA and ORM providers like Hibernate.
+		Introduces the concept of repositories, which are interfaces that provide CRUD operations without the need to write implementations.
+		JPQL, HQL, native SQL, or the QueryDSL framework.
+		
+*** Differences and How They Fit Together
+	* Level of Abstraction:
+		JPA: 
+			Specification level. Defines the standard for ORM in Java.
+		Hibernate: 
+			Implementation level. Provides a concrete implementation of JPA along with extra features.
+		Spring Data JPA: 
+			Abstraction and productivity level. Simplifies JPA-based data access with repositories and query methods.
+	* Usage:
+		JPA: 
+			Used when you want to stick to standard APIs and need flexibility to switch between different JPA providers.
+		Hibernate: 
+			Used when you need advanced ORM features and optimizations provided by Hibernate, either via its native API or as a JPA provider.
+		Spring Data JPA: 
+			Used in Spring applications to minimize boilerplate code and leverage Spring’s powerful features for dependency injection, transaction management, and more.
+	* Configuration and Integration:
+		JPA: 
+			Can be configured and used with or without Spring. Requires more boilerplate code for setup and operations.
+		Hibernate: 
+			Can be used standalone or as a JPA provider. Requires configuration but offers more advanced features.
+		Spring Data JPA: 
+			Requires Spring Framework. Simplifies configuration and reduces boilerplate through conventions and repository interfaces.
+	
+3. JVM, JRE and JDK
+	* Java Virtual Machine (JVM) - The JVM is platform-independent, meaning the same Java program can run on different operating systems without modification, as long as the appropriate JVM is installed.
+		Purpose: 
+			The JVM is a runtime engine that executes Java bytecode. 
+			It allows Java applications to run on any device or operating system without modification, making Java a "write once, run anywhere" language.
+		Functionality:
+			Converts bytecode (compiled Java code) into machine-specific code.
+			Manages system memory and provides garbage collection.
+			Ensures security by running Java programs in a controlled environment.
+	* Java Runtime Environment (JRE) - The JRE is used by end-users who want to run Java applications on their computers but do not need to develop them.
+		Purpose: 
+			The JRE provides the libraries, Java Virtual Machine, and other components to run applications written in Java.
+		Components:
+			JVM: Executes the Java bytecode.
+			Core Libraries: Essential class libraries needed for running Java programs.
+			Support Files: Configuration files, properties files, etc.
+	* Java Development Kit (JDK) - write, compile, and debug Java programs. It includes everything in the JRE, plus tools for Java development.
+		Purpose: 
+			The JDK is a full-featured software development kit required for developing Java applications.
+		Components:
+			JRE: Includes the Java Runtime Environment to run Java applications.
+			Development Tools: Tools like javac (Java compiler), javadoc (documentation generator), jar (archiver), and other utilities necessary for Java development.
+			Additional Libraries and Files: Includes header files, source code, and additional libraries required for developing Java applications.
+	
+4. How Java do garbage collection
+	* Purpose:
+		free up memory occupied by unreachable objects, 
+		preventing memory leaks 
+		improving application performance
+	* Concept:
+		Heap Memory: 
+			memory for object, divided into young generation(Eden Space (for new object) & Survivor Spaces (S0 and S1)), old generation, metaspace (stores class metadata)
+		Stack Memory: 
+			Primitive data types (e.g., int, float) and object references (not the objects themselves).
+		Memory leaks: 
+			when a program inadvertently retains references to objects that are no longer needed -> gradual increase in memory usage
+	* How Garbage Collection Works
+		Allocation: 
+			Objects are allocated in the Eden space in the young generation.
+		Minor GC:
+			When Eden space fills up, a minor GC is triggered.
+			Live objects are moved to survivor spaces (S0 or S1).
+			Dead objects are collected.
+			After surviving several minor GCs, objects are promoted to the old generation.
+		Major/Full GC:
+			When the old generation fills up, a major GC is triggered.
+			Involves marking live objects, sweeping dead objects, and optionally compacting the heap.
+		Concurrent Phases (for CMS, G1, ZGC, Shenandoah):
+			Marking: Identify live objects.
+			Remarking: Fix any changes made during the marking phase.
+			Cleanup: Collect dead objects and reclaim memory.
+
+5. 	Bean, Component and DI
+6. 	Nguyên tắc của generic
+	Hashing collection
+	Mock profile
