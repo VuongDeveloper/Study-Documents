@@ -1,0 +1,57 @@
+1. Spring Scheduling
+	* References:
+		https://spring.io/guides/gs/scheduling-tasks
+		https://springframework.guru/scheduling-in-spring-boot/#:~:text=Add%20Spring%20Boot%20%40Scheduled%20annotation%20on%20the%20methods,ignored%29.%20The%20method%20should%20not%20expect%20any%20parameters.
+
+	* Type of scheduled tasks:
+		. Fixed rate:
+			@Scheduled(fixedRate = 10000)
+			Useful when tasks task is independent.
+		. Fixed delay: 
+			@Scheduled(fixedDelay = 10000)
+			Use this option when the previous execution has to be completed before running again.
+		. Cron Expression
+			@Scheduled(cron = "0 10 10 10 * ?")
+			
+	*** Cron Expression
+		https://crontab.cronhub.io/
+		
+2. Approaches for Synchronize Scheduled Tasks via multiple server Instances
+	a. Scheduler Lock (ShedLock)
+		* https://www.baeldung.com/shedlock-spring
+		. It’s worth noting that if a task is already underway on one node
+			-> ShedLock doesn’t make other nodes wait; instead, it gracefully skips execution on those nodes
+		. Configuration:
+			Step1: Add maven dependency (shedlock-spring)
+			Step2: Configuring Shedlock (ShedLock is compatible with any database platform supported by a JDBC driver.)
+				E.g: using JDBCTemplate 
+					. maven dependency: shedlock-provider-jdbc-template
+					. Create the lock data table:
+						CREATE TABLE shedlock(	name VARCHAR(64) NOT NULL, 
+												lock_until TIMESTAMP NOT NULL,
+												locked_at TIMESTAMP NOT NULL, 
+												locked_by VARCHAR(255) NOT NULL, 
+												PRIMARY KEY (name));
+					. config in application:
+						@Configuration
+						@EnableSchedulerLock(defaultLockAtLeastFor = CronConstant.SHEDLOCK_ATLEAST_MINS, defaultLockAtMostFor = CronConstant.SHEDLOCK_ATMOST_MINS)
+						public class LockConfig {
+							@Bean
+							public LockProvider lockProvider(@Qualifier(value = "webAppDataSource") DataSource dataSource) {
+								return new JdbcTemplateLockProvider(
+										JdbcTemplateLockProvider.Configuration.builder()
+											.withJdbcTemplate(new JdbcTemplate(dataSource))
+											.usingDbTime()
+											.withTableName(CronConstant.SHEDLOCK_TABLE)
+											.build());
+							}
+						}
+			Step3: Adding ShedLock to scheduled tasks
+				@ScheduleLock(name = "")
+					. only methods annotated with @SchedulerLock are locked
+					. you must specify a name for the lock, ensuring that only one task with the same name can execute simultaneously
+					. lockAtMostFor: must be configured in case a duration significantly longer than the normal
+						-> if not set, the default value?
+					. lockAtLeastFor: should be set in case the task run too fast
+					
+	b. 

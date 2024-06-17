@@ -1,0 +1,55 @@
+1. Tips for Optimize SQL Query
+	. Minimize the use of wildcard characters
+		The use of wildcard characters, such as % and _, in SQL queries, can slow down query performance.
+		E.g: 	SELECT * FROM customers WHERE last_name_city LIKE 'P%'
+			can be much slower than adding an index to the last_name_city column, and rewrite as below
+				SELECT * FROM customers WHERE last_name_city >= 'P' AND last_name < 'Q'
+				
+	. Increase Query Performance with Indexes
+		. Indexing is the process of mapping the values of one or more columns from a table to such a unique value 
+			-> makes it easy to search for the rows that match a certain value or range of values.
+		. To enhance SQL queries, you can create indexes on the columns that are frequently used in the WHERE, JOIN, and ORDER BY clauses
+		. However, creating too many indexes can slow down data modification operations such as INSERT, UPDATE, and DELETE.
+		-> Consider the trade-offs between read performance and write performance when deciding:
+			? which columns to index 
+			? which types of indexes to use.
+		
+	. Avoid subqueries
+		It is important to avoid subqueries whenever possible and to use JOINs or other techniques instead.
+	
+	. Use LIMIT or TOP to limit the number of rows returned
+		
+	. Use EXISTS instead of IN
+		Using IN can slow down query performance because it requires the database to perform a full table scan on the subquery
+		-> To optimize SQL queries, you can use the EXISTS operator instead of IN
+		E.g:	SELECT * FROM customers WHERE customer_id IN (SELECT customer_id FROM orders WHERE order_date >= DATEADD(day, -30, GETDATE()));
+			->	SELECT * FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id AND o.order_date >= DATEADD(day, -30, GETDATE()));
+		
+	. Use Exist() instead of Count() in case search whether the table has a specific record or not
+	
+	. Use WHERE Clause instead of HAVING
+		WHERE filters are recorded before groups are created
+		HAVING filters are recorded after the creation of groups
+		
+	. Avoid Queries inside a Loop
+		-> you will be able to insert and update data in bulk which is a far better approach as compared to queries inside a loop
+	
+	.  Use stored procedures
+	
+	. Optimize the database design
+		Optimizing the database design can also improve query performance. 
+		This includes:
+			ensuring that tables are properly normalized
+			indexes are used effectively
+			ensure that the database is properly tuned for the expected workload
+			ensure that db is configured for the appropriate level of concurrency.
+			
+	. Use query optimization tools & Monitor query performance
+		Some optimization tools:
+			Microsoft SQL Server Query Optimizer
+			Oracle SQL Developer
+			MySQL Query Optimizer,...
+		Some query performance monitoring tools:
+			SQL Server Profiler
+			Oracle Enterprise Manager
+			MySQL Enterprise Monitor,...

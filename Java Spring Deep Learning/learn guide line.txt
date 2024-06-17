@@ -5,8 +5,6 @@
 	Stomp protocol
 	Compare with other message brocker like Kafka, etc
 	* Step 11
-3. Spring Scheduler
-	Optimize when scale up
 4. Asynchronous
 	Spring Asynchronous
 	Asynchronous API
@@ -32,3 +30,6 @@ Finished:
 	Spring projection
 	QueryDSL
 	jOOQ
+3. Spring Scheduler
+	Optimize when scale up
+
