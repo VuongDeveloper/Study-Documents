@@ -1,0 +1,12 @@
+1. SOLID principle
+	Single Responsibility:
+		
+		
+	Open/Closed:
+		
+	Liskov’s Substitution:
+		
+	Interface Segregation:
+		
+	Dependency Inversion:
+		
