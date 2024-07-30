@@ -1,0 +1,6 @@
+1. SQL Index?
+	. A SQL index is a database structure that speeds up data retrieval operations by providing quick access to table rows
+	. It works like a book's index, allowing the database to find data without scanning the entire table.
+	
+2. Internal?
+	. 
