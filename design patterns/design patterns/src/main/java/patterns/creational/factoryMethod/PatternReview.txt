@@ -1,0 +1,26 @@
+0. What is Factory Method Patter for?
+    . Encapsulation of Object Creation: It encapsulates the object creation process,
+        -> allowing the code that uses the objects to remain unaware of the specific classes being instantiated1.
+    . Flexibility and Reusability:
+        -> By using this pattern, you can introduce new types of objects without changing the code that uses these objects.
+        -> This makes the code more flexible and easier to maintain2.
+    . Deferred Instantiation:
+        -> The pattern defers the instantiation of objects to subclasses, which can override the factory method to create specific types of objects.
+    . Example Use Case:
+        -> Imagine you have a vehicle manufacturing application.
+           Instead of creating vehicle objects directly, you define a factory method in a base class (e.g., VehicleFactory) and let subclasses (e.g., CarFactory, MotorcycleFactory) decide which specific vehicle to create
+1. What signals indicate to implement this pattern?
+    . Need for Flexibility:
+        -> When your code needs to be flexible and able to handle new types of objects without requiring changes to the existing codebase.
+    . Complex Object Creation:
+        -> When the process of creating an object is complex or involves multiple steps, and you want to encapsulate this complexity.
+    . Decoupling Code:
+        -> When you want to decouple the code that uses the objects from the code that creates the objects, promoting loose coupling and enhancing maintainability.
+    . Single Responsibility Principle:
+        -> When you want to adhere to the Single Responsibility Principle by separating the object creation logic from the business logic.
+    . Product Families:
+        -> When you have a family of related products that need to be instantiated, and you want to ensure that the correct product is created based on some criteria.
+    . Runtime Object Selection:
+        -> When the type of object to be created needs to be determined at runtime, rather than at compile time.
+    . Avoiding Direct Instantiation:
+        -> When you want to avoid direct instantiation of classes, which can make your code more modular and easier to test.
