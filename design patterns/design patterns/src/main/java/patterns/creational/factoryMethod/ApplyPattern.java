@@ -1,6 +1,6 @@
 package patterns.creational.factoryMethod;
 
-import patterns.creational.factoryMethod.ingredients.DevType;
+import patterns.constant.DevType;
 import patterns.creational.factoryMethod.ingredients.DeveloperFactory;
 
 public class ApplyPattern {

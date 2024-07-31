@@ -1,5 +1,7 @@
 package patterns.creational.factoryMethod.ingredients;
 
+import patterns.constant.DevType;
+
 public class DeveloperFactory {
     public static Developer getDeveloper(DevType devType) {
         return switch (devType) {

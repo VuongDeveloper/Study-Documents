@@ -1,0 +1,11 @@
+I personally can see that Abstract Factory pattern(AFP) is quite similar to Factory Method pattern(FMP).
+However, Abstract Factory pattern is in a higher level.
+In FMP, we can dynamically initiate an object between objects having some attribute in common.
+    E.g: in a factory A, we can dynamically initiate between object A1, A2, ...
+
+In AFP, we can dynamically initiate a factory of objects among factories having at least one common attribute.
+    E.g: in group of factories alphabet letters, we can:
+        -> dynamically initiate a factory: A, B, C
+            -> after initiating factory (A), we can apply FMP to initiate an object as required: A1, A2, A3
+
+To apply AFP, it requires a wise overview of the system, understand it and can group up objects and separate them into factories.
