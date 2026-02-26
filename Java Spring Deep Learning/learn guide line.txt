@@ -1,22 +1,46 @@
 1. Spring Mail
-	Optimize for huge number of mails
+	. Optimize for huge number of mails
+	. Use connection pooling and batching where possible.
+	. Consider cloud mail providers (SES, SendGrid, etc.) for large-scale delivery and reputation management.
+
 2. Messaging
-	WebSocket
-	Stomp protocol
-	Compare with other message brocker like Kafka, etc
-	* Step 11
+	. WebSocket
+	. STOMP protocol
+	. Compare with message brokers like Kafka, RabbitMQ, Pulsar (when to use which).
+	. In 2026 focus on:
+		. Spring for Apache Kafka / Spring AMQP.
+		. Exactly-once / at-least-once semantics and idempotent consumers.
+
 4. Asynchronous
-	Spring Asynchronous
-	Asynchronous API
-5. Logging system
-	Optimize for easy debug on product environment, etc
+	. Spring @Async for simple background tasks.
+	. Asynchronous API (CompletableFuture, Project Loom / virtual threads, reactive programming with WebFlux).
+
+5. Logging & Observability
+	. Structure logs (JSON) for easy parsing in tools like ELK, Loki, CloudWatch, etc.
+	. Correlate logs with trace IDs (Micrometer + OpenTelemetry).
+	. Optimize for easy debug on production environment.
+
 7. Design Pattern
+	. Apply SOLID, hexagonal/clean architecture, and domain-driven design where appropriate.
+	. Use Spring stereotypes (@Controller, @Service, @Repository) to reflect responsibilities.
+
 9. Spring Security
+	. Spring Security 6 / Boot 3.x (no WebSecurityConfigurerAdapter).
+	. JWT, OAuth2/OIDC, method security (@PreAuthorize).
+
 10. Global transaction - Local transaction - Java Transaction API (JTA)
-11. Message brockers: Topic, consumer, ...
+	. XA / distributed transactions vs saga/outbox patterns in microservices.
+
+11. Message brokers: Topic, consumer, ...
+	. Kafka, RabbitMQ, SNS/SQS (patterns: pub/sub, event sourcing, CQRS).
+
 12. CI/CD 
-13. AWS
-14. Cloud
+	. GitHub Actions / GitLab CI / Jenkins pipelines.
+	. Build once, promote through environments; blue‑green / canary deployments.
+
+13. AWS / Cloud
+	. ECS/EKS, RDS, S3, SQS/SNS, API Gateway.
+	. Use managed services where possible.
 
 Finished:
 1. DI
@@ -32,4 +56,3 @@ Finished:
 	jOOQ
 3. Spring Scheduler
 	Optimize when scale up
-

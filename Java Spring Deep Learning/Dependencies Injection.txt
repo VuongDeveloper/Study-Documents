@@ -54,3 +54,16 @@
 	. Indicate that the annotated class is a component to be managed by Spring IoC container
 	. How it works? 
 		the same as @Bean
+
+3. Modern Spring Boot DI (Spring 6 / Boot 3.x)
+	. Prefer constructor injection as the default
+		. In Boot 3.x you usually omit @Autowired on a single constructor; Spring injects it automatically.
+		. Works well with immutability and testing (dependencies are required at construction time).
+	. Avoid field injection in new code
+		. Harder to test, hides required dependencies, and prevents final fields.
+	. Use stereotype annotations for clarity
+		. @Component, @Service, @Repository, @Controller, @RestController, @Configuration.
+	. Configuration classes
+		. Use @Configuration + @Bean when you need full control, 3rd‑party beans, or conditional beans.
+	. Record and Lombok support
+		. Records and Lombok (@RequiredArgsConstructor, @AllArgsConstructor) work well with constructor injection.

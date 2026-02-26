@@ -1,6 +1,49 @@
-1. SQL Index?
-	. A SQL index is a database structure that speeds up data retrieval operations by providing quick access to table rows
+1. What is a SQL index?
+	. A SQL index is a separate data structure that speeds up data retrieval operations by providing quick access to table rows.
 	. It works like a book's index, allowing the database to find data without scanning the entire table.
-	
-2. Internal?
-	. 
+	. Most relational databases implement B-tree (or B+tree) indexes by default; some also support hash, GiST, GIN, BRIN, etc.
+
+2. Internal structure (B-tree index – high level)
+	. Leaf nodes
+		. Store the indexed key + a pointer to the actual table row (or the full row for clustered indexes).
+	. Non-leaf (internal) nodes
+		. Store key ranges and pointers to child nodes, used to navigate the tree.
+	. Lookup algorithm
+		. Use the key to traverse from root -> internal nodes -> leaf; complexity is O(log N).
+	. Clustered vs non-clustered
+		. Clustered index defines the physical ordering of rows (e.g. InnoDB primary key).
+		. Non-clustered (secondary) indexes store pointers back to the clustered index / heap.
+
+3. Types of indexes (relational DBs)
+	. Single-column index
+		. Index on one column; good when queries filter/sort on that column alone.
+	. Composite (multi-column) index
+		. Index on multiple columns, e.g. (status, created_at).
+		. Important: index order matters; (status, created_at) can help where status = ? and created_at >= ?, but not only created_at.
+	. Covering index
+		. Index that contains all columns needed by a query (filters + SELECT list).
+		. Allows index-only scans (no table lookup), which are usually much faster.
+	. Partial / filtered index (PostgreSQL, SQL Server)
+		. Index only a subset of rows, e.g. WHERE status = 'ACTIVE'.
+		. Reduces size and can speed up common queries on hot data.
+
+4. When to create an index
+	. Columns frequently used in WHERE, JOIN, ORDER BY, GROUP BY.
+	. Foreign key columns (for fast joins).
+	. Columns used in unique constraints (UNIQUE index).
+	. High-cardinality columns (many distinct values) usually benefit more than low-cardinality ones.
+
+5. When NOT to create / overuse indexes
+	. Very frequent INSERT/UPDATE/DELETE on the table
+		. Every index must be updated, which can slow down writes.
+	. Very low-cardinality columns (e.g. boolean flags) – often not selective enough.
+	. Columns that change very frequently (e.g. last_accessed_at updated on every request).
+	. Huge number of overlapping indexes
+		. Prefer fewer, well-designed composite indexes instead of many single-column indexes.
+
+6. Index usage patterns and best practices (2026)
+	. Avoid leading wildcards on indexed columns (e.g. LIKE '%abc') – cannot use B-tree index efficiently.
+	. Avoid wrapping indexed columns in functions in predicates (e.g. LOWER(col) = 'x') unless you have a function-based index.
+	. Prefer selective predicates first in composite indexes.
+	. Always inspect the execution plan (EXPLAIN, EXPLAIN ANALYZE) to verify that the index is actually used.
+	. Periodically review unused / rarely used indexes with DB-specific views (e.g. sys.dm_db_index_usage_stats in SQL Server, pg_stat_user_indexes in PostgreSQL).

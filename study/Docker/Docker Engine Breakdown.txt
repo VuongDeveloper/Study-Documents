@@ -1,0 +1,74 @@
+# Docker Components in 2026: Purposes and Naming
+
+**Date reference**: Early 2026 (Docker Engine ≈ v27–v29 releases, containerd ≈ v2.1–v2.2, runc ≈ v1.3.x)
+
+Docker today uses a layered, modular architecture. The **Docker daemon** is much thinner than in the past — most low-level work is delegated.
+
+## 1. Docker CLI
+- **Full name**: Docker Command-Line Interface
+- **Common short/binary name**: `docker`
+- **Purpose today**: User-facing tool. Sends commands (run, build, ps, images, compose up, etc.) via REST API to the Docker daemon (or — in daemonless mode — directly to other tools like containerd via nerdctl). Handles parsing, authentication to registries, output formatting.
+
+## 2. Docker Daemon
+- **Full name**: Docker Daemon
+- **Common short/binary name**: `dockerd`
+- **Purpose today**: Central API server & high-level orchestrator.
+  - Exposes the Docker Engine API (over unix socket `/var/run/docker.sock` or TCP).
+  - Manages Docker-specific higher-level objects: images (tagging, history, prune), volumes (create/mount/volume drivers), networks (create/drivers: bridge, overlay, macvlan), Swarm mode (if enabled), plugins, events, logging drivers.
+  - Orchestrates builds (delegates to BuildKit).
+  - Forwards container lifecycle requests (create/start/stop/...) to containerd.
+  - Still required for full Docker CLI compatibility, Compose, most IDE integrations, etc.
+
+## 3. containerd
+- **Full name**: Container Daemon (industry-standard high-level container runtime)
+- **Common short/binary name**: `containerd`
+- **Purpose today**: Core container runtime (handles almost the entire container lifecycle).
+  - Pulls/pushes images (distribution), unpacks/stores images (snapshotters: overlaybd, etc.).
+  - Manages full container lifecycle: create/start/stop/pause/kill/metrics.
+  - Executes storage, networking setup (via CNI plugins), supervision.
+  - Uses a **shim** process per container for re-parenting and daemon independence.
+  - Default runtime underneath dockerd since ~2017; also used standalone by Kubernetes, nerdctl, etc.
+
+## 4. containerd-shim (or containerd-shim-runc-v2)
+- **Full name**: containerd Runtime Shim (v2 is the modern/default one)
+- **Common short/binary name**: `containerd-shim-runc-v2` (or similar, e.g. `containerd-shim-*`)
+- **Purpose today**: Small, long-running per-container process.
+  - Acts as parent of the actual container process (prevents zombie processes if containerd restarts).
+  - Handles stdio forwarding, exit status reporting back to containerd.
+  - Provides exec/attach/resize without direct runc interaction.
+  - Enables daemonless-like behavior even when using containerd via dockerd.
+
+## 5. runc
+- **Full name**: OCI Runtime (reference implementation)
+- **Common short/binary name**: `runc`
+- **Purpose today**: Lowest-level OCI-compliant runtime.
+  - Creates actual OS-level isolation: Linux namespaces, cgroups (resource limits), capabilities, seccomp filters, mount points, pivot_root.
+  - Starts/stops the container entrypoint process (one-shot — runc exits immediately after start).
+  - Called by the shim (never directly by users in normal Docker usage).
+
+## 6. BuildKit
+- **Full name**: Moby BuildKit (modern build engine)
+- **Common short/binary name**: `buildkitd` (daemon), used via `docker buildx` or `docker build --builder=...`
+- **Purpose today**: High-performance, next-generation image builder (default in recent Docker).
+  - Handles `docker build`, multi-stage, multi-platform, cache imports/exports, secrets, SSH forwarding.
+  - Parallel execution, advanced garbage collection, Buildx integration.
+  - Can run standalone or embedded in dockerd/containerd.
+  - Much faster and more secure than the old builder.
+
+## 7. Other Notable Related Components
+| Component              | Full Name                          | Short Name       | Main Purpose (2026)                              |
+|------------------------|------------------------------------|------------------|--------------------------------------------------|
+| Docker Compose         | Docker Compose                     | `docker compose` / `docker-compose` | Multi-container app definition & orchestration (v2 uses BuildKit too) |
+| nerdctl                | nerd container tools               | `nerdctl`        | Docker-compatible CLI that talks directly to containerd (daemonless alternative) |
+| containerd image store | containerd Image Store             | (config flag)    | Newer backend in Docker Engine for multi-platform image support |
+| Storage drivers        | (overlay2, fuse-overlayfs, etc.)   | —                | Managed by containerd snapshotters now           |
+| Network drivers        | Bridge / Overlay / Macvlan / Host  | —                | Creation & management mostly in containerd now   |
+
+## Quick Summary – Call Chain for `docker run nginx`
+docker CLI  →  dockerd (API)  →  containerd  →  containerd-shim-runc-v2  →  runc  →  nginx process
+
+BuildKit handles builds → containerd handles image unpack → runc starts the build container.
+
+Modern Docker = **dockerd** (API & high-level) + **containerd** (core runtime) + **runc** (low-level executor) + **BuildKit** (builder).
+
+This modularity improves security, performance, and Kubernetes alignment — but the classic privileged `dockerd` remains the main difference vs fully daemonless tools like Podman.

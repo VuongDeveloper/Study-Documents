@@ -1,12 +1,27 @@
 1. SOLID principle
 	Single Responsibility:
-		
-		
+		Each class/module should have one reason to change.
+		. Focus one class on one responsibility (e.g. `OrderService` handles order use cases, `OrderRepository` handles persistence).
+		. In Spring: split controller, service, repository, mapper instead of one big class.
+
 	Open/Closed:
-		
+		Software entities should be open for extension, but closed for modification.
+		. Add new behavior via inheritance, composition, or strategy instead of editing existing, tested code.
+		. In Spring: use interfaces and strategy beans; add a new implementation and inject it instead of adding `if/else` chains.
+
 	Liskov’s Substitution:
-		
+		Subtypes must be substitutable for their base types without breaking correctness.
+		. A subclass should not strengthen preconditions or weaken postconditions.
+		. In Java: do not override a method and throw `UnsupportedOperationException` for valid base use cases.
+
 	Interface Segregation:
-		
+		Clients should not be forced to depend on methods they do not use.
+		. Prefer several small, focused interfaces over one “fat” interface.
+		. In Spring: define separate ports (interfaces) per use case instead of one giant `FooService` with many unrelated methods.
+
 	Dependency Inversion:
-		
+		High-level modules should not depend on low-level modules; both should depend on abstractions.
+		. Depend on interfaces/abstractions, not concrete implementations.
+		. In Spring (Boot 3 / Spring 6):
+			. Define interfaces for domain services/ports and inject them via constructor.
+			. Let Spring IoC wire concrete implementations; this keeps code testable and replaceable.

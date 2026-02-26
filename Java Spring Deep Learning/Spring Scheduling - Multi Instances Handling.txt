@@ -47,11 +47,16 @@
 							}
 						}
 			Step3: Adding ShedLock to scheduled tasks
-				@ScheduleLock(name = "")
-					. only methods annotated with @SchedulerLock are locked
-					. you must specify a name for the lock, ensuring that only one task with the same name can execute simultaneously
-					. lockAtMostFor: must be configured in case a duration significantly longer than the normal
-						-> if not set, the default value?
-					. lockAtLeastFor: should be set in case the task run too fast
+				@SchedulerLock(name = "someMeaningfulJobName")
+					. Only methods annotated with @SchedulerLock are locked.
+					. You must specify a name for the lock, ensuring that only one task with the same name can execute simultaneously.
+					. lockAtMostFor: configure a duration significantly longer than the normal run time, to protect against node crashes.
+					. lockAtLeastFor: configure a minimum lock time to avoid tasks running too frequently when they are very fast.
 					
-	b. 
+	b. Single scheduler instance / external schedulers
+		. Run the scheduled job on a single dedicated instance (e.g. separate worker, cron VM, or Kubernetes CronJob).
+		. Other application instances do not enable @Scheduled for that job (e.g. via profile / feature flag).
+		. Alternatives:
+			. Use a clustered scheduler like Quartz with DB-backed job store and clustering enabled.
+			. Use an external orchestrator (Kubernetes CronJob, AWS EventBridge, CloudWatch, etc.) to trigger work via HTTP or a message queue.
+		. This offloads timing & locking responsibilities from your application nodes and simplifies scaling.
