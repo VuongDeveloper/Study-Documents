@@ -1,0 +1,340 @@
+Non-Relational Databases – Intro and Java Perspective
+
+1. Java, objects, and relational vs NoSQL
+
+- Java is an object‑oriented, class-based, statically typed language.
+- You define classes (e.g., User, Order) with pre‑defined fields and types.
+- Relational databases also have pre‑defined schemas: tables, columns, types, constraints. This maps nicely to Java classes; hence tools like JPA/Hibernate, Spring Data JPA.
+- But this does not mean Java is “only suitable” for relational databases:
+  - Java works very well with NoSQL systems too: MongoDB, Cassandra, Redis, Elasticsearch, etc.
+  - In NoSQL, the database may not enforce schema strictly; instead, you often enforce it in your application code (Java classes, DTOs, validation).
+
+Conclusion:
+Java is not tied to relational databases. Its object model can represent data for both relational and non‑relational databases.
+
+2. Java objects with a NoSQL system (MongoDB example)
+
+Example MongoDB users document:
+
+{
+  "_id": "64f5b3e8c1234567890abcd1",
+  "username": "alice",
+  "email": "alice@example.com",
+  "age": 25,
+  "roles": ["USER", "ADMIN"],
+  "address": {
+    "city": "Hanoi",
+    "country": "Vietnam"
+  }
+}
+
+Typical Java class with Spring Data MongoDB:
+
+@Document(collection = "users")
+public class User {
+
+    @Id
+    private String id;          // maps to MongoDB _id
+
+    private String username;
+    private String email;
+    private Integer age;
+    private List<String> roles;
+    private Address address;    // nested document
+
+    public static class Address {
+        private String city;
+        private String country;
+
+        public String getCity() { return city; }
+        public void setCity(String city) { this.city = city; }
+
+        public String getCountry() { return country; }
+        public void setCountry(String country) { this.country = country; }
+    }
+
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+
+    public Integer getAge() { return age; }
+    public void setAge(Integer age) { this.age = age; }
+
+    public List<String> getRoles() { return roles; }
+    public void setRoles(List<String> roles) { this.roles = roles; }
+
+    public Address getAddress() { return address; }
+    public void setAddress(Address address) { this.address = address; }
+}
+
+Repository:
+
+public interface UserRepository extends MongoRepository<User, String> {
+    List<User> findByUsername(String username);
+    List<User> findByAgeGreaterThan(int age);
+}
+
+Even though MongoDB is schemaless, you define a schema in Java via your class.
+The DB doesn’t enforce it; your code does.
+
+3. Handling flexible / dynamic fields in Java with NoSQL
+
+A common reason to choose NoSQL (like MongoDB) is schema flexibility:
+- Different user documents can have different fields.
+- New fields can appear over time without ALTER TABLE, migrations, etc.
+
+Java can handle this flexibility in multiple ways:
+
+3.1 Map only the fields you care about
+
+Document:
+
+{
+  "_id": "u1",
+  "username": "alice",
+  "email": "alice@example.com",
+  "age": 25,
+  "favorite_color": "blue",
+  "twitter": "@alice",
+  "whatever_new_field": "..."
+}
+
+Java class:
+
+@Document(collection = "users")
+public class User {
+
+    @Id
+    private String id;
+
+    private String username;
+    private String email;
+    private Integer age;
+
+    // no fields for favorite_color, twitter, whatever_new_field
+
+    // getters/setters...
+}
+
+- Unknown fields are simply ignored by the mapper.
+- You still store them in MongoDB, but your Java model only cares about the subset it knows.
+
+3.2 Capture extra fields into a Map (semi‑structured)
+
+@Document(collection = "users")
+public class User {
+
+    @Id
+    private String id;
+
+    private String username;
+    private String email;
+
+    // dynamic fields
+    private Map<String, Object> attributes = new HashMap<>();
+
+    public Map<String, Object> getAttributes() {
+        return attributes;
+    }
+
+    public void setAttributes(Map<String, Object> attributes) {
+        this.attributes = attributes;
+    }
+
+    // getters/setters for id, username, email...
+}
+
+Example document:
+
+{
+  "_id": "u1",
+  "username": "alice",
+  "email": "alice@example.com",
+  "attributes": {
+    "favorite_color": "blue",
+    "twitter": "@alice",
+    "vip": true,
+    "login_count": 123
+  }
+}
+
+You get type safety for core fields (username, email) and flexibility in attributes.
+
+3.3 Fully dynamic structures (Document, JsonNode, etc.)
+
+You can represent the whole thing as dynamic JSON:
+
+@MongoDocument(collection = "users")
+public class UserDocument {
+
+    @Id
+    private String id;
+
+    private Document data;  // fully dynamic structure
+
+    // getters/setters...
+}
+
+Then you manipulate data like a JSON/BSON tree.
+
+4. Is Elasticsearch also NoSQL? Types of NoSQL databases
+
+Elasticsearch is generally considered part of the NoSQL family, more specifically:
+- A distributed search and analytics engine.
+- Stores data as JSON documents, with powerful full‑text search and aggregations.
+
+Main NoSQL categories:
+
+4.1 Key–value stores
+- Examples: Redis, Amazon DynamoDB (in key–value mode), Riak.
+- Model: key -> value where value is opaque (string, blob, JSON, etc.).
+- Use cases: Caching, session storage, feature flags, ultra‑fast lookups.
+- Schema: No DDL; schema is in your application code.
+
+4.2 Document stores
+- Examples: MongoDB, Couchbase, CouchDB. (Elasticsearch also stores JSON documents, but is optimized for search.)
+- Model: Collections of JSON-like documents; each document can have different fields.
+- Queries: Rich queries on document fields, indexing of fields.
+- Use cases: Flexible schemas, API backends, content, events.
+
+4.3 Wide-column / column-family stores
+- Examples: Cassandra, HBase, ScyllaDB.
+- Model: Keyspaces → tables → rows with dynamic columns.
+- Queries: Fast for designed access patterns based on partition keys.
+- Use cases: Time-series, telemetry, IoT, large append-only workloads.
+- Schema: There is DDL (CQL in Cassandra), but fewer constraints, no joins.
+
+4.4 Graph databases
+- Examples: Neo4j, JanusGraph, Amazon Neptune.
+- Model: Nodes and relationships with properties.
+- Queries: Graph traversals (friends-of-friends, shortest paths).
+- Use cases: Social graphs, recommendations, fraud detection.
+
+4.5 Search / analytics engines (Elasticsearch, OpenSearch, Solr)
+- Model: Indexes of documents, inverted indexes for text search.
+- Queries: Full‑text search, filters, aggregations, scoring.
+- Use cases: Search boxes, log analytics, observability, dashboards.
+- Schema concept: Mappings that define field types and indexing behavior.
+
+5. Schema / DDL comparison: relational vs NoSQL
+
+Relational (e.g., PostgreSQL)
+
+You declare schema using DDL:
+
+CREATE TABLE users (
+    id        SERIAL PRIMARY KEY,
+    username  VARCHAR(50) NOT NULL UNIQUE,
+    email     VARCHAR(255) NOT NULL,
+    age       INT CHECK (age >= 0)
+);
+
+- Strong, centralized schema:
+  - DB enforces types, constraints, foreign keys, etc.
+
+NoSQL
+
+No single standard; each system has its own idea of “schema”:
+
+5.1 MongoDB (document store)
+
+Historically schemaless. Modern approach: optional JSON Schema validators:
+
+db.createCollection("users", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["username", "email"],
+      properties: {
+        username: { bsonType: "string" },
+        email:    { bsonType: "string" },
+        age:      { bsonType: "int", minimum: 0 }
+      }
+    }
+  }
+});
+
+- Schema is partly in DB validators, but largely in Java classes and code.
+
+5.2 Cassandra (wide-column)
+
+Has CQL DDL:
+
+CREATE TABLE users (
+    user_id   uuid PRIMARY KEY,
+    username  text,
+    email     text,
+    age       int
+);
+
+- But:
+  - No foreign keys.
+  - Table design is driven by query patterns and partitioning, not normalization.
+
+5.3 Redis (key–value)
+
+- No DDL.
+- “Schema” is just the structure of values your application chooses (strings, hashes, JSON, etc.).
+
+5.4 Elasticsearch (search engine)
+
+Uses mappings, not SQL DDL:
+
+PUT /products
+{
+  "mappings": {
+    "properties": {
+      "name":       { "type": "text" },
+      "price":      { "type": "double" },
+      "created_at": { "type": "date" }
+    }
+  }
+}
+
+- Focus is on how to index and search fields, not on constraints like foreign keys.
+
+Overall, with NoSQL, schema is often:
+- Less strict and more distributed between:
+  - DB configuration (validators, mappings, keyspaces, tables),
+  - Application code (Java classes, DTOs, validators),
+  - Conventions.
+
+6. How different NoSQL databases structure data “on local” (conceptually)
+
+Every system has its own hierarchy instead of “cluster → database → schema → table”:
+
+6.1 MongoDB
+- mongod instance → databases → collections → documents.
+- Each mongod has one data directory; it organizes database/collection files internally.
+
+6.2 Cassandra
+- Cluster → nodes → keyspaces → tables → partitions → rows.
+- On each node: data directory → keyspace/table directories → SSTable files.
+
+6.3 Redis
+- Single instance → multiple logical databases (0..N) → keys.
+- On disk: one RDB/AOF file per instance containing all logical databases; separation is logical, not separate OS directories.
+
+6.4 Elasticsearch / OpenSearch
+- Cluster → nodes → indices → shards → segments.
+- On each node: data directory → directories per index+shard → Lucene files.
+
+6.5 Couchbase
+- Cluster → nodes → buckets (similar to databases) → scopes/collections → documents.
+- Each bucket has its own set of storage files per node.
+
+6.6 Neo4j
+- Server instance → databases → nodes, relationships, indexes, constraints.
+- Each database is a directory with multiple store files inside.
+
+Compared to relational:
+- PostgreSQL: Cluster → databases → schemas → tables.
+- Oracle: Database → schemas (users) → tables.
+
+NoSQL systems create their own equivalents of “database/schema/table” (databases, keyspaces, buckets, indices, collections, etc.), and handle OS‑level files automatically.
+
