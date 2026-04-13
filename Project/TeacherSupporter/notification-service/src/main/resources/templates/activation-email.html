@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+    <h2>Welcome to TeacherSupporter!</h2>
+    <p>Hi <span th:text="${firstName}">User</span>,</p>
+    <p>Please activate your account by clicking the link below:</p>
+    <a th:href="${activationLink}">Activate Account</a>
+    <p>This link expires in 24 hours.</p>
+</body>
+</html>

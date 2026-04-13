@@ -1,0 +1,63 @@
+server:
+  port: 8080
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: auth-service
+          uri: lb://auth-service
+          predicates:
+            - Path=/api/auth/**
+          filters:
+            - StripPrefix=2
+        - id: auth-oauth2
+          uri: lb://auth-service
+          predicates:
+            - Path=/oauth2/**
+        - id: course-service-courses
+          uri: lb://course-service
+          predicates:
+            - Path=/api/courses/**
+          filters:
+            - StripPrefix=2
+        - id: course-service-students
+          uri: lb://course-service
+          predicates:
+            - Path=/api/students/**
+          filters:
+            - StripPrefix=2
+        - id: course-service-assignments
+          uri: lb://course-service
+          predicates:
+            - Path=/api/assignments/**
+          filters:
+            - StripPrefix=2
+        - id: course-service-enrollments
+          uri: lb://course-service
+          predicates:
+            - Path=/api/enrollments/**
+          filters:
+            - StripPrefix=2
+        - id: dictionary-service
+          uri: lb://dictionary-service
+          predicates:
+            - Path=/api/dictionary/**
+          filters:
+            - StripPrefix=2
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecretKeyThatIsAtLeast256BitsLongForHS256Algorithm123456}
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+logging:
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"

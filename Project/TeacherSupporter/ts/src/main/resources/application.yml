@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: ts
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/TS
+    username: postgres
+    password: root
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 32
+      minimum-idle: 1
+
+  mongodb:
+    uri: mongodb://localhost:27017/ts
+
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  flyway:
+    enabled: false
+server:
+  port: 8080
