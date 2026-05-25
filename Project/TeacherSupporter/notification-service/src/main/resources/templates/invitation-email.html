@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+    <h2>You're invited to TeacherSupporter</h2>
+    <p>An administrator has invited you to join TeacherSupporter as a <strong th:text="${role}">ROLE</strong>.</p>
+    <p>Click the link below to accept the invitation and sign in with your Google account:</p>
+    <p><a th:href="${inviteLink}">Accept invitation</a></p>
+    <p>This link expires in 7 days.</p>
+</body>
+</html>

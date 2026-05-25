@@ -55,6 +55,9 @@ public class User {
     @Column(name = "totp_enabled", nullable = false)
     private boolean totpEnabled;
 
+    @Column(name = "must_change_password", nullable = false)
+    private boolean mustChangePassword;
+
     @Column(nullable = false)
     private boolean activated;
 

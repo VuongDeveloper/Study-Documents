@@ -7,6 +7,7 @@ import type {
   ActivationResponse,
   UserResponse,
   TotpSetupResponse,
+  ChangePasswordRequest,
 } from '@/types';
 
 export const authApi = {
@@ -20,6 +21,8 @@ export const authApi = {
     apiClient.post(`/auth/activate?code=${code}`),
   refresh: (refreshToken: string) =>
     apiClient.post<LoginResponse>('/auth/refresh', { refreshToken }),
+  changePassword: (data: ChangePasswordRequest) =>
+    apiClient.post<LoginResponse>('/auth/change-password', data),
   logout: (refreshToken: string) =>
     apiClient.post('/auth/logout', { refreshToken }),
   getMe: () =>

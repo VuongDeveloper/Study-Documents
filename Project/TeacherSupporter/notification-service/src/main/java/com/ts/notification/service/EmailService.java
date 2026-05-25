@@ -38,6 +38,48 @@ public class EmailService {
         }
     }
 
+    public void sendInvitationEmail(String to, String role, String inviteToken) {
+        Context context = new Context();
+        context.setVariable("role", role);
+        context.setVariable("inviteLink", "http://localhost:3000/invite?token=" + inviteToken);
+
+        String htmlContent = templateEngine.process("invitation-email", context);
+
+        try {
+            MimeMessage message = javaMailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+            helper.setTo(to);
+            helper.setSubject("You're invited to TeacherSupporter");
+            helper.setText(htmlContent, true);
+            javaMailSender.send(message);
+            log.info("Invitation email sent to {}", to);
+        } catch (MessagingException e) {
+            log.error("Failed to send invitation email to {}. Content: {}", to, htmlContent, e);
+        }
+    }
+
+    public void sendTempPasswordEmail(String to, String role, String tempPassword) {
+        Context context = new Context();
+        context.setVariable("email", to);
+        context.setVariable("role", role);
+        context.setVariable("tempPassword", tempPassword);
+        context.setVariable("loginLink", "http://localhost:3000/login");
+
+        String htmlContent = templateEngine.process("temp-password-email", context);
+
+        try {
+            MimeMessage message = javaMailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+            helper.setTo(to);
+            helper.setSubject("Your TeacherSupporter account is ready");
+            helper.setText(htmlContent, true);
+            javaMailSender.send(message);
+            log.info("Temp password email sent to {}", to);
+        } catch (MessagingException e) {
+            log.error("Failed to send temp password email to {}. Content: {}", to, htmlContent, e);
+        }
+    }
+
     public void sendAssignmentNotification(String to, String title, String dueDate) {
         Context context = new Context();
         context.setVariable("title", title);

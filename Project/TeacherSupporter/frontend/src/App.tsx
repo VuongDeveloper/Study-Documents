@@ -5,6 +5,10 @@ import LoginPage from '@/pages/auth/LoginPage';
 import SignUpPage from '@/pages/auth/SignUpPage';
 import ActivatePage from '@/pages/auth/ActivatePage';
 import TwoFactorVerifyPage from '@/pages/auth/TwoFactorVerifyPage';
+import OAuthCallbackPage from '@/pages/auth/OAuthCallbackPage';
+import InvitePage from '@/pages/auth/InvitePage';
+import ChangePasswordPage from '@/pages/auth/ChangePasswordPage';
+import AdminUsersPage from '@/pages/admin/AdminUsersPage';
 import DashboardPage from '@/pages/dashboard/DashboardPage';
 import CourseListPage from '@/pages/courses/CourseListPage';
 import CourseDetailPage from '@/pages/courses/CourseDetailPage';
@@ -30,6 +34,9 @@ export default function App() {
       <Route path="/signup" element={<SignUpPage />} />
       <Route path="/activate" element={<ActivatePage />} />
       <Route path="/2fa/verify" element={<TwoFactorVerifyPage />} />
+      <Route path="/oauth/callback" element={<OAuthCallbackPage />} />
+      <Route path="/invite" element={<InvitePage />} />
+      <Route path="/change-password" element={<ChangePasswordPage />} />
 
       {/* Protected */}
       <Route
@@ -64,6 +71,14 @@ export default function App() {
           element={
             <RoleGuard role="TEACHER">
               <DictionaryPage />
+            </RoleGuard>
+          }
+        />
+        <Route
+          path="admin/users"
+          element={
+            <RoleGuard role="ADMIN">
+              <AdminUsersPage />
             </RoleGuard>
           }
         />

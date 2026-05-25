@@ -1,6 +1,7 @@
 package com.ts.auth.controller;
 
 import com.ts.auth.dto.ActivationResponse;
+import com.ts.auth.dto.ChangePasswordRequest;
 import com.ts.auth.dto.LoginRequest;
 import com.ts.auth.dto.LoginResponse;
 import com.ts.auth.dto.RegisterRequest;
@@ -50,6 +51,12 @@ public class AuthController {
     public ResponseEntity<Void> activate(@RequestParam String code) {
         authService.activate(code);
         return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/change-password")
+    public ResponseEntity<LoginResponse> changePassword(@Valid @RequestBody ChangePasswordRequest request) {
+        LoginResponse response = authService.changePassword(request.tempToken(), request.newPassword());
+        return ResponseEntity.ok(response);
     }
 
     @PostMapping("/refresh")

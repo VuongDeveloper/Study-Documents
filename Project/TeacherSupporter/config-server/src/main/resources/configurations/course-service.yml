@@ -1,8 +1,10 @@
 server:
   port: 8082
+  error:
+    include-message: always
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5434/ts_course
+    url: jdbc:postgresql://localhost:5432/ts_course
     username: postgres
     password: root
     driver-class-name: org.postgresql.Driver
@@ -21,6 +23,15 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      group-id: course-group
+      auto-offset-reset: earliest
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.trusted.packages: com.ts.common.dto
 resilience4j:
   circuitbreaker:
     instances:

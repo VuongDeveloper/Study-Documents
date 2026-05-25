@@ -696,3 +696,63 @@ Build: `mvn clean package -DskipTests` from root, then `docker compose up --buil
 | Kafka: event replay, consumer groups, high throughput | Kafka has a steeper learning curve than simpler message brokers |
 | Industry-standard architecture for large teams | Overkill if you're the only developer |
 | ~90+ new files | |
+
+##To run:
+
+  # Build backend
+  mvn clean package -DskipTests
+
+  # Start all infrastructure + services
+  docker compose up --build
+
+  # Start frontend (separate terminal)
+  cd frontend && npm install && npm run dev
+
+##ok, so now how can I start this microservices app?                                                                                                                                                                                
+                                                     
+● You have PostgreSQL and MongoDB locally. You still need Kafka and MailDev — start just those from Docker, then run the Spring Boot services in terminal.                                                                          
+                                         
+  Step 1 — Start remaining infra via Docker                                                                                                                                                                                         
+                                                                                                                                                                                                                                    
+  docker-compose up kafka kafka-ui zipkin maildev -d                                                                                                                                                                                
+                                                            
+  ▎ Zipkin and kafka-ui are optional but useful for debugging.
+
+  ---
+  Step 2 — Start Spring Boot services in order
+
+  Open a new terminal for each. Run from the project root TeacherSupporter/:
+
+  Terminal 1 — Config Server (start first, everything depends on it)
+  mvn spring-boot:run -pl config-server
+  Wait for: Started ConfigServerApplication on port 8888
+
+  Terminal 2 — Discovery Server
+  mvn spring-boot:run -pl discovery-server
+  Wait for: Started on port 8761, then check http://localhost:8761
+
+  Terminal 3+ — App services (any order, after discovery is up)
+  mvn spring-boot:run -pl auth-service
+  mvn spring-boot:run -pl course-service
+  mvn spring-boot:run -pl dictionary-service
+  mvn spring-boot:run -pl notification-service
+  mvn spring-boot:run -pl api-gateway
+
+  ---
+  Verify everything is up
+
+  ┌────────────────────────────────────────────┬───────────────────────┐
+  │                   Check                    │          URL          │
+  ├────────────────────────────────────────────┼───────────────────────┤
+  │ Eureka dashboard (all services registered) │ http://localhost:8761 │
+  ├────────────────────────────────────────────┼───────────────────────┤
+  │ API gateway                                │ http://localhost:8080 │
+  ├────────────────────────────────────────────┼───────────────────────┤
+  │ Kafka UI                                   │ http://localhost:9090 │
+  ├────────────────────────────────────────────┼───────────────────────┤
+  │ Zipkin traces                              │ http://localhost:9411 │
+  ├────────────────────────────────────────────┼───────────────────────┤
+  │ MailDev inbox                              │ http://localhost:1080 │
+  └────────────────────────────────────────────┴───────────────────────┘
+
+  Flyway runs automatically when auth-service and course-service start — tables will be created in ts_auth and ts_course on first boot.

@@ -6,11 +6,16 @@ import type {
   AssignmentResponse,
   EnrollmentRequest,
   EnrollmentResponse,
+  PageResponse,
 } from '@/types';
 
 export const coursesApi = {
-  list: (page = 0, size = 20) =>
-    apiClient.get<CourseResponse[]>('/courses/courses', { params: { page, size } }),
+  list: async (page = 0, size = 20) => {
+    const res = await apiClient.get<PageResponse<CourseResponse>>('/courses/courses', {
+      params: { page, size },
+    });
+    return { ...res, data: res.data.content };
+  },
   get: (id: number) =>
     apiClient.get<CourseResponse>(`/courses/courses/${id}`),
   create: (data: CourseRequest) =>

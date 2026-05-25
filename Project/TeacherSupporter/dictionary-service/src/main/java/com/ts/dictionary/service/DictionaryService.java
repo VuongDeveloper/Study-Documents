@@ -10,6 +10,8 @@ import com.ts.dictionary.dto.WordLinkRequest;
 import com.ts.dictionary.repository.WordDefinitionRepository;
 import com.ts.dictionary.repository.WordLinkRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.MessageSource;
+import org.springframework.context.i18n.LocaleContextHolder;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -23,6 +25,17 @@ public class DictionaryService {
 
     private final WordDefinitionRepository wordDefinitionRepository;
     private final WordLinkRepository wordLinkRepository;
+    private final MessageSource messageSource;
+
+    private String msg(String key, Object... args) {
+        return messageSource.getMessage(key, args, LocaleContextHolder.getLocale());
+    }
+
+    private String wordTextOrId(String wordId) {
+        return wordDefinitionRepository.findById(wordId)
+                .map(WordDefinition::getWord)
+                .orElse(wordId);
+    }
 
     public WordDefinitionResponse createWord(WordDefinitionRequest req, String userId) {
         WordDefinition word = WordDefinition.builder()
@@ -41,13 +54,13 @@ public class DictionaryService {
 
     public WordDefinitionResponse getWord(String id, String userId) {
         WordDefinition word = wordDefinitionRepository.findByIdAndCreatedByUserId(id, userId)
-                .orElseThrow(() -> new ApiException(404, "Word not found"));
+                .orElseThrow(() -> new ApiException(404, msg("word.not.found")));
         return toResponse(word, userId);
     }
 
     public WordDefinitionResponse updateWord(String id, WordDefinitionRequest req, String userId) {
         WordDefinition word = wordDefinitionRepository.findByIdAndCreatedByUserId(id, userId)
-                .orElseThrow(() -> new ApiException(404, "Word not found"));
+                .orElseThrow(() -> new ApiException(404, msg("word.not.found")));
 
         word.setWord(req.word());
         word.setMeaning(req.meaning());
@@ -63,7 +76,7 @@ public class DictionaryService {
 
     public void deleteWord(String id, String userId) {
         WordDefinition word = wordDefinitionRepository.findByIdAndCreatedByUserId(id, userId)
-                .orElseThrow(() -> new ApiException(404, "Word not found"));
+                .orElseThrow(() -> new ApiException(404, msg("word.not.found")));
         wordDefinitionRepository.delete(word);
         wordLinkRepository.deleteByParentWordIdOrChildWordId(id, id);
     }
@@ -112,7 +125,9 @@ public class DictionaryService {
         checkForCycle(req.parentWordId(), req.childWordId(), userId);
 
         if (wordLinkRepository.existsByParentWordIdAndChildWordId(req.parentWordId(), req.childWordId())) {
-            throw new ApiException(409, "Link already exists");
+            throw new ApiException(409, msg("link.already.exists",
+                    wordTextOrId(req.parentWordId()),
+                    wordTextOrId(req.childWordId())));
         }
 
         WordLink link = WordLink.builder()
@@ -126,18 +141,18 @@ public class DictionaryService {
 
     public void deleteLink(String linkId, String userId) {
         WordLink link = wordLinkRepository.findById(linkId)
-                .orElseThrow(() -> new ApiException(404, "Link not found"));
+                .orElseThrow(() -> new ApiException(404, msg("link.not.found")));
         if (!link.getCreatedByUserId().equals(userId)) {
-            throw new ApiException(403, "Not authorized to delete this link");
+            throw new ApiException(403, msg("link.unauthorized.delete"));
         }
         wordLinkRepository.delete(link);
     }
 
     public void updateLinkPosition(String linkId, int newPosition, String userId) {
         WordLink link = wordLinkRepository.findById(linkId)
-                .orElseThrow(() -> new ApiException(404, "Link not found"));
+                .orElseThrow(() -> new ApiException(404, msg("link.not.found")));
         if (!link.getCreatedByUserId().equals(userId)) {
-            throw new ApiException(403, "Not authorized to update this link");
+            throw new ApiException(403, msg("link.unauthorized.update"));
         }
         link.setPosition(newPosition);
         wordLinkRepository.save(link);
@@ -163,11 +178,20 @@ public class DictionaryService {
 
     private void checkForCycle(String parentId, String childId, String userId) {
         if (parentId.equals(childId)) {
-            throw new ApiException(400, "Cycle detected");
+            throw new ApiException(400, msg("word.link.self", wordTextOrId(parentId)));
         }
-        List<WordLink> parentLinks = wordLinkRepository.findByChildWordId(parentId);
-        for (WordLink link : parentLinks) {
-            checkForCycle(link.getParentWordId(), childId, userId);
+        checkAncestors(parentId, childId);
+    }
+
+    private void checkAncestors(String currentAncestorId, String prospectiveChildId) {
+        List<WordLink> ancestorLinks = wordLinkRepository.findByChildWordId(currentAncestorId);
+        for (WordLink link : ancestorLinks) {
+            if (link.getParentWordId().equals(prospectiveChildId)) {
+                throw new ApiException(400, msg("word.link.cycle",
+                        wordTextOrId(prospectiveChildId),
+                        wordTextOrId(currentAncestorId)));
+            }
+            checkAncestors(link.getParentWordId(), prospectiveChildId);
         }
     }
 

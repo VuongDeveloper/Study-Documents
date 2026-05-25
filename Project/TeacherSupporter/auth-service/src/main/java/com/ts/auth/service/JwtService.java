@@ -55,6 +55,19 @@ public class JwtService {
                 .compact();
     }
 
+    public String generatePasswordChangeToken(User user) {
+        Date now = new Date();
+        Date expiry = new Date(now.getTime() + 5 * 60 * 1000); // 5 minutes
+
+        return Jwts.builder()
+                .subject(String.valueOf(user.getId()))
+                .claim("passwordChangeRequired", true)
+                .issuedAt(now)
+                .expiration(expiry)
+                .signWith(signingKey)
+                .compact();
+    }
+
     public String generateRefreshTokenValue() {
         return UUID.randomUUID().toString();
     }

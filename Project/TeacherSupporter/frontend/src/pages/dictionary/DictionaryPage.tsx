@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -19,8 +19,8 @@ const wordSchema = z.object({
 type WordForm = z.infer<typeof wordSchema>;
 
 const linkSchema = z.object({
-  parentWordId: z.string().min(1, 'Parent word ID is required'),
-  childWordId: z.string().min(1, 'Child word ID is required'),
+  parentWordId: z.string().min(1, 'Pick a parent word'),
+  childWordId: z.string().min(1, 'Pick a child word'),
 });
 type LinkForm = z.infer<typeof linkSchema>;
 
@@ -79,6 +79,87 @@ function TreeNode({
   );
 }
 
+// --- Word autocomplete ---
+function WordAutocomplete({
+  label,
+  value,
+  onChange,
+  error,
+}: {
+  label: string;
+  value: string;
+  onChange: (id: string) => void;
+  error?: string;
+}) {
+  const [query, setQuery] = useState('');
+  const [debounced, setDebounced] = useState('');
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(query), 200);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const { data: results } = useQuery({
+    queryKey: ['dictionary-search', debounced],
+    queryFn: () => dictionaryApi.listWords(0, 10, debounced).then((r) => r.data),
+    enabled: debounced.trim().length > 0,
+  });
+
+  return (
+    <div className="relative" ref={containerRef}>
+      <label className="block text-xs font-medium text-gray-600">{label}</label>
+      <input
+        type="text"
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+          if (value) onChange('');
+        }}
+        onFocus={() => setOpen(true)}
+        placeholder="Search by word..."
+        className="mt-1 block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+      />
+      {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+      {open && results && results.length > 0 && (
+        <ul className="absolute left-0 right-0 z-10 mt-1 max-h-40 overflow-y-auto rounded border border-gray-200 bg-white shadow-lg">
+          {results.map((w) => (
+            <li
+              key={w.id}
+              onClick={() => {
+                onChange(w.id);
+                setQuery(w.word);
+                setOpen(false);
+              }}
+              className="cursor-pointer px-3 py-1.5 text-sm hover:bg-indigo-50"
+            >
+              <p className="font-medium text-gray-900">{w.word}</p>
+              {w.meaning && <p className="text-xs text-gray-500">{w.meaning}</p>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {open && debounced.trim().length > 0 && results && results.length === 0 && (
+        <div className="absolute left-0 right-0 z-10 mt-1 rounded border border-gray-200 bg-white px-3 py-2 text-xs text-gray-500 shadow-lg">
+          No matches.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // --- Main page ---
 export default function DictionaryPage() {
   const queryClient = useQueryClient();
@@ -87,6 +168,13 @@ export default function DictionaryPage() {
   const [showLinkForm, setShowLinkForm] = useState(false);
   const [formError, setFormError] = useState('');
   const [isEditing, setIsEditing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchQuery), 200);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
 
   // Fetch graph
   const { data: graph, isLoading: graphLoading } = useQuery({
@@ -94,11 +182,36 @@ export default function DictionaryPage() {
     queryFn: () => dictionaryApi.getGraph().then((r) => r.data),
   });
 
+  // Search results (when search query is present)
+  const { data: searchResults, isLoading: searchLoading } = useQuery({
+    queryKey: ['dictionary-search', debouncedSearch],
+    queryFn: () => dictionaryApi.listWords(0, 50, debouncedSearch).then((r) => r.data),
+    enabled: debouncedSearch.trim().length > 0,
+  });
+
   // Fetch selected word details
-  const { data: selectedWord, isLoading: wordLoading } = useQuery({
+  const {
+    data: selectedWord,
+    isLoading: wordLoading,
+    error: wordError,
+  } = useQuery({
     queryKey: ['dictionary-word', selectedWordId],
     queryFn: () => dictionaryApi.getWord(selectedWordId!).then((r) => r.data),
     enabled: !!selectedWordId,
+    retry: false,
+  });
+
+  // Parents / children of selected word (for clickable relationship links)
+  const { data: parentWords } = useQuery({
+    queryKey: ['dictionary-parents', selectedWordId],
+    queryFn: () => dictionaryApi.getParents(selectedWordId!).then((r) => r.data),
+    enabled: !!selectedWordId && (selectedWord?.parentIds?.length ?? 0) > 0,
+  });
+
+  const { data: childWords } = useQuery({
+    queryKey: ['dictionary-children', selectedWordId],
+    queryFn: () => dictionaryApi.getChildren(selectedWordId!).then((r) => r.data),
+    enabled: !!selectedWordId && (selectedWord?.childIds?.length ?? 0) > 0,
   });
 
   // Create word form
@@ -153,12 +266,16 @@ export default function DictionaryPage() {
     mutationFn: (id: string) => dictionaryApi.deleteWord(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dictionary-graph'] });
+      queryClient.invalidateQueries({ queryKey: ['dictionary-search'] });
       setSelectedWordId(null);
     },
   });
 
   // Link form
-  const linkForm = useForm<LinkForm>({ resolver: zodResolver(linkSchema) });
+  const linkForm = useForm<LinkForm>({
+    resolver: zodResolver(linkSchema),
+    defaultValues: { parentWordId: '', childWordId: '' },
+  });
 
   const createLinkMutation = useMutation({
     mutationFn: (data: LinkForm) => dictionaryApi.createLink(data),
@@ -186,12 +303,17 @@ export default function DictionaryPage() {
     setFormError('');
   };
 
+  const parentWordIdValue = linkForm.watch('parentWordId');
+  const childWordIdValue = linkForm.watch('childWordId');
+
   return (
     <div className="flex h-[calc(100vh-7rem)] gap-6">
       {/* Left panel: Tree */}
       <div className="flex w-80 flex-shrink-0 flex-col rounded-xl bg-white shadow-sm ring-1 ring-gray-200">
         <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
-          <h2 className="text-sm font-semibold text-gray-900">Word Tree</h2>
+          <h2 className="text-sm font-semibold text-gray-900">
+            {debouncedSearch ? 'Search Results' : 'Word Tree'}
+          </h2>
           <div className="flex gap-1">
             <button
               onClick={() => { setShowCreateForm(true); setShowLinkForm(false); setFormError(''); }}
@@ -210,9 +332,31 @@ export default function DictionaryPage() {
           </div>
         </div>
 
+        {/* Search bar */}
+        <div className="border-b border-gray-200 px-3 py-2">
+          <div className="relative">
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search words..."
+              className="block w-full rounded border border-gray-300 px-2 py-1 pr-7 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="absolute right-1 top-1/2 -translate-y-1/2 px-1 text-xs text-gray-400 hover:text-gray-600"
+                title="Clear"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        </div>
+
         {/* Create word form */}
         {showCreateForm && (
-          <div className="border-b border-gray-200 bg-gray-50 px-4 py-3">
+          <div className="max-h-[60vh] overflow-y-auto border-b border-gray-200 bg-gray-50 px-4 py-3">
             <form
               onSubmit={createForm.handleSubmit((data) => createWordMutation.mutate(data))}
               className="space-y-2"
@@ -226,10 +370,34 @@ export default function DictionaryPage() {
               {createForm.formState.errors.word && (
                 <p className="text-xs text-red-600">{createForm.formState.errors.word.message}</p>
               )}
+              <textarea
+                placeholder="Meaning"
+                rows={2}
+                {...createForm.register('meaning')}
+                className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <textarea
+                placeholder="Usage"
+                rows={2}
+                {...createForm.register('usage')}
+                className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <textarea
+                placeholder="Notes"
+                rows={2}
+                {...createForm.register('notes')}
+                className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <textarea
+                placeholder="Examples (one per line)"
+                rows={3}
+                {...createForm.register('examplesRaw')}
+                className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
               <input
                 type="text"
-                placeholder="Meaning"
-                {...createForm.register('meaning')}
+                placeholder="Tags (comma-separated)"
+                {...createForm.register('tagsRaw')}
                 className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
               {formError && <p className="text-xs text-red-600">{formError}</p>}
@@ -258,26 +426,20 @@ export default function DictionaryPage() {
           <div className="border-b border-gray-200 bg-gray-50 px-4 py-3">
             <form
               onSubmit={linkForm.handleSubmit((data) => createLinkMutation.mutate(data))}
-              className="space-y-2"
+              className="space-y-3"
             >
-              <input
-                type="text"
-                placeholder="Parent Word ID"
-                {...linkForm.register('parentWordId')}
-                className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              <WordAutocomplete
+                label="Parent word"
+                value={parentWordIdValue}
+                onChange={(id) => linkForm.setValue('parentWordId', id, { shouldValidate: true })}
+                error={linkForm.formState.errors.parentWordId?.message}
               />
-              {linkForm.formState.errors.parentWordId && (
-                <p className="text-xs text-red-600">{linkForm.formState.errors.parentWordId.message}</p>
-              )}
-              <input
-                type="text"
-                placeholder="Child Word ID"
-                {...linkForm.register('childWordId')}
-                className="block w-full rounded border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              <WordAutocomplete
+                label="Child word"
+                value={childWordIdValue}
+                onChange={(id) => linkForm.setValue('childWordId', id, { shouldValidate: true })}
+                error={linkForm.formState.errors.childWordId?.message}
               />
-              {linkForm.formState.errors.childWordId && (
-                <p className="text-xs text-red-600">{linkForm.formState.errors.childWordId.message}</p>
-              )}
               {formError && <p className="text-xs text-red-600">{formError}</p>}
               <div className="flex gap-2">
                 <button
@@ -299,9 +461,32 @@ export default function DictionaryPage() {
           </div>
         )}
 
-        {/* Tree */}
+        {/* Tree or search results */}
         <div className="flex-1 overflow-y-auto px-2 py-2">
-          {graphLoading ? (
+          {debouncedSearch ? (
+            searchLoading ? (
+              <p className="px-2 py-4 text-center text-sm text-gray-500">Searching...</p>
+            ) : !searchResults || searchResults.length === 0 ? (
+              <p className="px-2 py-4 text-center text-sm text-gray-500">No matches.</p>
+            ) : (
+              searchResults.map((word) => (
+                <div
+                  key={word.id}
+                  onClick={() => setSelectedWordId(word.id)}
+                  className={`cursor-pointer rounded px-2 py-1 text-sm transition-colors ${
+                    selectedWordId === word.id
+                      ? 'bg-indigo-100 text-indigo-700'
+                      : 'text-gray-700 hover:bg-gray-100'
+                  }`}
+                >
+                  <p className="font-medium">{word.word}</p>
+                  {word.meaning && (
+                    <p className="truncate text-xs text-gray-500">{word.meaning}</p>
+                  )}
+                </div>
+              ))
+            )
+          ) : graphLoading ? (
             <p className="px-2 py-4 text-center text-sm text-gray-500">Loading words...</p>
           ) : !graph || graph.length === 0 ? (
             <p className="px-2 py-4 text-center text-sm text-gray-500">No words yet. Create one!</p>
@@ -328,9 +513,17 @@ export default function DictionaryPage() {
           <div className="flex h-full items-center justify-center text-sm text-gray-500">
             Loading word...
           </div>
+        ) : wordError ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-red-600">
+            <p>Failed to load word.</p>
+            <p className="text-xs text-gray-500">
+              {(wordError as AxiosError<{ message?: string }>)?.response?.data?.message ||
+                (wordError as Error)?.message}
+            </p>
+          </div>
         ) : !selectedWord ? (
-          <div className="flex h-full items-center justify-center text-sm text-red-500">
-            Word not found
+          <div className="flex h-full items-center justify-center text-sm text-gray-400">
+            No data.
           </div>
         ) : isEditing ? (
           /* Edit form */
@@ -421,7 +614,6 @@ export default function DictionaryPage() {
             <div className="flex items-start justify-between">
               <div>
                 <h2 className="text-2xl font-bold text-gray-900">{selectedWord.word}</h2>
-                <p className="mt-1 text-xs text-gray-400">ID: {selectedWord.id}</p>
               </div>
               <div className="flex gap-2">
                 <button
@@ -495,12 +687,46 @@ export default function DictionaryPage() {
               {(selectedWord.parentIds?.length > 0 || selectedWord.childIds?.length > 0) && (
                 <div>
                   <h3 className="text-xs font-medium uppercase text-gray-500">Relationships</h3>
-                  <div className="mt-1 space-y-1 text-sm text-gray-700">
+                  <div className="mt-1 space-y-2 text-sm text-gray-700">
                     {selectedWord.parentIds?.length > 0 && (
-                      <p>Parents: {selectedWord.parentIds.join(', ')}</p>
+                      <div>
+                        <span className="text-gray-500">Parents: </span>
+                        {parentWords && parentWords.length > 0 ? (
+                          parentWords.map((p, i) => (
+                            <span key={p.id}>
+                              <button
+                                onClick={() => setSelectedWordId(p.id)}
+                                className="font-medium text-indigo-600 hover:text-indigo-800 hover:underline"
+                              >
+                                {p.word}
+                              </button>
+                              {i < parentWords.length - 1 && ', '}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-gray-400">Loading...</span>
+                        )}
+                      </div>
                     )}
                     {selectedWord.childIds?.length > 0 && (
-                      <p>Children: {selectedWord.childIds.join(', ')}</p>
+                      <div>
+                        <span className="text-gray-500">Children: </span>
+                        {childWords && childWords.length > 0 ? (
+                          childWords.map((c, i) => (
+                            <span key={c.id}>
+                              <button
+                                onClick={() => setSelectedWordId(c.id)}
+                                className="font-medium text-indigo-600 hover:text-indigo-800 hover:underline"
+                              >
+                                {c.word}
+                              </button>
+                              {i < childWords.length - 1 && ', '}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-gray-400">Loading...</span>
+                        )}
+                      </div>
                     )}
                   </div>
                 </div>

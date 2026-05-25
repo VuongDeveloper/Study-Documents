@@ -24,7 +24,8 @@ public class SecurityConfig {
     private final GatewayHeaderAuthFilter gatewayHeaderAuthFilter;
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain securityFilterChain(HttpSecurity http,
+                                                   OAuth2LoginSuccessHandler oAuth2LoginSuccessHandler) throws Exception {
         http
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -35,12 +36,15 @@ public class SecurityConfig {
                                 "/activate",
                                 "/refresh",
                                 "/verify-2fa",
+                                "/change-password",
                                 "/oauth2/**",
+                                "/login/oauth2/**",
                                 "/v3/api-docs/**",
                                 "/swagger-ui/**"
                         ).permitAll()
                         .anyRequest().authenticated()
                 )
+                .oauth2Login(oauth2 -> oauth2.successHandler(oAuth2LoginSuccessHandler))
                 .addFilterBefore(gatewayHeaderAuthFilter, UsernamePasswordAuthenticationFilter.class);
 
         return http.build();

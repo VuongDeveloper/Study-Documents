@@ -3,9 +3,10 @@ import { useAuthStore } from '@/stores/authStore';
 import { cn } from '@/lib/utils';
 
 const navItems = [
-  { path: '/', label: 'Dashboard', roles: ['TEACHER', 'STUDENT'] },
+  { path: '/', label: 'Dashboard', roles: ['TEACHER', 'STUDENT', 'ADMIN'] },
   { path: '/courses', label: 'Courses', roles: ['TEACHER', 'STUDENT'] },
   { path: '/dictionary', label: 'Dictionary', roles: ['TEACHER'] },
+  { path: '/admin/users', label: 'Manage Users', roles: ['ADMIN'] },
 ];
 
 export default function Sidebar() {

@@ -1,6 +1,6 @@
 # TeacherSupporter - Microservices Platform
 
-A Spring Boot microservices platform that helps teachers manage courses, students, assignments, and personal word dictionaries. The system supports multiple authentication flows (local + OAuth2 Google, with optional TOTP-based 2FA), event-driven notifications via Kafka, and a flexible graph-based dictionary powered by MongoDB.
+A Spring Boot microservices platform that helps teachers manage courses, students, assignments, and personal word dictionaries. The system supports multiple authentication flows (local + OAuth2 Google, with optional TOTP-based 2FA), role-based access control (ADMIN / TEACHER / STUDENT) with admin-driven user provisioning and invitations, event-driven notifications via Kafka, a flexible graph-based dictionary powered by MongoDB, and a React single-page frontend.
 
 ---
 
@@ -15,6 +15,7 @@ A Spring Boot microservices platform that helps teachers manage courses, student
   - [Local Development (without Docker)](#local-development-without-docker)
 - [API Documentation](#api-documentation)
   - [Authentication Endpoints](#authentication-endpoints)
+  - [Admin User Endpoints](#admin-user-endpoints)
   - [Course Endpoints](#course-endpoints)
   - [Student Endpoints](#student-endpoints)
   - [Assignment Endpoints](#assignment-endpoints)
@@ -60,21 +61,22 @@ All client requests enter through the **API Gateway** (port 8080), which validat
 
 | Category          | Technology                                     |
 |-------------------|------------------------------------------------|
-| Language          | Java 21 (Eclipse Temurin)                      |
-| Framework         | Spring Boot 3.4.4                              |
-| Cloud             | Spring Cloud 2024.0.1                          |
+| Language          | Java 25 (Eclipse Temurin)                      |
+| Framework         | Spring Boot 3.5.6                              |
+| Cloud             | Spring Cloud 2025.0.0                          |
 | Service Discovery | Netflix Eureka                                 |
 | API Gateway       | Spring Cloud Gateway                           |
 | Configuration     | Spring Cloud Config Server (native)            |
-| Security          | Spring Security, JWT (jjwt 0.12.6), TOTP 2FA  |
+| Security          | Spring Security, JWT (jjwt 0.12.6), TOTP 2FA, OAuth2 (Google) |
 | Messaging         | Apache Kafka 3.9                               |
 | Databases         | PostgreSQL 17, MongoDB 8                       |
+| Migrations        | Flyway (auth-service, course-service)          |
 | Inter-service     | OpenFeign (sync), Kafka (async)                |
 | API Docs          | SpringDoc OpenAPI 2.8.6 (Swagger UI)           |
 | Tracing           | Zipkin                                         |
 | Build             | Maven 3.9+ (multi-module)                      |
 | Containerization  | Docker, Docker Compose                         |
-| Frontend (planned)| React 19, Vite, TypeScript, Tailwind CSS v4, shadcn/ui |
+| Frontend          | React 19, Vite, TypeScript, Tailwind CSS v4, shadcn/ui |
 | Caching (future)  | Redis                                          |
 
 ---
@@ -97,15 +99,21 @@ All client requests enter through the **API Gateway** (port 8080), which validat
 | postgres-auth        | 5433       | Auth database                            | -                         |
 | postgres-course      | 5434       | Course database                          | -                         |
 | mongodb              | 27017      | Dictionary database                      | -                         |
+| frontend (Vite)      | 3000       | React single-page app (dev server)       | -                         |
+
+> **Remote debugging:** in `docker-compose.yml` each Spring service also exposes a JDWP port (`config-server` 5888, `discovery-server` 5761, `api-gateway` 5080, `auth` 5081, `course` 5082, `dictionary` 5083, `notification` 5084). Attach your IDE debugger to `localhost:<port>`.
+>
+> **Kafka listeners:** the broker advertises two listeners — `kafka:19092` for in-container traffic (used by all services and Kafka UI) and `localhost:9092` for access from the host.
 
 ---
 
 ## Prerequisites
 
-- **Java 21** (Eclipse Temurin recommended)
+- **Java 25** (Eclipse Temurin recommended)
 - **Maven 3.9+**
 - **Docker** and **Docker Compose**
-- **Node.js 20+** (for frontend, when available)
+- **Node.js 20+** (for the React frontend)
+- A **Google OAuth2 client** (optional) — set `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` to enable Google login
 
 ---
 
@@ -121,11 +129,16 @@ cd TeacherSupporter
 # Build all services
 mvn clean package -DskipTests
 
+# (Optional) enable Google OAuth2 login
+export GOOGLE_CLIENT_ID=<your-client-id>
+export GOOGLE_CLIENT_SECRET=<your-client-secret>
+
 # Start everything
 docker compose up --build
 
 # Access the services:
 # API Gateway:        http://localhost:8080
+# Frontend (dev):     http://localhost:3000   (run separately, see below)
 # Eureka Dashboard:   http://localhost:8761
 # Kafka UI:           http://localhost:9090
 # Zipkin:             http://localhost:9411
@@ -135,9 +148,13 @@ docker compose up --build
 # Swagger (dictionary): http://localhost:8083/swagger-ui.html
 ```
 
+A default administrator (`admin@teachersupporter.com`) is seeded by Flyway migration `V4__seed_default_admin.sql` on first start; its password is set there as a BCrypt hash. Use this account to provision other users via the **Admin Users** screen / `/api/auth/admin/users` endpoints.
+
 ### Local Development (without Docker)
 
 When developing a single service, start only the infrastructure containers and run the Spring Boot services from your IDE.
+
+> **Datasource ports:** the Config Server now defaults the JDBC URLs to `localhost:5432`. The Dockerized databases are published on host ports `5433` (auth) and `5434` (course), so when running a service from your IDE against the containers, override `SPRING_DATASOURCE_URL` accordingly (e.g. `jdbc:postgresql://localhost:5433/ts_auth`). Inside Docker Compose this is already handled by the per-service `SPRING_DATASOURCE_URL` overrides.
 
 **Step 1 -- Start infrastructure**
 
@@ -174,6 +191,78 @@ cd dictionary-service    && mvn spring-boot:run
 cd notification-service  && mvn spring-boot:run
 ```
 
+### Per-Service Terminals (Docker, recommended for learning)
+
+Run every service in its own foreground terminal so each service's logs stay isolated. Uses `--no-deps` so each `docker compose up` starts only that service — you bring services up in the right order yourself.
+
+**Prerequisite:** build the JARs first.
+
+```bash
+mvn clean package -DskipTests
+```
+
+**Terminal 1 -- Infrastructure (bundled, rarely needs per-service debugging)**
+
+```bash
+docker compose up postgres-auth postgres-course mongodb kafka kafka-ui zipkin maildev
+```
+
+Wait until Postgres and Kafka are ready.
+
+**Terminal 2 -- Config Server**
+
+```bash
+docker compose up --no-deps --build config-server
+```
+
+Wait for `Started ConfigServerApplication`.
+
+**Terminal 3 -- Discovery Server**
+
+```bash
+docker compose up --no-deps --build discovery-server
+```
+
+Wait until Eureka is up at `http://localhost:8761`.
+
+**Terminals 4-8 -- Application services (any order)**
+
+```bash
+# Terminal 4
+docker compose up --no-deps --build api-gateway
+
+# Terminal 5
+docker compose up --no-deps --build auth-service
+
+# Terminal 6
+docker compose up --no-deps --build course-service
+
+# Terminal 7
+docker compose up --no-deps --build dictionary-service
+
+# Terminal 8
+docker compose up --no-deps --build notification-service
+```
+
+**Terminal 9 -- Frontend (React + Vite)**
+
+```bash
+cd frontend
+npm install   # first time only
+npm run dev
+```
+
+Vite serves the SPA at `http://localhost:3000` (configured in `vite.config.ts`). It proxies `/api` and `/oauth2` calls to the gateway at `http://localhost:8080`.
+
+Flyway runs automatically when `auth-service` and `course-service` start — look for `Successfully applied N migrations` in their logs.
+
+**Tips:**
+
+- Use Windows Terminal tabs (Ctrl+T) or split panes to keep the 8 terminals manageable.
+- After the first build, drop `--build` on unchanged services for faster restarts.
+- `Ctrl+C` in a terminal stops just that service; `docker compose stop <service>` from any terminal does the same without killing the foreground process.
+- `docker compose down` tears the whole stack down.
+
 ---
 
 ## API Documentation
@@ -183,12 +272,14 @@ All requests go through the API Gateway at `http://localhost:8080`. The gateway 
 | Gateway Prefix         | Target Service       |
 |------------------------|----------------------|
 | `/api/auth/**`         | auth-service         |
+| `/api/auth/admin/**`   | auth-service (ADMIN) |
 | `/api/courses/**`      | course-service       |
 | `/api/students/**`     | course-service       |
 | `/api/assignments/**`  | course-service       |
 | `/api/enrollments/**`  | course-service       |
 | `/api/dictionary/**`   | dictionary-service   |
 | `/oauth2/**`           | auth-service         |
+| `/login/oauth2/**`     | auth-service (OAuth2 redirect callback) |
 
 ### Authentication Endpoints
 
@@ -196,9 +287,10 @@ All paths below are relative to the gateway prefix `/api/auth`.
 
 | Method | Path                    | Auth Required | Description                              |
 |--------|-------------------------|---------------|------------------------------------------|
-| POST   | `/register`             | No            | Register a new user (TEACHER or STUDENT) |
+| POST   | `/register`             | No            | Self-register a new user (always created as STUDENT) |
 | POST   | `/login`                | No            | Login with email and password            |
 | POST   | `/verify-2fa`           | No            | Submit TOTP code after login (if 2FA enabled) |
+| POST   | `/change-password`      | No            | Set a new password using a `tempToken` (forced password change) |
 | POST   | `/activate`             | No            | Activate account with activation code    |
 | POST   | `/refresh`              | No            | Refresh an expired access token          |
 | POST   | `/logout`               | No            | Revoke a refresh token                   |
@@ -207,6 +299,17 @@ All paths below are relative to the gateway prefix `/api/auth`.
 | POST   | `/me/enable-2fa/verify` | Yes           | Confirm 2FA setup with a TOTP code       |
 | POST   | `/me/disable-2fa`       | Yes           | Disable two-factor authentication        |
 | GET    | `/users/{id}`           | Yes           | Get user by ID (internal / feign)        |
+
+### Admin User Endpoints
+
+All paths below are relative to the gateway prefix `/api/auth/admin` and require the **ADMIN** role.
+
+| Method | Path           | Description                                                        |
+|--------|----------------|--------------------------------------------------------------------|
+| POST   | `/users`       | Provision a user. `authMethod=PASSWORD` creates the account with a generated temporary password (emailed, must be changed on first login); `authMethod=GOOGLE` creates a pending invitation (emailed) the user accepts by signing in with Google. |
+| GET    | `/users`       | List all users (paginated)                                         |
+| PATCH  | `/users/{id}`  | Update a user's role (cannot assign `ADMIN`)                       |
+| DELETE | `/users/{id}`  | Delete a user (cannot delete an admin)                             |
 
 ### Course Endpoints
 
@@ -272,18 +375,33 @@ All paths below are relative to the gateway prefix `/api/dictionary`.
 
 ### Example curl Commands
 
-**Register a new teacher:**
+**Register a new user** (self-registration always becomes a STUDENT; the `role` field is still required by request validation but ignored — use admin provisioning to create TEACHERs):
 
 ```bash
 curl -X POST http://localhost:8080/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{
-    "email": "teacher@test.com",
+    "email": "student@test.com",
     "password": "password123",
     "firstName": "John",
     "lastName": "Doe",
-    "role": "TEACHER",
+    "role": "STUDENT",
     "activationMethod": "SCREEN"
+  }'
+```
+
+**Provision a teacher (as ADMIN):**
+
+```bash
+curl -X POST http://localhost:8080/api/auth/admin/users \
+  -H "Authorization: Bearer <admin_access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "teacher@test.com",
+    "firstName": "Jane",
+    "lastName": "Roe",
+    "role": "TEACHER",
+    "authMethod": "PASSWORD"
   }'
 ```
 
@@ -330,11 +448,26 @@ curl -X POST http://localhost:8080/api/dictionary/words \
 
 ### Sign-up
 
-1. Client sends `POST /api/auth/register` with email, password, role (`TEACHER` or `STUDENT`), and `activationMethod` (`EMAIL` or `SCREEN`).
+1. Client sends `POST /api/auth/register` with email, password, and `activationMethod` (`EMAIL` or `SCREEN`). Self-registration always creates a **STUDENT** — the `TEACHER` and `ADMIN` roles are assigned only through admin provisioning.
 2. The service creates a user record with `activated = false` and generates an activation code.
 3. **If `activationMethod = EMAIL`:** A `ts.user.registered` Kafka event is published. The notification-service consumes it and sends an activation email via MailDev (or a real SMTP server in production). The user clicks the link to activate.
 4. **If `activationMethod = SCREEN`:** The activation link is returned directly in the response body. The client can call `POST /api/auth/activate?code=<code>` immediately.
-5. Once activated, the user can log in.
+5. On activation the service publishes a `ts.user.activated` event. The course-service consumes it and provisions a `Student` row for new STUDENT users.
+6. Once activated, the user can log in.
+
+### Admin User Provisioning
+
+1. An ADMIN calls `POST /api/auth/admin/users` with the target email, name, role, and `authMethod`.
+2. **`authMethod = PASSWORD`:** the user is created immediately (activated, `mustChangePassword = true`) with a randomly generated temporary password. An `AdminProvisionedUserEvent` is published to `ts.user.admin-provisioned`; the notification-service emails the temporary password.
+3. **`authMethod = GOOGLE`:** a pending `user_invitation` (7-day expiry) is stored instead of a user. The same event triggers an invitation email containing an invite link.
+4. When the invited user signs in with Google, the OAuth2 success handler consumes the matching invitation and creates the account with the invited role.
+
+### Forced Password Change
+
+1. A user provisioned with a temporary password logs in via `POST /api/auth/login`.
+2. Because `mustChangePassword = true`, the response contains `mustChangePassword = true` and a short-lived `tempToken` (instead of access/refresh tokens).
+3. The client collects a new password and calls `POST /api/auth/change-password` with the `tempToken` and `newPassword`.
+4. On success the flag is cleared and the response contains the normal `accessToken` / `refreshToken`.
 
 ### Login with 2FA
 
@@ -348,9 +481,9 @@ curl -X POST http://localhost:8080/api/dictionary/words \
 ### OAuth2 Google Login
 
 1. Client redirects to `/oauth2/authorization/google` through the gateway.
-2. Spring Security handles the OAuth2 authorization code flow with Google.
-3. On success, a user record is created (or matched) with `provider = GOOGLE`.
-4. JWT tokens are issued and returned to the client.
+2. Spring Security handles the OAuth2 authorization code flow with Google; the callback returns to `/login/oauth2/code/google` (routed to the auth-service).
+3. The `OAuth2LoginSuccessHandler` matches an existing user by Google `sub` or email (linking the provider if needed), or creates a new one. A pending invitation for that email is consumed to assign its role; otherwise the new user defaults to STUDENT.
+4. JWT access/refresh tokens are minted and the user is redirected to the frontend at `app.oauth2.success-redirect-uri` (`http://localhost:3000/oauth/callback` by default) with the tokens as query parameters.
 
 ---
 
@@ -370,6 +503,7 @@ The dictionary uses a **directed acyclic graph (DAG)** model stored in MongoDB w
 - **Cycle detection** is enforced: the service prevents creating a link that would form a cycle (e.g., A -> B -> C -> A).
 - **Root words** are words that have no incoming links (no parents). Use `GET /roots` to retrieve them.
 - **Full graph** can be fetched via `GET /graph`, which returns all words and links for the authenticated user.
+- **Error messages** are externalized to `messages.properties` and resolved via Spring's `MessageSource` (using the request locale), so validation/lookup errors can be localized.
 
 ### Example Graph
 
@@ -389,10 +523,14 @@ The dictionary uses a **directed acyclic graph (DAG)** model stored in MongoDB w
 
 ### Kafka Topics
 
-| Topic                   | Producer         | Consumer              | Payload                        |
-|-------------------------|------------------|-----------------------|--------------------------------|
-| `ts.user.registered`    | auth-service     | notification-service  | userId, email, firstName, activationCode, activationMethod |
-| `ts.assignment.created` | course-service   | notification-service  | assignmentId + assignment details |
+| Topic                       | Producer       | Consumer              | Payload                        |
+|-----------------------------|----------------|-----------------------|--------------------------------|
+| `ts.user.registered`        | auth-service   | notification-service  | userId, email, firstName, activationCode, activationMethod |
+| `ts.user.activated`         | auth-service   | course-service        | userId, email, firstName, lastName, role — course-service provisions a `Student` row for STUDENT users |
+| `ts.user.admin-provisioned` | auth-service   | notification-service  | email, role, authMethod, inviteToken, tempPassword — sends invitation or temp-password email |
+| `ts.assignment.created`     | course-service | notification-service  | assignmentId + assignment details |
+
+Kafka consumers use Spring Kafka's `ErrorHandlingDeserializer` (wrapping the JSON/String delegates) so a poison message can't halt the consumer; trusted packages are restricted to `com.ts.common.dto`.
 
 ### Synchronous Communication
 
@@ -412,11 +550,11 @@ TeacherSupporter/
 │   ├── Dockerfile
 │   ├── pom.xml
 │   └── src/
-├── auth-service/               # Authentication & user management
+├── auth-service/               # Auth, OAuth2, 2FA, admin user mgmt & invitations
 │   ├── Dockerfile
 │   ├── pom.xml
-│   └── src/
-├── common/                     # Shared DTOs and event classes
+│   └── src/                    # Flyway migrations under src/main/resources/db/migration
+├── common/                     # Shared DTOs and Kafka event records
 │   ├── pom.xml
 │   └── src/
 ├── config-server/              # Spring Cloud Config Server
@@ -443,9 +581,12 @@ TeacherSupporter/
 │   ├── Dockerfile
 │   ├── pom.xml
 │   └── src/
-├── notification-service/       # Kafka consumer, email sender
+├── notification-service/       # Kafka consumer, email sender (HTML templates)
 │   ├── Dockerfile
 │   ├── pom.xml
+│   └── src/
+├── frontend/                   # React 19 + Vite + TypeScript SPA
+│   ├── package.json
 │   └── src/
 ├── docker-compose.yml          # Full stack orchestration
 ├── pom.xml                     # Parent POM (multi-module)
@@ -476,6 +617,8 @@ In `docker-compose.yml`, environment variables override Config Server values. Co
 | `SPRING_KAFKA_BOOTSTRAP_SERVERS`         | Kafka broker address                   |
 | `SPRING_MAIL_HOST` / `SPRING_MAIL_PORT`  | SMTP server for notifications          |
 | `JWT_SECRET`                             | JWT signing key                        |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth2 client credentials (auth-service) |
+| `JAVA_TOOL_OPTIONS`                      | JDWP remote-debug agent (per-service debug port) |
 
 ---
 
@@ -496,7 +639,7 @@ In `docker-compose.yml`, environment variables override Config Server values. Co
 1. Define the event record in the `common` module (e.g., `com.ts.common.dto.MyNewEvent`).
 2. In the **producer** service, create a publisher component that uses `KafkaTemplate` to send to a topic (naming convention: `ts.<domain>.<action>`).
 3. In the **consumer** service, create a listener class annotated with `@KafkaListener(topics = "ts.<domain>.<action>")`.
-4. If needed, register a new Kafka consumer configuration or update the existing `KafkaConsumerConfig`.
+4. Consumer settings (group ID, deserializers, trusted packages) live in the service's YAML under `spring.kafka.consumer` in the Config Server — no Java `@Configuration` class is needed. Add the new event's package to `spring.json.trusted.packages` if it lives outside `com.ts.common.dto`.
 
 ### Adding a New API Endpoint
 

@@ -1,0 +1,47 @@
+MailDev                                                                                                                                                                                                                           
+                                         
+  MailDev is a fake SMTP server + email inbox UI for development. It catches all emails your app sends so they never go to real inboxes — you just read them in a browser.                                                          
+                                                                                                                                                                                                                                    
+  ---                                                                                                                                                                                                                               
+  How it works                                              
+
+  Your App  →  sends email to SMTP localhost:1025  →  MailDev catches it
+                                                           ↓
+                                                View at http://localhost:1080
+
+  No real email is ever sent. No Gmail/Outlook needed.
+
+  ---
+  In your project
+
+  notification-service sends emails (account activation, notifications) via SMTP. In Docker it points to:
+  SPRING_MAIL_HOST: maildev
+  SPRING_MAIL_PORT: 1025
+
+  When running locally in terminal, it falls back to localhost:1025 (already set in notification-service.yml).
+
+  ---
+  How to use it
+
+  1. Trigger something that sends an email (e.g. register a new user)
+  2. Open http://localhost:1080
+  3. You'll see the email appear in the inbox — subject, body, HTML preview, everything
+
+  ---
+  Why not just use Gmail?
+
+  ┌────────────────────────────────────┬────────────────────────────┐
+  │              MailDev               │   Real SMTP (Gmail etc.)   │
+  ├────────────────────────────────────┼────────────────────────────┤
+  │ No credentials needed              │ Needs app password / OAuth │
+  ├────────────────────────────────────┼────────────────────────────┤
+  │ Works offline                      │ Needs internet             │
+  ├────────────────────────────────────┼────────────────────────────┤
+  │ Catches all emails instantly       │ Can go to spam             │
+  ├────────────────────────────────────┼────────────────────────────┤
+  │ Safe — nothing leaves your machine │ Sends to real inboxes      │
+  ├────────────────────────────────────┼────────────────────────────┤
+  │ Easy to inspect raw HTML           │ Hard to debug templates    │
+  └────────────────────────────────────┴────────────────────────────┘
+
+  It's the standard tool for testing email flows during development.

@@ -11,6 +11,7 @@ import com.ts.auth.dto.UserResponse;
 import com.ts.auth.entity.RefreshToken;
 import com.ts.auth.entity.Role;
 import com.ts.auth.entity.User;
+import com.ts.auth.event.UserActivatedPublisher;
 import com.ts.auth.event.UserRegisteredPublisher;
 import com.ts.auth.repository.RefreshTokenRepository;
 import com.ts.auth.repository.UserRepository;
@@ -34,6 +35,7 @@ public class AuthService {
     private final JwtService jwtService;
     private final TotpService totpService;
     private final UserRegisteredPublisher userRegisteredPublisher;
+    private final UserActivatedPublisher userActivatedPublisher;
 
     public ActivationResponse register(RegisterRequest req) {
         if (userRepository.existsByEmail(req.email())) {
@@ -45,7 +47,7 @@ public class AuthService {
         user.setPasswordHash(passwordEncoder.encode(req.password()));
         user.setFirstName(req.firstName());
         user.setLastName(req.lastName());
-        user.setRole(Role.valueOf(req.role().toUpperCase()));
+        user.setRole(Role.STUDENT);
         user.setActivationCode(UUID.randomUUID().toString());
         user.setActivated(false);
 
@@ -67,7 +69,6 @@ public class AuthService {
         }
     }
 
-    @Transactional(readOnly = true)
     public LoginResponse login(LoginRequest req) {
         User user = userRepository.findByEmail(req.email())
                 .orElseThrow(() -> new IllegalArgumentException("Invalid email or password"));
@@ -80,10 +81,32 @@ public class AuthService {
             throw new IllegalStateException("Account is not activated");
         }
 
+        if (user.isMustChangePassword()) {
+            String tempToken = jwtService.generatePasswordChangeToken(user);
+            return new LoginResponse(null, null, false, true, tempToken);
+        }
+
         if (user.isTotpEnabled()) {
             String tempToken = jwtService.generateTempToken(user);
-            return new LoginResponse(null, null, true, tempToken);
+            return new LoginResponse(null, null, true, false, tempToken);
         }
+
+        return createTokens(user);
+    }
+
+    public LoginResponse changePassword(String tempToken, String newPassword) {
+        io.jsonwebtoken.Claims claims = jwtService.parseToken(tempToken);
+        Boolean pending = claims.get("passwordChangeRequired", Boolean.class);
+        if (pending == null || !pending) {
+            throw new IllegalArgumentException("Invalid password-change token");
+        }
+        Long userId = Long.parseLong(claims.getSubject());
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new IllegalArgumentException("User not found"));
+
+        user.setPasswordHash(passwordEncoder.encode(newPassword));
+        user.setMustChangePassword(false);
+        userRepository.save(user);
 
         return createTokens(user);
     }
@@ -110,7 +133,7 @@ public class AuthService {
         }
 
         String accessToken = jwtService.generateAccessToken(refreshToken.getUser());
-        return new LoginResponse(accessToken, refreshToken.getToken(), false, null);
+        return new LoginResponse(accessToken, refreshToken.getToken(), false, false, null);
     }
 
     public void activate(String code) {
@@ -120,6 +143,8 @@ public class AuthService {
         user.setActivated(true);
         user.setActivationCode(null);
         userRepository.save(user);
+
+        userActivatedPublisher.publish(user);
     }
 
     public void logout(String refreshToken) {
@@ -171,7 +196,7 @@ public class AuthService {
         userRepository.save(user);
     }
 
-    private LoginResponse createTokens(User user) {
+    public LoginResponse createTokens(User user) {
         String accessToken = jwtService.generateAccessToken(user);
         String refreshTokenValue = jwtService.generateRefreshTokenValue();
 
@@ -182,7 +207,7 @@ public class AuthService {
         refreshToken.setCreatedAt(Instant.now());
         refreshTokenRepository.save(refreshToken);
 
-        return new LoginResponse(accessToken, refreshTokenValue, false, null);
+        return new LoginResponse(accessToken, refreshTokenValue, false, false, null);
     }
 
     private UserResponse toUserResponse(User user) {

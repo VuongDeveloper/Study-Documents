@@ -4,11 +4,16 @@ import type {
   WordDefinitionResponse,
   WordLinkRequest,
   WordGraphResponse,
+  PageResponse,
 } from '@/types';
 
 export const dictionaryApi = {
-  listWords: (page = 0, size = 20, q?: string) =>
-    apiClient.get<WordDefinitionResponse[]>('/dictionary/words', { params: { page, size, q } }),
+  listWords: async (page = 0, size = 20, q?: string) => {
+    const res = await apiClient.get<PageResponse<WordDefinitionResponse>>('/dictionary/words', {
+      params: { page, size, q },
+    });
+    return { ...res, data: res.data.content };
+  },
   getWord: (id: string) =>
     apiClient.get<WordDefinitionResponse>(`/dictionary/words/${id}`),
   createWord: (data: WordDefinitionRequest) =>
@@ -23,8 +28,10 @@ export const dictionaryApi = {
     apiClient.get<WordDefinitionResponse[]>(`/dictionary/words/${id}/children`),
   getRoots: () =>
     apiClient.get<WordDefinitionResponse[]>('/dictionary/roots'),
-  getGraph: () =>
-    apiClient.get<WordGraphResponse[]>('/dictionary/graph'),
+  getGraph: async () => {
+    const res = await apiClient.get<WordGraphResponse>('/dictionary/graph');
+    return { ...res, data: res.data.children };
+  },
   createLink: (data: WordLinkRequest) =>
     apiClient.post('/dictionary/links', data),
   deleteLink: (id: string) =>

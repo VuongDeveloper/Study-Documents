@@ -34,6 +34,11 @@ export default function LoginPage() {
     try {
       const { data } = await authApi.login(formData);
 
+      if (data.mustChangePassword) {
+        navigate('/change-password', { state: { tempToken: data.tempToken } });
+        return;
+      }
+
       if (data.requiresTwoFactor) {
         navigate('/2fa/verify', { state: { tempToken: data.tempToken } });
         return;

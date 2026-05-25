@@ -1,8 +1,10 @@
 server:
   port: 8081
+  error:
+    include-message: always
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5433/ts_auth
+    url: jdbc:postgresql://localhost:5432/ts_auth
     username: postgres
     password: root
     driver-class-name: org.postgresql.Driver
@@ -29,6 +31,7 @@ spring:
             client-id: ${GOOGLE_CLIENT_ID:placeholder}
             client-secret: ${GOOGLE_CLIENT_SECRET:placeholder}
             scope: openid, profile, email
+            redirect-uri: http://localhost:8080/login/oauth2/code/google
 app:
   jwt:
     secret: ${JWT_SECRET:mySecretKeyThatIsAtLeast256BitsLongForHS256Algorithm123456}
@@ -38,6 +41,8 @@ app:
     issuer: TeacherSupporter
   activation:
     base-url: http://localhost:3000/activate
+  oauth2:
+    success-redirect-uri: http://localhost:3000/oauth/callback
 management:
   tracing:
     sampling:

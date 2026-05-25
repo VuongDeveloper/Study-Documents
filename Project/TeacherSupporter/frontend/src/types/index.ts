@@ -17,7 +17,48 @@ export interface LoginResponse {
   accessToken: string;
   refreshToken: string;
   requiresTwoFactor: boolean;
+  mustChangePassword: boolean;
   tempToken?: string;
+}
+
+export interface ChangePasswordRequest {
+  tempToken: string;
+  newPassword: string;
+}
+
+export interface AdminCreateUserRequest {
+  email: string;
+  role: 'STUDENT' | 'TEACHER';
+  authMethod: 'PASSWORD' | 'GOOGLE';
+  firstName?: string;
+  lastName?: string;
+}
+
+export interface AdminCreateUserResponse {
+  email: string;
+  role: string;
+  authMethod: string;
+  status: 'USER_CREATED' | 'INVITATION_SENT';
+}
+
+export interface AdminUserResponse {
+  id: number;
+  email: string;
+  firstName: string | null;
+  lastName: string | null;
+  role: string;
+  provider: string;
+  activated: boolean;
+  mustChangePassword: boolean;
+  createdAt: string;
+}
+
+export interface PageResponse<T> {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  number: number;
+  size: number;
 }
 
 export interface TotpVerifyRequest {

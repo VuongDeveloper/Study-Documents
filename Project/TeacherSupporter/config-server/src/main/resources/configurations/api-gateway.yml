@@ -14,6 +14,10 @@ spring:
           uri: lb://auth-service
           predicates:
             - Path=/oauth2/**
+        - id: auth-oauth2-callback
+          uri: lb://auth-service
+          predicates:
+            - Path=/login/oauth2/**
         - id: course-service-courses
           uri: lb://course-service
           predicates:
