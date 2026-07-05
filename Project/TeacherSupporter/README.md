@@ -59,47 +59,47 @@ All client requests enter through the **API Gateway** (port 8080), which validat
 
 ## Tech Stack
 
-| Category          | Technology                                     |
-|-------------------|------------------------------------------------|
-| Language          | Java 25 (Eclipse Temurin)                      |
-| Framework         | Spring Boot 3.5.6                              |
-| Cloud             | Spring Cloud 2025.0.0                          |
-| Service Discovery | Netflix Eureka                                 |
-| API Gateway       | Spring Cloud Gateway                           |
-| Configuration     | Spring Cloud Config Server (native)            |
+| Category          | Technology                                                    |
+| ----------------- | ------------------------------------------------------------- |
+| Language          | Java 25 (Eclipse Temurin)                                     |
+| Framework         | Spring Boot 3.5.6                                             |
+| Cloud             | Spring Cloud 2025.0.0                                         |
+| Service Discovery | Netflix Eureka                                                |
+| API Gateway       | Spring Cloud Gateway                                          |
+| Configuration     | Spring Cloud Config Server (native)                           |
 | Security          | Spring Security, JWT (jjwt 0.12.6), TOTP 2FA, OAuth2 (Google) |
-| Messaging         | Apache Kafka 3.9                               |
-| Databases         | PostgreSQL 17, MongoDB 8                       |
-| Migrations        | Flyway (auth-service, course-service)          |
-| Inter-service     | OpenFeign (sync), Kafka (async)                |
-| API Docs          | SpringDoc OpenAPI 2.8.6 (Swagger UI)           |
-| Tracing           | Zipkin                                         |
-| Build             | Maven 3.9+ (multi-module)                      |
-| Containerization  | Docker, Docker Compose                         |
-| Frontend          | React 19, Vite, TypeScript, Tailwind CSS v4, shadcn/ui |
-| Caching (future)  | Redis                                          |
+| Messaging         | Apache Kafka 3.9                                              |
+| Databases         | PostgreSQL 17, MongoDB 8                                      |
+| Migrations        | Flyway (auth-service, course-service)                         |
+| Inter-service     | OpenFeign (sync), Kafka (async)                               |
+| API Docs          | SpringDoc OpenAPI 2.8.6 (Swagger UI)                          |
+| Tracing           | Zipkin                                                        |
+| Build             | Maven 3.9+ (multi-module)                                     |
+| Containerization  | Docker, Docker Compose                                        |
+| Frontend          | React 19, Vite, TypeScript, Tailwind CSS v4, shadcn/ui        |
+| Caching (future)  | Redis                                                         |
 
 ---
 
 ## Services
 
-| Service              | Port       | Description                              | Database                  |
-|----------------------|------------|------------------------------------------|---------------------------|
-| config-server        | 8888       | Centralized configuration for all services | -                       |
-| discovery-server     | 8761       | Eureka service registry and dashboard    | -                         |
-| api-gateway          | 8080       | Single entry point, JWT validation, routing | -                      |
-| auth-service         | 8081       | Authentication, OAuth2 Google, TOTP 2FA  | PostgreSQL (`ts_auth`)    |
-| course-service       | 8082       | Courses, students, assignments, enrollments | PostgreSQL (`ts_course`) |
-| dictionary-service   | 8083       | Word definitions, graph links, flexible schema | MongoDB (`ts_dictionary`) |
-| notification-service | 8084       | Email notifications (Kafka consumer)     | - (stateless)             |
-| kafka                | 9092       | Event streaming broker                   | -                         |
-| kafka-ui             | 9090       | Kafka management web UI                  | -                         |
-| zipkin               | 9411       | Distributed tracing dashboard            | -                         |
-| maildev              | 1025/1080  | Dev email server (SMTP / Web UI)         | -                         |
-| postgres-auth        | 5433       | Auth database                            | -                         |
-| postgres-course      | 5434       | Course database                          | -                         |
-| mongodb              | 27017      | Dictionary database                      | -                         |
-| frontend (Vite)      | 3000       | React single-page app (dev server)       | -                         |
+| Service              | Port      | Description                                    | Database                    |
+| -------------------- | --------- | ---------------------------------------------- | --------------------------- |
+| config-server        | 8888      | Centralized configuration for all services     | -                           |
+| discovery-server     | 8761      | Eureka service registry and dashboard          | -                           |
+| api-gateway          | 8080      | Single entry point, JWT validation, routing    | -                           |
+| auth-service         | 8081      | Authentication, OAuth2 Google, TOTP 2FA        | PostgreSQL (`ts_auth`)    |
+| course-service       | 8082      | Courses, students, assignments, enrollments    | PostgreSQL (`ts_course`)  |
+| dictionary-service   | 8083      | Word definitions, graph links, flexible schema | MongoDB (`ts_dictionary`) |
+| notification-service | 8084      | Email notifications (Kafka consumer)           | - (stateless)               |
+| kafka                | 9092      | Event streaming broker                         | -                           |
+| kafka-ui             | 9090      | Kafka management web UI                        | -                           |
+| zipkin               | 9411      | Distributed tracing dashboard                  | -                           |
+| maildev              | 1025/1080 | Dev email server (SMTP / Web UI)               | -                           |
+| postgres-auth        | 5433      | Auth database                                  | -                           |
+| postgres-course      | 5434      | Course database                                | -                           |
+| mongodb              | 27017     | Dictionary database                            | -                           |
+| frontend (Vite)      | 3000      | React single-page app (dev server)             | -                           |
 
 > **Remote debugging:** in `docker-compose.yml` each Spring service also exposes a JDWP port (`config-server` 5888, `discovery-server` 5761, `api-gateway` 5080, `auth` 5081, `course` 5082, `dictionary` 5083, `notification` 5084). Attach your IDE debugger to `localhost:<port>`.
 >
@@ -204,7 +204,7 @@ mvn clean package -DskipTests
 **Terminal 1 -- Infrastructure (bundled, rarely needs per-service debugging)**
 
 ```bash
-docker compose up postgres-auth postgres-course mongodb kafka kafka-ui zipkin maildev
+docker compose up postgres-auth postgres-course mongodb kafka kafka-ui zipkin maildev minio
 ```
 
 Wait until Postgres and Kafka are ready.
@@ -269,109 +269,109 @@ Flyway runs automatically when `auth-service` and `course-service` start — loo
 
 All requests go through the API Gateway at `http://localhost:8080`. The gateway strips the `/api/{service}` prefix before forwarding.
 
-| Gateway Prefix         | Target Service       |
-|------------------------|----------------------|
-| `/api/auth/**`         | auth-service         |
-| `/api/auth/admin/**`   | auth-service (ADMIN) |
-| `/api/courses/**`      | course-service       |
-| `/api/students/**`     | course-service       |
-| `/api/assignments/**`  | course-service       |
-| `/api/enrollments/**`  | course-service       |
-| `/api/dictionary/**`   | dictionary-service   |
-| `/oauth2/**`           | auth-service         |
-| `/login/oauth2/**`     | auth-service (OAuth2 redirect callback) |
+| Gateway Prefix          | Target Service                          |
+| ----------------------- | --------------------------------------- |
+| `/api/auth/**`        | auth-service                            |
+| `/api/auth/admin/**`  | auth-service (ADMIN)                    |
+| `/api/courses/**`     | course-service                          |
+| `/api/students/**`    | course-service                          |
+| `/api/assignments/**` | course-service                          |
+| `/api/enrollments/**` | course-service                          |
+| `/api/dictionary/**`  | dictionary-service                      |
+| `/oauth2/**`          | auth-service                            |
+| `/login/oauth2/**`    | auth-service (OAuth2 redirect callback) |
 
 ### Authentication Endpoints
 
 All paths below are relative to the gateway prefix `/api/auth`.
 
-| Method | Path                    | Auth Required | Description                              |
-|--------|-------------------------|---------------|------------------------------------------|
-| POST   | `/register`             | No            | Self-register a new user (always created as STUDENT) |
-| POST   | `/login`                | No            | Login with email and password            |
-| POST   | `/verify-2fa`           | No            | Submit TOTP code after login (if 2FA enabled) |
+| Method | Path                      | Auth Required | Description                                                       |
+| ------ | ------------------------- | ------------- | ----------------------------------------------------------------- |
+| POST   | `/register`             | No            | Self-register a new user (always created as STUDENT)              |
+| POST   | `/login`                | No            | Login with email and password                                     |
+| POST   | `/verify-2fa`           | No            | Submit TOTP code after login (if 2FA enabled)                     |
 | POST   | `/change-password`      | No            | Set a new password using a `tempToken` (forced password change) |
-| POST   | `/activate`             | No            | Activate account with activation code    |
-| POST   | `/refresh`              | No            | Refresh an expired access token          |
-| POST   | `/logout`               | No            | Revoke a refresh token                   |
-| GET    | `/me`                   | Yes           | Get current authenticated user profile   |
-| POST   | `/me/enable-2fa`        | Yes           | Generate TOTP secret and QR code URI     |
-| POST   | `/me/enable-2fa/verify` | Yes           | Confirm 2FA setup with a TOTP code       |
-| POST   | `/me/disable-2fa`       | Yes           | Disable two-factor authentication        |
-| GET    | `/users/{id}`           | Yes           | Get user by ID (internal / feign)        |
+| POST   | `/activate`             | No            | Activate account with activation code                             |
+| POST   | `/refresh`              | No            | Refresh an expired access token                                   |
+| POST   | `/logout`               | No            | Revoke a refresh token                                            |
+| GET    | `/me`                   | Yes           | Get current authenticated user profile                            |
+| POST   | `/me/enable-2fa`        | Yes           | Generate TOTP secret and QR code URI                              |
+| POST   | `/me/enable-2fa/verify` | Yes           | Confirm 2FA setup with a TOTP code                                |
+| POST   | `/me/disable-2fa`       | Yes           | Disable two-factor authentication                                 |
+| GET    | `/users/{id}`           | Yes           | Get user by ID (internal / feign)                                 |
 
 ### Admin User Endpoints
 
 All paths below are relative to the gateway prefix `/api/auth/admin` and require the **ADMIN** role.
 
-| Method | Path           | Description                                                        |
-|--------|----------------|--------------------------------------------------------------------|
-| POST   | `/users`       | Provision a user. `authMethod=PASSWORD` creates the account with a generated temporary password (emailed, must be changed on first login); `authMethod=GOOGLE` creates a pending invitation (emailed) the user accepts by signing in with Google. |
-| GET    | `/users`       | List all users (paginated)                                         |
-| PATCH  | `/users/{id}`  | Update a user's role (cannot assign `ADMIN`)                       |
-| DELETE | `/users/{id}`  | Delete a user (cannot delete an admin)                             |
+| Method | Path            | Description                                                                                                                                                                                                                                          |
+| ------ | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/users`      | Provision a user.`authMethod=PASSWORD` creates the account with a generated temporary password (emailed, must be changed on first login); `authMethod=GOOGLE` creates a pending invitation (emailed) the user accepts by signing in with Google. |
+| GET    | `/users`      | List all users (paginated)                                                                                                                                                                                                                           |
+| PATCH  | `/users/{id}` | Update a user's role (cannot assign `ADMIN`)                                                                                                                                                                                                       |
+| DELETE | `/users/{id}` | Delete a user (cannot delete an admin)                                                                                                                                                                                                               |
 
 ### Course Endpoints
 
 All paths below are relative to the gateway prefix `/api/courses`.
 
-| Method | Path                      | Auth / Role | Description                        |
-|--------|---------------------------|-------------|------------------------------------|
-| GET    | `/courses`                | TEACHER     | List courses owned by the teacher (paginated) |
-| GET    | `/courses/{id}`           | Any         | Get a single course by ID          |
-| POST   | `/courses`                | TEACHER     | Create a new course                |
-| PUT    | `/courses/{id}`           | TEACHER     | Update a course                    |
-| DELETE | `/courses/{id}`           | TEACHER     | Delete a course                    |
-| GET    | `/courses/{id}/assignments` | Any       | List assignments for a course      |
-| POST   | `/courses/{id}/assignments` | TEACHER   | Create an assignment in a course   |
+| Method | Path                          | Auth / Role | Description                                   |
+| ------ | ----------------------------- | ----------- | --------------------------------------------- |
+| GET    | `/courses`                  | TEACHER     | List courses owned by the teacher (paginated) |
+| GET    | `/courses/{id}`             | Any         | Get a single course by ID                     |
+| POST   | `/courses`                  | TEACHER     | Create a new course                           |
+| PUT    | `/courses/{id}`             | TEACHER     | Update a course                               |
+| DELETE | `/courses/{id}`             | TEACHER     | Delete a course                               |
+| GET    | `/courses/{id}/assignments` | Any         | List assignments for a course                 |
+| POST   | `/courses/{id}/assignments` | TEACHER     | Create an assignment in a course              |
 
 ### Student Endpoints
 
 All paths below are relative to the gateway prefix `/api/students`.
 
-| Method | Path                  | Auth / Role | Description                              |
-|--------|-----------------------|-------------|------------------------------------------|
-| GET    | `/students/me/courses`     | STUDENT     | List courses the student is enrolled in  |
-| GET    | `/students/me/assignments` | STUDENT     | List assignments for enrolled courses    |
+| Method | Path                         | Auth / Role | Description                             |
+| ------ | ---------------------------- | ----------- | --------------------------------------- |
+| GET    | `/students/me/courses`     | STUDENT     | List courses the student is enrolled in |
+| GET    | `/students/me/assignments` | STUDENT     | List assignments for enrolled courses   |
 
 ### Assignment Endpoints
 
 All paths below are relative to the gateway prefix `/api/assignments`.
 
-| Method | Path                 | Auth / Role | Description              |
-|--------|----------------------|-------------|--------------------------|
-| GET    | `/assignments/{id}`  | Any         | Get a single assignment  |
-| PUT    | `/assignments/{id}`  | TEACHER     | Update an assignment     |
-| DELETE | `/assignments/{id}`  | TEACHER     | Delete an assignment     |
+| Method | Path                  | Auth / Role | Description             |
+| ------ | --------------------- | ----------- | ----------------------- |
+| GET    | `/assignments/{id}` | Any         | Get a single assignment |
+| PUT    | `/assignments/{id}` | TEACHER     | Update an assignment    |
+| DELETE | `/assignments/{id}` | TEACHER     | Delete an assignment    |
 
 ### Enrollment Endpoints
 
 All paths below are relative to the gateway prefix `/api/enrollments`.
 
-| Method | Path                  | Auth / Role | Description                            |
-|--------|-----------------------|-------------|----------------------------------------|
-| POST   | `/enrollments`        | TEACHER     | Enroll a student in a course           |
-| DELETE | `/enrollments/{id}`   | TEACHER     | Remove a student from a course         |
-| GET    | `/enrollments`        | Any         | List enrollments for a course (query param `courseId`) |
+| Method | Path                  | Auth / Role | Description                                              |
+| ------ | --------------------- | ----------- | -------------------------------------------------------- |
+| POST   | `/enrollments`      | TEACHER     | Enroll a student in a course                             |
+| DELETE | `/enrollments/{id}` | TEACHER     | Remove a student from a course                           |
+| GET    | `/enrollments`      | Any         | List enrollments for a course (query param `courseId`) |
 
 ### Dictionary Endpoints
 
 All paths below are relative to the gateway prefix `/api/dictionary`.
 
-| Method | Path                     | Auth / Role | Description                          |
-|--------|--------------------------|-------------|--------------------------------------|
-| GET    | `/words`                 | TEACHER     | Search words (optional query param `q`, paginated) |
-| GET    | `/words/{id}`            | TEACHER     | Get a word definition                |
-| POST   | `/words`                 | TEACHER     | Create a word definition             |
-| PUT    | `/words/{id}`            | TEACHER     | Update a word definition             |
-| DELETE | `/words/{id}`            | TEACHER     | Delete a word definition             |
-| GET    | `/words/{id}/parents`    | TEACHER     | Get parent words in the graph        |
-| GET    | `/words/{id}/children`   | TEACHER     | Get child words in the graph         |
-| GET    | `/roots`                 | TEACHER     | Get all root words (no parents)      |
-| GET    | `/graph`                 | TEACHER     | Get the full word graph for the user |
-| POST   | `/links`                 | TEACHER     | Create a parent-child link           |
-| DELETE | `/links/{id}`            | TEACHER     | Delete a link                        |
-| PATCH  | `/links/{id}`            | TEACHER     | Update link position (`{"position": N}`) |
+| Method | Path                     | Auth / Role | Description                                          |
+| ------ | ------------------------ | ----------- | ---------------------------------------------------- |
+| GET    | `/words`               | TEACHER     | Search words (optional query param `q`, paginated) |
+| GET    | `/words/{id}`          | TEACHER     | Get a word definition                                |
+| POST   | `/words`               | TEACHER     | Create a word definition                             |
+| PUT    | `/words/{id}`          | TEACHER     | Update a word definition                             |
+| DELETE | `/words/{id}`          | TEACHER     | Delete a word definition                             |
+| GET    | `/words/{id}/parents`  | TEACHER     | Get parent words in the graph                        |
+| GET    | `/words/{id}/children` | TEACHER     | Get child words in the graph                         |
+| GET    | `/roots`               | TEACHER     | Get all root words (no parents)                      |
+| GET    | `/graph`               | TEACHER     | Get the full word graph for the user                 |
+| POST   | `/links`               | TEACHER     | Create a parent-child link                           |
+| DELETE | `/links/{id}`          | TEACHER     | Delete a link                                        |
+| PATCH  | `/links/{id}`          | TEACHER     | Update link position (`{"position": N}`)           |
 
 ### Example curl Commands
 
@@ -523,20 +523,20 @@ The dictionary uses a **directed acyclic graph (DAG)** model stored in MongoDB w
 
 ### Kafka Topics
 
-| Topic                       | Producer       | Consumer              | Payload                        |
-|-----------------------------|----------------|-----------------------|--------------------------------|
-| `ts.user.registered`        | auth-service   | notification-service  | userId, email, firstName, activationCode, activationMethod |
-| `ts.user.activated`         | auth-service   | course-service        | userId, email, firstName, lastName, role — course-service provisions a `Student` row for STUDENT users |
-| `ts.user.admin-provisioned` | auth-service   | notification-service  | email, role, authMethod, inviteToken, tempPassword — sends invitation or temp-password email |
-| `ts.assignment.created`     | course-service | notification-service  | assignmentId + assignment details |
+| Topic                         | Producer       | Consumer             | Payload                                                                                                   |
+| ----------------------------- | -------------- | -------------------- | --------------------------------------------------------------------------------------------------------- |
+| `ts.user.registered`        | auth-service   | notification-service | userId, email, firstName, activationCode, activationMethod                                                |
+| `ts.user.activated`         | auth-service   | course-service       | userId, email, firstName, lastName, role — course-service provisions a `Student` row for STUDENT users |
+| `ts.user.admin-provisioned` | auth-service   | notification-service | email, role, authMethod, inviteToken, tempPassword — sends invitation or temp-password email             |
+| `ts.assignment.created`     | course-service | notification-service | assignmentId + assignment details                                                                         |
 
 Kafka consumers use Spring Kafka's `ErrorHandlingDeserializer` (wrapping the JSON/String delegates) so a poison message can't halt the consumer; trusted packages are restricted to `com.ts.common.dto`.
 
 ### Synchronous Communication
 
-| Caller          | Target        | Method   | Protocol                   |
-|-----------------|---------------|----------|----------------------------|
-| course-service  | auth-service  | `GET /users/{id}` | OpenFeign (via Eureka) |
+| Caller         | Target       | Method              | Protocol               |
+| -------------- | ------------ | ------------------- | ---------------------- |
+| course-service | auth-service | `GET /users/{id}` | OpenFeign (via Eureka) |
 
 The course-service uses OpenFeign with a fallback to fetch user details from the auth-service. This is used, for example, when enrolling students to validate that the user exists and has the STUDENT role.
 
@@ -608,17 +608,17 @@ TeacherSupporter/
 
 In `docker-compose.yml`, environment variables override Config Server values. Common overrides:
 
-| Variable                                 | Purpose                                |
-|------------------------------------------|----------------------------------------|
-| `SPRING_CONFIG_IMPORT`                   | Config Server URL                      |
-| `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE`   | Eureka URL                             |
-| `SPRING_DATASOURCE_URL`                  | PostgreSQL JDBC URL                    |
-| `SPRING_DATA_MONGODB_URI`                | MongoDB connection URI                 |
-| `SPRING_KAFKA_BOOTSTRAP_SERVERS`         | Kafka broker address                   |
-| `SPRING_MAIL_HOST` / `SPRING_MAIL_PORT`  | SMTP server for notifications          |
-| `JWT_SECRET`                             | JWT signing key                        |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth2 client credentials (auth-service) |
-| `JAVA_TOOL_OPTIONS`                      | JDWP remote-debug agent (per-service debug port) |
+| Variable                                        | Purpose                                          |
+| ----------------------------------------------- | ------------------------------------------------ |
+| `SPRING_CONFIG_IMPORT`                        | Config Server URL                                |
+| `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE`        | Eureka URL                                       |
+| `SPRING_DATASOURCE_URL`                       | PostgreSQL JDBC URL                              |
+| `SPRING_DATA_MONGODB_URI`                     | MongoDB connection URI                           |
+| `SPRING_KAFKA_BOOTSTRAP_SERVERS`              | Kafka broker address                             |
+| `SPRING_MAIL_HOST` / `SPRING_MAIL_PORT`     | SMTP server for notifications                    |
+| `JWT_SECRET`                                  | JWT signing key                                  |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth2 client credentials (auth-service)  |
+| `JAVA_TOOL_OPTIONS`                           | JDWP remote-debug agent (per-service debug port) |
 
 ---
 

@@ -1,9 +1,12 @@
 import axios from 'axios';
 import { useAuthStore } from '@/stores/authStore';
 
+// No global Content-Type default: axios infers it per request — application/json
+// for plain-object bodies, and multipart/form-data (with boundary) for FormData
+// uploads like assignment submissions. A hard-coded default would force JSON onto
+// FormData requests and the multipart endpoints would reject them.
 const apiClient = axios.create({
   baseURL: '/api',
-  headers: { 'Content-Type': 'application/json' },
 });
 
 apiClient.interceptors.request.use((config) => {

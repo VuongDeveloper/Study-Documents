@@ -10,7 +10,7 @@ import type {
 export const dictionaryApi = {
   listWords: async (page = 0, size = 20, q?: string) => {
     const res = await apiClient.get<PageResponse<WordDefinitionResponse>>('/dictionary/words', {
-      params: { page, size, q },
+      params: { page, size, q, sort: 'word,asc' },
     });
     return { ...res, data: res.data.content };
   },

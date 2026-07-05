@@ -13,6 +13,7 @@ import DashboardPage from '@/pages/dashboard/DashboardPage';
 import CourseListPage from '@/pages/courses/CourseListPage';
 import CourseDetailPage from '@/pages/courses/CourseDetailPage';
 import CourseFormPage from '@/pages/courses/CourseFormPage';
+import AssignmentDetailPage from '@/pages/courses/AssignmentDetailPage';
 import DictionaryPage from '@/pages/dictionary/DictionaryPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -58,6 +59,10 @@ export default function App() {
           }
         />
         <Route path="courses/:id" element={<CourseDetailPage />} />
+        <Route
+          path="courses/:courseId/assignments/:assignmentId"
+          element={<AssignmentDetailPage />}
+        />
         <Route
           path="courses/:id/edit"
           element={

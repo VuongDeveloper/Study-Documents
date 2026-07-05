@@ -140,6 +140,30 @@ export interface AssignmentResponse {
   createdAt: string;
 }
 
+// Submission types
+export interface SubmissionResponse {
+  id: number;
+  assignmentId: number;
+  studentId: number;
+  studentName: string;
+  attemptNumber: number;
+  textContent: string | null;
+  linkUrl: string | null;
+  fileName: string | null;
+  fileDownloadUrl: string | null;
+  status: 'SUBMITTED' | 'GRADED';
+  score: number | null;
+  feedback: string | null;
+  gradedBy: number | null;
+  submittedAt: string;
+  gradedAt: string | null;
+}
+
+export interface GradeRequest {
+  score: number;
+  feedback?: string;
+}
+
 // Enrollment types
 export interface EnrollmentRequest {
   courseId: number;
@@ -163,6 +187,7 @@ export interface WordDefinitionRequest {
   notes?: string;
   examples?: string[];
   tags?: string[];
+  images?: string[];
   extra?: Record<string, unknown>;
 }
 
@@ -174,6 +199,7 @@ export interface WordDefinitionResponse {
   notes: string;
   examples: string[];
   tags: string[];
+  images: string[];
   extra: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;

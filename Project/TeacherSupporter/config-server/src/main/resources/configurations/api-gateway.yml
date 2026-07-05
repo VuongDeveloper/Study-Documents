@@ -42,6 +42,12 @@ spring:
             - Path=/api/enrollments/**
           filters:
             - StripPrefix=2
+        - id: course-service-submissions
+          uri: lb://course-service
+          predicates:
+            - Path=/api/submissions/**
+          filters:
+            - StripPrefix=2
         - id: dictionary-service
           uri: lb://dictionary-service
           predicates:

@@ -26,6 +26,8 @@ export default function CourseDetailPage() {
   const queryClient = useQueryClient();
   const [showAssignmentForm, setShowAssignmentForm] = useState(false);
   const [formError, setFormError] = useState('');
+  const [selectedStudentId, setSelectedStudentId] = useState('');
+  const [enrollError, setEnrollError] = useState('');
 
   const { data: course, isLoading: courseLoading, error: courseError } = useQuery({
     queryKey: ['course', courseId],
@@ -65,6 +67,50 @@ export default function CourseDetailPage() {
       queryClient.invalidateQueries({ queryKey: ['course-assignments', courseId] });
     },
   });
+
+  const { data: students } = useQuery({
+    queryKey: ['students'],
+    queryFn: () => coursesApi.listStudents().then((r) => r.data),
+    enabled: isTeacher,
+  });
+
+  const enrollMutation = useMutation({
+    mutationFn: (studentId: number) => coursesApi.enroll({ courseId, studentId }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['course-enrollments', courseId] });
+      setSelectedStudentId('');
+      setEnrollError('');
+    },
+    onError: (err: AxiosError<{ message?: string }>) => {
+      setEnrollError(err.response?.data?.message || 'Failed to enroll student.');
+    },
+  });
+
+  const unenrollMutation = useMutation({
+    mutationFn: (enrollmentId: number) => coursesApi.unenroll(enrollmentId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['course-enrollments', courseId] });
+    },
+  });
+
+  const statusMutation = useMutation({
+    mutationFn: (status: string) =>
+      coursesApi.update(courseId, {
+        name: course!.name,
+        description: course!.description,
+        status,
+        startDate: course!.startDate,
+        endDate: course!.endDate,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['course', courseId] });
+      queryClient.invalidateQueries({ queryKey: ['courses'] });
+    },
+  });
+
+  // Students not already enrolled in this course — candidates for the picker.
+  const enrolledStudentIds = new Set((enrollments ?? []).map((e) => e.studentId));
+  const availableStudents = (students ?? []).filter((s) => !enrolledStudentIds.has(s.id));
 
   const {
     register,
@@ -112,7 +158,20 @@ export default function CourseDetailPage() {
       <div className="grid gap-4 sm:grid-cols-3">
         <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
           <p className="text-xs font-medium uppercase text-gray-500">Status</p>
-          <p className="mt-1 font-medium text-gray-900">{course.status}</p>
+          {isTeacher ? (
+            <select
+              value={course.status}
+              onChange={(e) => statusMutation.mutate(e.target.value)}
+              disabled={statusMutation.isPending}
+              className="mt-1 block w-full rounded-lg border border-gray-300 px-2 py-1 text-sm font-medium text-gray-900 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:opacity-50"
+            >
+              <option value="DRAFT">Draft</option>
+              <option value="ACTIVE">Active</option>
+              <option value="ARCHIVED">Archived</option>
+            </select>
+          ) : (
+            <p className="mt-1 font-medium text-gray-900">{course.status}</p>
+          )}
         </div>
         <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-200">
           <p className="text-xs font-medium uppercase text-gray-500">Start Date</p>
@@ -213,7 +272,12 @@ export default function CourseDetailPage() {
             assignments.map((assignment) => (
               <div key={assignment.id} className="flex items-center justify-between px-6 py-4">
                 <div>
-                  <p className="font-medium text-gray-900">{assignment.title}</p>
+                  <Link
+                    to={`/courses/${courseId}/assignments/${assignment.id}`}
+                    className="font-medium text-indigo-600 hover:text-indigo-500"
+                  >
+                    {assignment.title}
+                  </Link>
                   {assignment.description && (
                     <p className="mt-0.5 text-sm text-gray-500">{assignment.description}</p>
                   )}
@@ -259,6 +323,42 @@ export default function CourseDetailPage() {
           <div className="border-b border-gray-200 px-6 py-4">
             <h2 className="text-lg font-semibold text-gray-900">Enrolled Students</h2>
           </div>
+
+          {/* Add student picker */}
+          <div className="border-b border-gray-200 bg-gray-50 px-6 py-4">
+            {enrollError && (
+              <div className="mb-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">{enrollError}</div>
+            )}
+            <div className="flex items-center gap-3">
+              <select
+                value={selectedStudentId}
+                onChange={(e) => setSelectedStudentId(e.target.value)}
+                className="block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              >
+                <option value="">
+                  {availableStudents.length === 0
+                    ? 'No students available to add'
+                    : 'Select a student to enroll...'}
+                </option>
+                {availableStudents.map((student) => {
+                  const name = `${student.firstName ?? ''} ${student.lastName ?? ''}`.trim();
+                  return (
+                    <option key={student.id} value={student.id}>
+                      {name ? `${name} (${student.email})` : student.email}
+                    </option>
+                  );
+                })}
+              </select>
+              <button
+                onClick={() => selectedStudentId && enrollMutation.mutate(Number(selectedStudentId))}
+                disabled={!selectedStudentId || enrollMutation.isPending}
+                className="shrink-0 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {enrollMutation.isPending ? 'Enrolling...' : 'Enroll'}
+              </button>
+            </div>
+          </div>
+
           <div className="divide-y divide-gray-100">
             {enrollmentsLoading ? (
               <div className="px-6 py-8 text-center text-sm text-gray-500">Loading students...</div>
@@ -273,15 +373,27 @@ export default function CourseDetailPage() {
                       Enrolled: {new Date(enrollment.enrolledAt).toLocaleDateString()}
                     </p>
                   </div>
-                  <span
-                    className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                      enrollment.status === 'ACTIVE'
-                        ? 'bg-green-100 text-green-700'
-                        : 'bg-gray-100 text-gray-600'
-                    }`}
-                  >
-                    {enrollment.status}
-                  </span>
+                  <div className="flex items-center gap-3">
+                    <span
+                      className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                        enrollment.status === 'ACTIVE'
+                          ? 'bg-green-100 text-green-700'
+                          : 'bg-gray-100 text-gray-600'
+                      }`}
+                    >
+                      {enrollment.status}
+                    </span>
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Remove ${enrollment.studentName} from this course?`)) {
+                          unenrollMutation.mutate(enrollment.id);
+                        }
+                      }}
+                      className="text-sm text-red-600 hover:text-red-500"
+                    >
+                      Remove
+                    </button>
+                  </div>
                 </div>
               ))
             )}

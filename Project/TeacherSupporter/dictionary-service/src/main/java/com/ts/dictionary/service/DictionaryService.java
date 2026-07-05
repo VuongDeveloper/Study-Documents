@@ -46,6 +46,7 @@ public class DictionaryService {
                 .notes(req.notes())
                 .examples(req.examples())
                 .tags(req.tags())
+                .images(req.images())
                 .extra(req.extra())
                 .build();
         word = wordDefinitionRepository.save(word);
@@ -68,6 +69,7 @@ public class DictionaryService {
         word.setNotes(req.notes());
         word.setExamples(req.examples());
         word.setTags(req.tags());
+        word.setImages(req.images());
         word.setExtra(req.extra());
 
         word = wordDefinitionRepository.save(word);
@@ -83,10 +85,11 @@ public class DictionaryService {
 
     public Page<WordDefinitionResponse> searchWords(String userId, String query, Pageable pageable) {
         if (query != null && !query.isBlank()) {
-            List<WordDefinition> words = wordDefinitionRepository
-                    .findByCreatedByUserIdAndWordContainingIgnoreCase(userId, query);
-            List<WordDefinitionResponse> responses = words.stream()
+            // Match the query against the word text OR any tag (case-insensitive).
+            List<WordDefinitionResponse> responses = wordDefinitionRepository
+                    .searchByWordOrTag(userId, escapeRegex(query.trim())).stream()
                     .map(w -> toResponse(w, userId))
+                    .sorted(Comparator.comparing(WordDefinitionResponse::word, String.CASE_INSENSITIVE_ORDER))
                     .toList();
             int start = (int) pageable.getOffset();
             int end = Math.min(start + pageable.getPageSize(), responses.size());
@@ -97,6 +100,11 @@ public class DictionaryService {
         }
         return wordDefinitionRepository.findByCreatedByUserId(userId, pageable)
                 .map(w -> toResponse(w, userId));
+    }
+
+    /** Escapes regex metacharacters so a user query is matched literally inside a Mongo $regex. */
+    private static String escapeRegex(String input) {
+        return input.replaceAll("[.*+?^${}()|\\[\\]\\\\]", "\\\\$0");
     }
 
     public List<WordDefinitionResponse> getRootWords(String userId) {
@@ -211,6 +219,7 @@ public class DictionaryService {
                 word.getNotes(),
                 word.getExamples(),
                 word.getTags(),
+                word.getImages(),
                 word.getExtra(),
                 word.getCreatedAt(),
                 word.getUpdatedAt(),

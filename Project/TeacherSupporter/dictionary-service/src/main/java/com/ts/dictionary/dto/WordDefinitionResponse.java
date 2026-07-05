@@ -12,6 +12,7 @@ public record WordDefinitionResponse(
         String notes,
         List<String> examples,
         List<String> tags,
+        List<String> images,
         Map<String, Object> extra,
         Instant createdAt,
         Instant updatedAt,

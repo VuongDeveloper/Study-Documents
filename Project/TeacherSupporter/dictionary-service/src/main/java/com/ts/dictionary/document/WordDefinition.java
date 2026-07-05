@@ -37,6 +37,9 @@ public class WordDefinition {
 
     private List<String> tags;
 
+    /** Image attachments stored inline as base64 data URLs (e.g. "data:image/png;base64,..."). */
+    private List<String> images;
+
     private Map<String, Object> extra;
 
     @CreatedDate

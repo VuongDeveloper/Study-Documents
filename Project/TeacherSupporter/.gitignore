@@ -1,0 +1,31 @@
+# Secrets
+.env
+*_client_secret.json
+
+# Maven build output
+target/
+*.jar
+*.war
+*.class
+!.mvn/wrapper/maven-wrapper.jar
+
+# Frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db

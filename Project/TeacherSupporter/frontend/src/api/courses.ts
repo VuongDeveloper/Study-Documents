@@ -6,6 +6,9 @@ import type {
   AssignmentResponse,
   EnrollmentRequest,
   EnrollmentResponse,
+  SubmissionResponse,
+  GradeRequest,
+  StudentResponse,
   PageResponse,
 } from '@/types';
 
@@ -37,6 +40,31 @@ export const coursesApi = {
   deleteAssignment: (id: number) =>
     apiClient.delete(`/assignments/assignments/${id}`),
 
+  // Submissions
+  getAssignmentSubmissions: (assignmentId: number) =>
+    apiClient.get<SubmissionResponse[]>(`/assignments/assignments/${assignmentId}/submissions`),
+  submitAssignment: (
+    assignmentId: number,
+    form: { textContent?: string; linkUrl?: string; file?: File }
+  ) => {
+    const fd = new FormData();
+    if (form.textContent) fd.append('textContent', form.textContent);
+    if (form.linkUrl) fd.append('linkUrl', form.linkUrl);
+    if (form.file) fd.append('file', form.file);
+    // FormData body: with no global Content-Type default on apiClient, axios
+    // sets multipart/form-data with the correct boundary automatically.
+    return apiClient.post<SubmissionResponse>(
+      `/assignments/assignments/${assignmentId}/submissions`,
+      fd
+    );
+  },
+  getSubmission: (id: number) =>
+    apiClient.get<SubmissionResponse>(`/submissions/submissions/${id}`),
+  gradeSubmission: (id: number, data: GradeRequest) =>
+    apiClient.post<SubmissionResponse>(`/submissions/submissions/${id}/grade`, data),
+  mySubmissions: () =>
+    apiClient.get<SubmissionResponse[]>('/submissions/submissions/me'),
+
   // Enrollments
   enroll: (data: EnrollmentRequest) =>
     apiClient.post<EnrollmentResponse>('/enrollments/enrollments', data),
@@ -44,6 +72,10 @@ export const coursesApi = {
     apiClient.delete(`/enrollments/enrollments/${id}`),
   getEnrollments: (courseId: number) =>
     apiClient.get<EnrollmentResponse[]>('/enrollments/enrollments', { params: { courseId } }),
+
+  // Students (teacher: list all to pick enrollees)
+  listStudents: () =>
+    apiClient.get<StudentResponse[]>('/students/students'),
 
   // Student self-service
   myCourses: () =>

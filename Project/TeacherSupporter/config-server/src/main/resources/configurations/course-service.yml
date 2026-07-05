@@ -18,6 +18,10 @@ spring:
         dialect: org.hibernate.dialect.PostgreSQLDialect
   flyway:
     enabled: true
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 25MB
   kafka:
     bootstrap-servers: localhost:9092
     producer:
@@ -32,6 +36,17 @@ spring:
         spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
         spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
         spring.json.trusted.packages: com.ts.common.dto
+app:
+  s3:
+    endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}
+    # Browser-reachable endpoint used to sign download URLs. When the service runs
+    # inside Docker the internal endpoint is minio:9000, which a browser cannot resolve.
+    public-endpoint: ${APP_S3_PUBLIC_ENDPOINT:http://localhost:9000}
+    region: ${APP_S3_REGION:us-east-1}
+    access-key: ${APP_S3_ACCESS_KEY:minioadmin}
+    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+    bucket: ${APP_S3_BUCKET:ts-submissions}
+    presigned-url-expiry-minutes: ${APP_S3_PRESIGNED_EXPIRY_MIN:15}
 resilience4j:
   circuitbreaker:
     instances:

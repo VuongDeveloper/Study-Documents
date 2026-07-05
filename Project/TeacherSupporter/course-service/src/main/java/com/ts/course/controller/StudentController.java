@@ -2,6 +2,7 @@ package com.ts.course.controller;
 
 import com.ts.course.dto.AssignmentResponse;
 import com.ts.course.dto.CourseResponse;
+import com.ts.course.dto.StudentResponse;
 import com.ts.course.service.StudentService;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +22,12 @@ import java.util.List;
 public class StudentController {
 
     private final StudentService studentService;
+
+    @GetMapping
+    @PreAuthorize("hasRole('TEACHER')")
+    public ResponseEntity<List<StudentResponse>> getAllStudents() {
+        return ResponseEntity.ok(studentService.getAllStudents());
+    }
 
     @GetMapping("/me/courses")
     @PreAuthorize("hasRole('STUDENT')")

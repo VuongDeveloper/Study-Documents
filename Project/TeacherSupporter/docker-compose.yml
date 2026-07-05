@@ -76,6 +76,22 @@ services:
       - "1080:1080"
       - "1025:1025"
 
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 5
+
   # ===== SPRING CLOUD =====
   config-server:
     build:
@@ -161,12 +177,18 @@ services:
         condition: service_healthy
       kafka:
         condition: service_started
+      minio:
+        condition: service_started
     environment:
       SPRING_CONFIG_IMPORT: configserver:http://config-server:8888
       EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-course:5432/ts_course
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+      APP_S3_ENDPOINT: http://minio:9000
+      APP_S3_PUBLIC_ENDPOINT: http://localhost:9000
+      APP_S3_ACCESS_KEY: minioadmin
+      APP_S3_SECRET_KEY: minioadmin
       JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5082"
 
   dictionary-service:
@@ -213,3 +235,4 @@ volumes:
   postgres-auth-data:
   postgres-course-data:
   mongo-data:
+  minio-data:

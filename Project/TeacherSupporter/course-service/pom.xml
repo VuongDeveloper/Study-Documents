@@ -14,6 +14,22 @@
     <name>Course Service</name>
     <description>Course management microservice</description>
 
+    <properties>
+        <awssdk.version>2.30.0</awssdk.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${awssdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!-- Spring Boot Starters -->
         <dependency>
@@ -80,6 +96,12 @@
         <dependency>
             <groupId>com.ts</groupId>
             <artifactId>common</artifactId>
+        </dependency>
+
+        <!-- AWS S3 SDK v2 (MinIO-compatible object storage for submission files) -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
         </dependency>
 
         <!-- OpenAPI -->
