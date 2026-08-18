@@ -1,0 +1,117 @@
+// Pipeline-as-code for TeacherSupporter on ts-server (k3s + local registry).
+//
+// Shape: checkout -> build -> push images -> deploy -> rollout gate.
+// Every command here is one you have already run by hand for milestone 3;
+// this file just makes a machine repeat them on every push to main.
+//
+// Read top to bottom. Comments explain the *why*; the Jenkins docs explain
+// the syntax: https://www.jenkins.io/doc/book/pipeline/syntax/
+
+pipeline {
+  // Where to run. `any` = the controller's own executors, because on a 2-core
+  // box agent pods cost more than they save. (Homelab compromise, stated.)
+  agent any
+
+  options {
+    timestamps()                          // every log line gets a clock -- invaluable when a stage "hangs"
+    disableConcurrentBuilds()             // two Maven runs on 2 cores would starve each other AND the cluster
+    buildDiscarder(logRotator(numToKeepStr: '10'))   // keep disk bounded
+  }
+
+  // Poll GitHub every ~5 min. Webhooks would be instant, but they need an
+  // inbound route and ts-server sits behind CGNAT. `H` = "a fixed minute
+  // Jenkins picks per job", spreading load if many jobs poll.
+  triggers { pollSCM('H/5 * * * *') }
+
+  environment {
+    // Jenkins itself runs on JDK 21; the project needs 25. JDK25_HOME is baked
+    // into the image (deploy/jenkins/Dockerfile). Prepend to PATH so `mvn`
+    // picks it up -- Maven honours JAVA_HOME.
+    JAVA_HOME = "${env.JDK25_HOME}"
+    PATH      = "${env.JDK25_HOME}/bin:${env.PATH}"
+
+    // Image tag = short git SHA. Immutable and traceable: `kubectl describe pod`
+    // tells you exactly which commit is running, and rollback is `set image`
+    // to an older SHA. (SNAPSHOT tags are overwritten -- fine for dev, bad for CD.)
+    TAG = "${env.GIT_COMMIT.take(7)}"
+
+    NS       = 'ts'
+    REGISTRY = 'localhost:5000'           // Jenkins is on the host network: same name k3s uses
+    // The vertical slice. Add a service here AND in deploy/k8s/base when it grows.
+    SERVICES = 'config-server discovery-server course-service'
+    MODULES  = 'common,config-server,discovery-server,course-service'
+  }
+
+  stages {
+
+    // ------------------------------------------------------------------ 1
+    stage('Build') {
+      steps {
+        dir('Project/TeacherSupporter') {   // monorepo: the Maven root is a subdirectory
+          // -B      batch mode: no ANSI colour / download progress bars in the log
+          // -pl/-am only the slice's modules and what they depend on -- CPU is scarce
+          // verify  compiles, packages (Jib needs common's jar -- lesson from milestone 3),
+          //         and would run tests if any existed. -DskipTests until there are some;
+          //         remove that flag the day the first test lands and this becomes the gate.
+          sh 'mvn -B -DskipTests -pl ${MODULES} -am verify'
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------ 2
+    stage('Push images') {
+      steps {
+        dir('Project/TeacherSupporter') {
+          // jib:build reuses target/ from the previous stage (no recompile) and pushes
+          // straight to the registry -- no Docker daemon in this container at all.
+          // -Djib.to.tags adds the SHA tag alongside 1.0.0-SNAPSHOT: same image, two names.
+          // Separate stage on purpose: the UI then shows *where* it broke.
+          sh 'mvn -B -pl ${MODULES} -am jib:build -Djib.to.tags=${TAG}'
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------ 3
+    stage('Deploy') {
+      steps {
+        dir('Project/TeacherSupporter') {
+          // Injects the Secret-file credential as a temp file and sets $KUBECONFIG
+          // for the block; kubectl reads that variable. Shredded when the block ends.
+          withCredentials([file(credentialsId: 'kubeconfig-ts', variable: 'KUBECONFIG')]) {
+            sh '''
+              set -eu
+              # 3a. Declare desired state. Idempotent: unchanged objects are no-ops.
+              kubectl apply -k deploy/k8s/base
+
+              # 3b. Point each Deployment at this build's image. This is what
+              #     actually triggers a rolling update -- apply alone would not,
+              #     because the manifest still says :1.0.0-SNAPSHOT.
+              for s in ${SERVICES}; do
+                kubectl -n ${NS} set image deployment/${s} ${s}=${REGISTRY}/${s}:${TAG}
+              done
+
+              # 3c. The gate. Blocks until the new pod passes its readiness probe
+              #     (the /v3/api-docs one you wrote) or the timeout hits -> build
+              #     FAILS and the old pod keeps serving. This is zero-downtime.
+              for s in ${SERVICES}; do
+                kubectl -n ${NS} rollout status deployment/${s} --timeout=300s
+              done
+            '''
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Deployed ${TAG} to namespace ${NS}." }
+    failure {
+      // Cheap forensics in the log itself, so you rarely need to ssh in.
+      dir('Project/TeacherSupporter') {
+        withCredentials([file(credentialsId: 'kubeconfig-ts', variable: 'KUBECONFIG')]) {
+          sh 'kubectl -n ${NS} get pods || true'
+        }
+      }
+    }
+  }
+}

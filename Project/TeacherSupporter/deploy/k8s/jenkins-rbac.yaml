@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: ts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-deployer
+  namespace: ts
+rules:
+  # How to read a rule: "may perform <verbs> on <resources> in <apiGroups>".
+  # Rules are additive; anything not listed is Forbidden. Namespace-scoped
+  # (this is a Role, not a ClusterRole), so nothing here reaches kube-system.
+  #
+  # Verb cheat-sheet for the pipeline's commands:
+  #   kubectl apply           -> get + create (new) or patch (existing)
+  #   kubectl set image       -> get + patch
+  #   kubectl rollout status  -> get/list/watch on deployments AND replicasets
+  #   kubectl logs / get pods -> get/list on pods, get on pods/log
+
+  # -- What `kubectl apply -k deploy/k8s/base` creates, by API group ---------
+  # Core group is spelled "" (empty string). Namespace is deliberately absent:
+  # it is cluster-scoped and cannot be granted by a Role, so the pipeline must
+  # not try to apply namespace.yaml (ts already exists).
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "secrets", "configmaps"]
+    verbs: ["get", "list", "create", "patch", "update"]
+
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "create", "patch", "update"]
+
+  # -- Read-only extras for `rollout status` and post-failure debugging -------
+  # A Deployment rolls out via ReplicaSets it owns; rollout status watches them.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+
+  # NOT granted, on purpose:
+  #   delete            -- CI should roll forward, never wipe; a human deletes.
+  #   nodes, namespaces -- cluster-scoped, out of a Role's reach anyway.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-deployer
+  namespace: ts
+subjects:
+  - kind: ServiceAccount
+    name: jenkins
+    namespace: ts
+roleRef:
+  kind: Role
+  name: jenkins-deployer
+  apiGroup: rbac.authorization.k8s.io

@@ -6,7 +6,10 @@ namespace: ts
 # Applied in dependency order for readability only -- Kubernetes starts pods in
 # parallel regardless. Ordering here is documentation, not orchestration.
 resources:
-  - namespace.yaml
+  # namespace.yaml is intentionally NOT listed. Namespaces are cluster-scoped,
+  # and the Jenkins ServiceAccount only holds a namespaced Role, so `apply`
+  # would be Forbidden. The namespace is created once by create-secrets.sh
+  # (or `kubectl apply -f namespace.yaml` by an admin).
   - postgres-course.yaml
   - minio.yaml
   - config-server.yaml

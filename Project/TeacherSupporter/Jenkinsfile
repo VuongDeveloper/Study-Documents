@@ -1,0 +1,69 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+
+  triggers { pollSCM('H/5 * * * *') }
+
+  environment {
+    JAVA_HOME = "${env.JDK25_HOME}"
+    PATH      = "${env.JDK25_HOME}/bin:${env.PATH}"
+    TAG       = "${env.GIT_COMMIT.take(7)}"
+    NS        = 'ts'
+    REGISTRY  = 'localhost:5000'
+    SERVICES  = 'config-server discovery-server course-service'
+    MODULES   = 'common,config-server,discovery-server,course-service'
+  }
+
+  stages {
+    stage('Build') {
+      steps {
+        dir('Project/TeacherSupporter') {
+          sh 'mvn -B -DskipTests -pl ${MODULES} -am verify'
+        }
+      }
+    }
+
+    stage('Push images') {
+      steps {
+        dir('Project/TeacherSupporter') {
+          sh 'mvn -B -pl ${MODULES} -am jib:build -Djib.to.tags=${TAG}'
+        }
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        dir('Project/TeacherSupporter') {
+          withCredentials([file(credentialsId: 'kubeconfig-ts', variable: 'KUBECONFIG')]) {
+            sh '''
+              set -eu
+              kubectl apply -k deploy/k8s/base
+              for s in ${SERVICES}; do
+                kubectl -n ${NS} set image deployment/${s} ${s}=${REGISTRY}/${s}:${TAG}
+              done
+              for s in ${SERVICES}; do
+                kubectl -n ${NS} rollout status deployment/${s} --timeout=300s
+              done
+            '''
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "Deployed ${TAG} to namespace ${NS}." }
+    failure {
+      dir('Project/TeacherSupporter') {
+        withCredentials([file(credentialsId: 'kubeconfig-ts', variable: 'KUBECONFIG')]) {
+          sh 'kubectl -n ${NS} get pods || true'
+        }
+      }
+    }
+  }
+}
