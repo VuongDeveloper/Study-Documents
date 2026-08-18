@@ -14,6 +14,11 @@
     <name>Common - Shared DTOs, Events, and Utilities</name>
     <description>Shared library module for DTOs, Kafka events, exceptions, and security constants.</description>
 
+    <properties>
+        <!-- library, not a runnable service: no image -->
+        <jib.skip>true</jib.skip>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>

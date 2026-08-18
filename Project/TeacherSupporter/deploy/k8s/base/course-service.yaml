@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: course-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: course-service }
+  template:
+    metadata:
+      labels: { app: course-service }
+    spec:
+      containers:
+        - name: course-service
+          image: localhost:5000/course-service:1.0.0-SNAPSHOT
+          # SNAPSHOT tags are overwritten on every push; the default IfNotPresent
+          # would keep serving whatever the node cached. Always re-check the
+          # registry (cheap: only the manifest is fetched if digests match).
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8082 }
+          env:
+            # Same values as docker-compose.yml, with compose service names
+            # swapped for Kubernetes Service names. They happen to be identical,
+            # because both resolve a name to an address on a private network.
+            - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
+            - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE, value: "http://discovery-server:8761/eureka/" }
+            - { name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://postgres-course:5432/ts_course" }
+            - { name: APP_S3_ENDPOINT, value: "http://minio:9000" }
+
+            # Eureka on Kubernetes needs this or nothing can call anything.
+            # By default a client registers its *hostname*, which inside a pod is
+            # the pod name -- a string no other pod can resolve. Pod IPs are
+            # routable cluster-wide, so register the IP instead.
+            - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+
+            # Not in this slice yet. Kafka's consumer retries in the background
+            # and tracing is simply switched off, so neither blocks startup.
+            - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
+
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+          envFrom:
+            - secretRef: { name: postgres-course-app }
+            - secretRef: { name: minio-app }
+
+          # ---- Health probes ---------------------------------------------------
+          # No actuator in this service, so /actuator/health is a 404. The one
+          # unauthenticated HTTP path that exists is springdoc's /v3/api-docs
+          # (permitAll in SecurityConfig). It only answers 200 once the whole
+          # Spring context is up -- which is AFTER Flyway has migrated and the
+          # MinIO bucket check has run. That makes it a true "ready" signal,
+          # unlike a tcpSocket check that passes as soon as Tomcat binds.
+
+          # startupProbe: "give the JVM time to boot, then hand over."
+          # While this probe is failing, readiness/liveness are NOT evaluated.
+          # 12 x 10s = up to 120s of grace for a cold start on two cores.
+          # If it still isn't up after that, kubelet restarts the container.
+          startupProbe:
+            httpGet: { path: /v3/api-docs, port: http }
+            periodSeconds: 10
+            failureThreshold: 12
+
+          # readinessProbe: "should the Service send traffic here right now?"
+          # Failing readiness pulls the pod out of the Service endpoints; it
+          # does NOT restart anything. Cheap and frequent.
+          readinessProbe:
+            httpGet: { path: /v3/api-docs, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          # No livenessProbe on purpose. Liveness restarts the container, and
+          # the only thing it would catch beyond readiness is a wedged JVM --
+          # rare, and a probe firing during a long GC pause on a 2-core box
+          # would kill a healthy pod. Add one later if we ever see a real hang.
+          # ----------------------------------------------------------------------
+
+          resources:
+            requests: { memory: 512Mi, cpu: 200m }
+            limits: { memory: 768Mi }
+            # No CPU limit on purpose. A limit throttles the JVM exactly during
+            # class loading, when it wants every core it can get -- turning a
+            # 60s start into a 200s one and failing the startupProbe.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: course-service
+spec:
+  selector: { app: course-service }
+  ports:
+    - { name: http, port: 8082, targetPort: 8082 }
+---
+# Traefik ships with k3s and watches Ingress resources with no extra config.
+# Host-based routing so the frontend and other services can share port 80 later.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: course-service
+spec:
+  rules:
+    - host: ts.local
+      http:
+        paths:
+          - path: /courses
+            pathType: Prefix
+            backend:
+              service:
+                name: course-service
+                port: { number: 8082 }

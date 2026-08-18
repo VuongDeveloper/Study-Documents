@@ -14,6 +14,10 @@
     <name>Notification Service</name>
     <description>Notification microservice for email and messaging</description>
 
+    <properties>
+        <start-class>com.ts.notification.NotificationServiceApplication</start-class>
+    </properties>
+
     <dependencies>
         <!-- Spring Boot Starters -->
         <dependency>
@@ -74,6 +78,10 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>com.google.cloud.tools</groupId>
+                <artifactId>jib-maven-plugin</artifactId>
             </plugin>
         </plugins>
     </build>

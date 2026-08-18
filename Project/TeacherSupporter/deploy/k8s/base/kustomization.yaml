@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ts
+
+# Applied in dependency order for readability only -- Kubernetes starts pods in
+# parallel regardless. Ordering here is documentation, not orchestration.
+resources:
+  - namespace.yaml
+  - postgres-course.yaml
+  - minio.yaml
+  - config-server.yaml
+  - discovery-server.yaml
+  - course-service.yaml
+
+# Stamped onto every object, so `kubectl delete -l part-of=teacher-supporter`
+# cleans up the whole slice without touching kube-system.
+commonLabels:
+  app.kubernetes.io/part-of: teacher-supporter
+
+# Secrets are NOT here on purpose -- see ../create-secrets.sh.

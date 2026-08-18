@@ -1,0 +1,48 @@
+# Config Server holds no state: its YAML is baked into the jar under
+# classpath:/configurations (spring.profiles.active=native). No PVC, no DB.
+# Every other pod blocks on this one, so it starts first in practice by virtue
+# of being the only thing with no dependencies of its own.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: config-server }
+  template:
+    metadata:
+      labels: { app: config-server }
+    spec:
+      containers:
+        - name: config-server
+          image: localhost:5000/config-server:1.0.0-SNAPSHOT
+          # SNAPSHOT tags are overwritten on every push; the default IfNotPresent
+          # would keep serving whatever the node cached. Always re-check the
+          # registry (cheap: only the manifest is fetched if digests match).
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8888 }
+          env:
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+          # startupProbe buys a slow JVM time to boot without forcing a long
+          # liveness initialDelay. Until it passes, liveness is not evaluated.
+          startupProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 30      # up to 150s to start
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { memory: 384Mi, cpu: 100m }
+            limits: { memory: 640Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-server
+spec:
+  selector: { app: config-server }
+  ports:
+    - { name: http, port: 8888, targetPort: 8888 }

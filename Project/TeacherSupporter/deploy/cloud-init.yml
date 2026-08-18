@@ -1,0 +1,15 @@
+#cloud-config
+# First-boot provisioning for the TeacherSupporter OCI VM (Ubuntu 24.04 aarch64).
+# Runs once, automatically, the first time the instance boots.
+package_update: true
+runcmd:
+  # Install Docker Engine + compose plugin from Docker's official convenience script
+  - curl -fsSL https://get.docker.com | sh
+  # Let the 'ubuntu' user run docker without sudo (takes effect on next login)
+  - usermod -aG docker ubuntu
+  # 4 GB swap: insurance against JVM startup memory spikes when ~8 JVMs boot at once
+  - fallocate -l 4G /swapfile
+  - chmod 600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab

@@ -24,6 +24,8 @@
 
     <properties>
         <java.version>25</java.version>
+        <!-- Override per environment: mvn -Ddocker.registry=ghcr.io/you ... -->
+        <docker.registry>localhost:5000</docker.registry>
         <maven.compiler.source>${java.version}</maven.compiler.source>
         <maven.compiler.target>${java.version}</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -121,6 +123,34 @@
                                 <artifactId>lombok</artifactId>
                             </exclude>
                         </excludes>
+                    </configuration>
+                </plugin>
+                <!-- Jib: builds an OCI image from target/classes and pushes it straight
+                     to the registry. No Dockerfile, no Docker daemon. Configured once
+                     here; each runnable service opts in with a bare <plugin> reference.
+                     Usage:  mvn -pl course-service compile jib:build              -->
+                <plugin>
+                    <groupId>com.google.cloud.tools</groupId>
+                    <artifactId>jib-maven-plugin</artifactId>
+                    <version>3.4.4</version>
+                    <configuration>
+                        <!-- Same base as the Dockerfiles, so runtime behaviour is unchanged. -->
+                        <from><image>eclipse-temurin:25-jre-alpine</image></from>
+                        <!-- Registry name is written from the cluster's point of view:
+                             k3s on ts-server pulls from its own localhost:5000. From
+                             Windows this needs `ssh -L 5000:localhost:5000 ts-server`. -->
+                        <to><image>${docker.registry}/${project.artifactId}:${project.version}</image></to>
+                        <!-- registry:2 is plain HTTP; Jib refuses that unless told. -->
+                        <allowInsecureRegistries>true</allowInsecureRegistries>
+                        <container>
+                            <!-- Set explicitly (each module defines ${start-class}) so Jib
+                                 never scans target/classes with ASM; its bundled ASM
+                                 does not understand Java 25 class files (major 69). -->
+                            <mainClass>${start-class}</mainClass>
+                            <!-- Reproducible builds pin timestamps to epoch; use the real
+                                 build time so `docker images` and k8s show when it was made. -->
+                            <creationTime>USE_CURRENT_TIMESTAMP</creationTime>
+                        </container>
                     </configuration>
                 </plugin>
                 <plugin>

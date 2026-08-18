@@ -1,0 +1,50 @@
+# Eureka. Kept deliberately -- this project is the classic Spring Cloud
+# showcase, and running it on Kubernetes alongside Service DNS is the point.
+#
+# Note the two service-discovery systems now coexist: Kubernetes resolves
+# `discovery-server` to a ClusterIP, and Eureka resolves `course-service` to a
+# pod IP that the clients registered themselves. Only the first survives a pod
+# reschedule instantly; Eureka takes up to 90s to evict a dead instance.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discovery-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: discovery-server }
+  template:
+    metadata:
+      labels: { app: discovery-server }
+    spec:
+      containers:
+        - name: discovery-server
+          image: localhost:5000/discovery-server:1.0.0-SNAPSHOT
+          # SNAPSHOT tags are overwritten on every push; the default IfNotPresent
+          # would keep serving whatever the node cached. Always re-check the
+          # registry (cheap: only the manifest is fetched if digests match).
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8761 }
+          env:
+            - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+          startupProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { memory: 384Mi, cpu: 100m }
+            limits: { memory: 640Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: discovery-server
+spec:
+  selector: { app: discovery-server }
+  ports:
+    - { name: http, port: 8761, targetPort: 8761 }

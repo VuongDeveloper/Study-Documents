@@ -1,0 +1,56 @@
+# StatefulSet rather than Deployment: a database needs a stable identity and a
+# volume that is never handed to a second replica. volumeClaimTemplates gives
+# each pod its own PVC, provisioned by k3s' local-path on the node's SSD.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-course
+spec:
+  serviceName: postgres-course
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres-course }
+  template:
+    metadata:
+      labels: { app: postgres-course }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          envFrom:
+            - secretRef: { name: postgres-course }
+          env:
+            # The official image refuses to initialise into a non-empty directory,
+            # and local-path volumes arrive with a lost+found. A subdirectory
+            # sidesteps it -- the standard fix, not a workaround.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "ts_course"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { memory: 256Mi, cpu: 100m }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-course
+spec:
+  selector: { app: postgres-course }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
