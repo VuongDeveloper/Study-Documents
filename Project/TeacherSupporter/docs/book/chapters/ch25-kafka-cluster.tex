@@ -208,15 +208,25 @@ Use a scratch topic, not a real one: a plain-text ``hello'' on
 \code{ErrorHandlingDeserializer}, but why find out in production. Then
 the real flow, once the pipeline has deployed the services:
 \begin{lstlisting}[language=bash]
-kubectl -n ts port-forward svc/maildev 1080:1080 &
 curl -X POST http://ts.local/api/auth/register -H 'Content-Type: application/json' \
-  -d '{"email":"t@example.com","password":"Passw0rd!","fullName":"Test"}'
-# open http://localhost:1080 -- the activation mail is there
+  -d '{"email":"t@example.com","password":"Passw0rd!","firstName":"Test",
+       "lastName":"User","role":"TEACHER","activationMethod":"EMAIL"}'
+# -> 201 {"message":"Registration successful. Check your email ..."}
 kubectl -n ts logs deploy/notification-service | grep -i registered
+# maildev's REST API, from inside the cluster (or port-forward 1080 for the UI):
+kubectl -n ts run mailcheck --rm -i --restart=Never \
+  --image=curlimages/curl:8.10.1 -- -s http://maildev:1080/email
+# -> [{"subject":"Activate your TeacherSupporter account","to":"t@example.com",...
 \end{lstlisting}
 That request crosses every part of this book: Ingress $\rightarrow$
 gateway $\rightarrow$ auth-service $\rightarrow$ Postgres $\rightarrow$
-Kafka $\rightarrow$ notification-service $\rightarrow$ SMTP.
+Kafka $\rightarrow$ notification-service $\rightarrow$ SMTP. It ran for
+the first time on 2026-08-25, pipeline build~\#7 --- after builds \#3--\#6
+each taught one of this chapter's and Chapters~17, 20 and 23's pitfalls.
+One loose end it exposed: the activation link in the mail still says
+\code{localhost:8080}, the dev default of the link base URL --- an env
+override for milestone~7, when the frontend gives the cluster a real
+public address.
 \end{handson}
 
 \section{Outside the project}
