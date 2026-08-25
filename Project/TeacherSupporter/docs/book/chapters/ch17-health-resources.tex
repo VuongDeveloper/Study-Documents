@@ -70,6 +70,26 @@ readinessProbe:
   is for.
 \end{description}
 
+\begin{pitfall}[Startup probe failed: statuscode 404 --- or 403]
+Symptom (milestone~6, builds \#6): notification-service logs show
+Kafka partitions assigned and a fully started application, yet the
+pod never goes Ready; the probe reports \code{404}. dictionary-service,
+same story, but \code{403}. Cause: the config-server files
+\emph{expose} \code{health,info,metrics,prometheus} for every service
+--- but only config-server, discovery-server and api-gateway had
+\code{spring-boot-starter-actuator} on the classpath. Exposure
+configuration for an absent library is silently inert; the URL is
+just a 404. The 403 variant is Spring Security's contribution: a 404
+forwards to \code{/error}, \code{/error} is not in the permitAll list,
+and a stateless chain with no entry point answers 403 --- so the
+symptom points at authorization while the cause is a missing jar.
+Fix: the starter in all four service POMs. Lesson: a probe path must
+be verified with \code{curl} from inside a pod \emph{before} it is
+trusted in a manifest --- the book's earlier claim that
+dictionary-service ``probes health properly'' was written from its
+SecurityConfig, not from a live request.
+\end{pitfall}
+
 \begin{pitfall}[the restart loop that creates itself]
 Symptom: a service restarts every few minutes under load, each restart
 making the load worse. Cause: an aggressive liveness probe timing out

@@ -166,6 +166,10 @@ custom checks), \code{/info}, \code{/metrics}, \code{/prometheus}.
 Two facts matter now:
 
 \begin{itemize}
+  \item The starter must be on the classpath. Exposure configuration
+  without \code{spring-boot-starter-actuator} is inert --- the project
+  shipped exactly that mistake in four services and found it through a
+  failing Kubernetes probe (Chapter~17).
   \item Endpoints must be \emph{exposed}
   (\code{management.endpoints.web.exposure.include}) --- the project
   exposes \code{health,info,metrics,prometheus}.
