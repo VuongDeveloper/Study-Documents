@@ -1,0 +1,137 @@
+\chapter{Images Without a Daemon: Jib and the Local Registry}
+\label{ch:jib}
+
+\section{Why not just \code{docker build} in CI?}
+
+The Dockerfiles work. Three reasons the pipeline builds images
+differently:
+
+\begin{enumerate}
+  \item \textbf{CI needs no Docker daemon.} \code{docker build} requires
+  a running daemon; giving Jenkins one means docker-in-docker or mounting
+  the host's Docker socket --- which is root on the host, handed to every
+  build. Jib builds and pushes images in pure Java: no daemon, no
+  privilege.
+  \item \textbf{Layering that matches how code changes.} The Dockerfile
+  copies one fat jar: one huge layer, fully re-pushed per build. Jib
+  splits the application into layers by volatility --- dependencies /
+  resources / classes --- so a one-line code change re-pushes only the
+  small classes layer. On two cores and Wi-Fi this is the difference
+  between seconds and minutes per service.
+  \item \textbf{OpenShift-ready by accident.} Jib images run as a
+  non-root user with group-0 file permissions --- exactly what OpenShift's
+  arbitrary-UID security model demands. Portability for free.
+\end{enumerate}
+
+\section{The configuration, annotated}
+
+Jib is configured once in the parent \code{pom.xml}'s
+\code{pluginManagement}; each runnable module opts in with a bare
+\code{<plugin>} reference, and \code{common} opts \emph{out} with
+\code{jib.skip=true}:
+
+\begin{lstlisting}[language=xml]
+<plugin>
+  <groupId>com.google.cloud.tools</groupId>
+  <artifactId>jib-maven-plugin</artifactId>
+  <version>3.4.4</version>
+  <configuration>
+    <from><image>eclipse-temurin:25-jre-alpine</image></from>  (*@\co{1}@*)
+    <to><image>${docker.registry}/${project.artifactId}:${project.version}</image></to> (*@\co{2}@*)
+    <allowInsecureRegistries>true</allowInsecureRegistries>    (*@\co{3}@*)
+    <container>
+      <mainClass>${start-class}</mainClass>                    (*@\co{4}@*)
+      <creationTime>USE_CURRENT_TIMESTAMP</creationTime>       (*@\co{5}@*)
+    </container>
+  </configuration>
+</plugin>
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Same base as the Dockerfiles --- runtime behavior
+  unchanged, only the packaging path differs.
+  \item[\co{2}] Resolves to \code{localhost:5000/course-service:1.0.0-SNAPSHOT}.
+  The name is written \emph{from the cluster's point of view} ---
+  Section~\ref{sec:whylocalhost}.
+  \item[\co{3}] The local registry is plain HTTP; Jib refuses insecure
+  pushes unless told. Every tool in this chain (Jib, containerd) makes
+  the same secure-by-default choice and needs the same explicit opt-out.
+  \item[\co{4}] Set explicitly because Jib's bundled bytecode scanner
+  does not yet parse Java~25 class files --- a real example of
+  bleeding-edge Java taxing the toolchain.
+  \item[\co{5}] Jib defaults to epoch-0 timestamps for reproducible
+  builds; this trades that away so \code{docker images} shows honest
+  build times.
+\end{description}
+
+\section{The registry, and why \code{localhost:5000}}
+\label{sec:whylocalhost}
+
+\begin{lstlisting}[language=bash]
+docker run -d --restart=unless-stopped --name registry \
+  -p 5000:5000 -v registry-data:/var/lib/registry registry:2
+\end{lstlisting}
+
+The non-obvious fact that forces this architecture: \textbf{k3s does not
+see Docker's images.} k3s runs its own containerd with its own image
+store; \code{docker build} on the host puts images somewhere k3s never
+looks. A registry is the honest interface between builder and cluster
+--- which the pipeline wants anyway.
+
+An image name is not just a name --- it is \emph{where to pull from}:
+\code{localhost:5000/course-service} means ``pull from
+localhost:5000.'' Since the puller is the k3s node itself, and pushing
+Jenkins shares the host's network namespace (Chapter~22), the same
+string is valid for both --- and \code{localhost} can never drift the way
+a LAN IP or hostname can. Two configuration hooks make it work:
+
+\begin{lstlisting}[language=yaml]
+# /etc/rancher/k3s/registries.yaml -- containerd assumes HTTPS otherwise
+mirrors:
+  "localhost:5000":
+    endpoint: ["http://localhost:5000"]
+\end{lstlisting}
+
+\begin{pitfall}[http: server gave HTTP response to HTTPS client]
+The signature error of this chapter. Both Jib (pushing) and containerd
+(pulling) default to TLS; \code{registry:2} speaks plain HTTP. If a pod
+sticks in \code{ImagePullBackOff} with this text in
+\code{kubectl describe pod}, the \code{registries.yaml} entry is missing
+--- and note containerd reads it \emph{only at startup}:
+\code{systemctl restart k3s} after editing.
+\end{pitfall}
+
+\begin{decision}[local registry vs.\ GHCR]
+GitHub Container Registry would make images pullable anywhere and add
+vulnerability scanning --- for the price of pushing hundreds of megabytes
+up residential Wi-Fi on every build. A LAN-local registry keeps the
+build loop at disk speed. The decision flips the moment a second machine
+must pull images; nothing in the manifests would change except the
+image prefix.
+\end{decision}
+
+\section{Tags, digests, and the SNAPSHOT trap}
+
+A \emph{tag} (\code{:1.0.0-SNAPSHOT}, \code{:a1b2c3d}) is a movable
+pointer; a \emph{digest} (\code{@sha256:...}) is the immutable content
+hash. The pipeline pushes every build twice-labelled: the SNAPSHOT tag
+(which the manifests reference) and the git-SHA tag (which deploys pin
+--- Chapter~23). Kubernetes caches images by tag; a re-pushed SNAPSHOT
+would be silently ignored on the node --- which is why every Deployment
+sets \code{imagePullPolicy: Always}: re-check the registry each start;
+if the digest matches, the check costs one manifest fetch.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Name the three CI problems Jib solves over
+  daemon-based builds, and which one is a security issue.
+  \item Why must the image name be written from the \emph{cluster's}
+  viewpoint, and what breaks if Jenkins and k3s disagree about what
+  \code{localhost:5000} means?
+  \item A colleague suggests \code{docker save | k3s ctr images import}
+  instead of a registry. What does that cost per deploy, and which
+  pipeline stage stops working naturally?
+  \item Explain how a re-pushed \code{:1.0.0-SNAPSHOT} plus default pull
+  policy produces ``I deployed but nothing changed,'' and both fixes.
+\end{enumerate}
+\end{quiz}

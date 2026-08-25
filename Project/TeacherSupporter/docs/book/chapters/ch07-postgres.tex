@@ -1,0 +1,157 @@
+\chapter{Relational Data: Postgres, JPA, Flyway}
+\label{ch:postgres}
+
+Two of the services own a PostgreSQL database each: auth-service owns
+\code{ts\_auth}, course-service owns \code{ts\_course}. This chapter
+covers the three layers between a \code{@Service} method and bytes on
+disk --- JPA/Hibernate, the connection pool, and Flyway --- and the
+architectural rule that there are \emph{two} databases at all.
+
+\section{Database-per-service}
+
+\begin{decision}[two Postgres servers, not two schemas in one]
+Each service owns its data exclusively; the only way to another service's
+data is through its API or its events. This forbids the classic failure
+mode of shared databases --- service A quietly joining service B's tables,
+coupling their schemas forever. The project takes it further than
+required: not just separate databases but separate server processes, so
+even accidental cross-connection is impossible and each can be tuned,
+backed up, or broken independently. Cost on this box: about 256\,MiB per
+extra server. In a cloud account the same isolation is usually two
+databases on one managed RDS instance --- isolation by credentials rather
+than by process --- because managed instances are billed per server.
+\end{decision}
+
+\section{JPA and Hibernate}
+
+JPA is the specification (annotations like \code{@Entity},
+\code{@OneToMany}, the \code{EntityManager}); Hibernate is the
+implementation Spring Boot auto-configures. Spring Data JPA sits on top,
+deriving queries from repository method names
+(\code{findByCourseIdAndStudentId}) and generating the boilerplate.
+
+The configuration from \code{configurations/course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ts_course   (*@\co{1}@*)
+    username: postgres
+    password: root                                    (*@\co{2}@*)
+  jpa:
+    hibernate:
+      ddl-auto: none                                  (*@\co{3}@*)
+    show-sql: true                                    (*@\co{4}@*)
+  flyway:
+    enabled: true                                     (*@\co{5}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The dev default. Compose overrides host to
+  \code{postgres-course}; Kubernetes overrides identically via
+  \code{SPRING\_DATASOURCE\_URL}. Note the k8s Service was deliberately
+  \emph{named} \code{postgres-course} so the override is the same string
+  in both environments.
+  \item[\co{2}] Plaintext credentials are acceptable only because this
+  file is the \emph{dev default}; in the cluster,
+  \code{SPRING\_DATASOURCE\_USERNAME}/\code{PASSWORD} arrive from a
+  Kubernetes Secret (Chapter~16) and outrank these.
+  \item[\co{3}] The most important line in the block ---
+  Section~\ref{sec:ddlauto}.
+  \item[\co{4}] Every SQL statement is logged --- a teaching tool and an
+  N+1-query detector in dev; turn it off where log volume costs money.
+  \item[\co{5}] Schema management belongs to Flyway, not Hibernate.
+\end{description}
+
+\section{Why \code{ddl-auto: none}}
+\label{sec:ddlauto}
+
+Hibernate can generate schema from entities (\code{ddl-auto: update}),
+and every tutorial uses it. Production systems do not, because
+\code{update} is a one-way ratchet with no history: it adds columns but
+never drops or renames safely; two developers' databases diverge
+silently; there is no record of what changed when, and no way to review a
+schema change before it hits production.
+
+\section{Flyway: migrations as code}
+
+Flyway treats schema as an ordered series of immutable SQL scripts,
+applied exactly once each, tracked in a table
+(\code{flyway\_schema\_history}) inside the target database:
+
+\begin{lstlisting}
+auth-service/src/main/resources/db/migration/
+  V1__create_users.sql
+  V2__create_refresh_tokens.sql
+  V3__add_admin_user_invitations.sql
+  V4__seed_default_admin.sql
+\end{lstlisting}
+
+At startup, Flyway compares the history table with the classpath scripts
+and applies the missing ones, in version order, before Hibernate ever
+initializes. The rules that make it work: never edit an applied
+migration (each row stores a checksum --- edits are detected and refused);
+only add new versions; and write migrations to be compatible with the
+\emph{previous} application version when you deploy rolling
+(Chapter~15): add-then-migrate-then-remove, never rename in one step.
+
+\begin{pitfall}[works locally, CrashLoopBackOff in the cluster]
+Symptom: a service boots on your machine but its pod restarts endlessly;
+logs show a Flyway checksum mismatch or a failed migration. Cause: the
+local database had been migrated by an older (or edited) script --- your
+laptop's history table and the cluster's disagree. This is also why the
+Kubernetes startup probe (Chapter~17) targets an endpoint that only
+answers after the Spring context is up: ``migrations applied'' is part of
+what \emph{ready} means. Fix by adding a corrective migration, never by
+editing history.
+\end{pitfall}
+
+\section{The connection pool}
+
+Opening a Postgres connection costs a TCP handshake, authentication, and
+a server process fork --- far too much per request. HikariCP (Spring
+Boot's default pool) keeps a small set of open connections that requests
+borrow and return. Default maximum: 10.
+
+\begin{hardware}
+Pool sizing folklore says ``more connections, more throughput''; the
+reality on a 2-core server is the opposite --- Postgres does work
+\emph{per connection}, and the practical formula
+(\(\approx\) cores $\times$ 2) suggests the default 10 is already
+generous for two services sharing two cores. If Postgres ever shows
+\code{too many clients}, lower the pools before raising
+\code{max\_connections}.
+\end{hardware}
+
+\section{Outside the project}
+
+A managed-cloud equivalent of this chapter's setup --- AWS RDS Postgres
+with the same Flyway flow --- changes only the URL and the trust model:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  datasource:
+    url: jdbc:postgresql://app-db.xxxxx.eu-central-1.rds.amazonaws.com:5432/ts_course
+    username: ${DB_USER}        # from AWS Secrets Manager
+    password: ${DB_PASSWORD}
+\end{lstlisting}
+
+Backups, replication and failover become the provider's problem ---
+which is why Chapter~19's warning about self-hosted state matters.
+The second industrial variant worth knowing: running Flyway as a
+separate CI step (\code{flyway migrate} against the target) instead of
+at application startup, so schema changes deploy independently of code
+and a slow migration cannot eat the startup probe's budget.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Give two concrete failure modes of \code{ddl-auto: update} in a
+  team setting that \code{none} + Flyway prevents.
+  \item Why must an applied migration never be edited, and what does
+  Flyway use to detect it?
+  \item You need to rename a column without downtime under rolling
+  deployments. Sketch the multi-release sequence.
+  \item Defend and attack the two-servers decision: one argument each
+  way, and the setting in which each wins.
+\end{enumerate}
+\end{quiz}

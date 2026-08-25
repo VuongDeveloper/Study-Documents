@@ -1,0 +1,110 @@
+\chapter{CI/CD: The Concepts}
+\label{ch:cicd}
+
+\section{Two practices, one pipeline}
+
+\begin{description}
+  \item[Continuous Integration] every change is merged into the shared
+  branch frequently and \emph{verified automatically} --- compiled,
+  tested, packaged. CI's product is confidence: the main branch is
+  always in a known-good state, and a breakage is caught minutes after
+  the commit that caused it, while its author still has context.
+  \item[Continuous Delivery/Deployment] every verified change is
+  automatically prepared for release (Delivery) or actually released
+  (Deployment --- no human gate). This project practices the stronger
+  form: a push to \code{main} ends as running pods, no button pressed.
+\end{description}
+
+The pipeline is the machine that enforces both:
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3.5mm and 5mm]
+  \node[boxdark] (git) {git push};
+  \node[box, right=of git] (trig) {trigger};
+  \node[box, right=of trig] (build) {build\\\scriptsize + tests};
+  \node[box, right=of build] (pkg) {package\\\scriptsize image + tag};
+  \node[box, right=of pkg] (reg) {registry};
+  \node[box, right=of reg] (dep) {deploy\\\scriptsize + verify};
+  \draw[flow] (git) -- (trig);
+  \draw[flow] (trig) -- (build);
+  \draw[flow] (build) -- (pkg);
+  \draw[flow] (pkg) -- (reg);
+  \draw[flow] (reg) -- (dep);
+\end{tikzpicture}
+\caption{The universal pipeline shape. Tool names vary; stages do not.}
+\end{figure}
+
+Whether it is Jenkins+Jib+k3s (this project), GitHub
+Actions+Docker+EKS, or GitLab CI+Kaniko+OpenShift --- source in, tested
+artifact into a registry, orchestrator told to converge on it,
+verification that it did. Learn the shape once and every employer's
+pipeline is a renaming exercise.
+
+\section{The vocabulary}
+
+\begin{description}
+  \item[Trigger] what starts a run. \emph{Webhook}: the git host calls
+  the CI server on push --- instant, but requires the CI server to be
+  reachable from the internet. \emph{Polling}: CI asks the repo ``anything
+  new?'' on a schedule --- reachable-from-nowhere, at the cost of
+  latency. This project polls (\code{H/5 * * * *}: about every five
+  minutes) precisely because Jenkins sits behind home NAT with no
+  public address --- topology decided the trigger, a pattern you will
+  see in every locked-down corporate network.
+  \item[Stage / step] the pipeline's units: stages are the named phases
+  (visible in the UI, gating progress); steps are the commands inside.
+  \item[Artifact] anything a build produces worth keeping: the jar, the
+  image, test reports. Artifacts must be \emph{immutable and traceable}
+  --- hence tagging images with the git SHA, so a running pod can be
+  traced to the exact commit it runs.
+  \item[Test gate] the property that later stages run only if earlier
+  ones passed. A pipeline that deploys despite failing tests is a
+  deployment script with extra steps.
+  \item[Environment promotion] the same artifact moving dev
+  $\rightarrow$ staging $\rightarrow$ prod. The iron rule:
+  \emph{promote artifacts, never rebuild them} --- a rebuild ``for
+  prod'' is a different binary than the one you tested. Chapter~1's
+  env-var machinery exists exactly so one image fits all environments.
+  \item[Rollback] the escape hatch. Because the registry keeps
+  SHA-tagged images and Kubernetes keeps old ReplicaSets
+  (Chapter~15), rolling back is re-pointing at a previous artifact ---
+  seconds, not a rebuild.
+\end{description}
+
+\begin{decision}[deploy on every push to main --- for one developer]
+Continuous Deployment without approvals is the right call here: one
+developer, a homelab blast radius, and the fastest possible feedback
+loop. The same choice at a bank would be wrong not because automation
+is risky but because \emph{regulated} changes need evidence of review.
+The graduation path keeps the pipeline and adds gates: a manual
+approval stage before prod, or --- Chapter~26 --- GitOps, where
+``deploy'' becomes a reviewable pull request to a config repo. The
+pipeline shape survives; only the gate policy changes.
+\end{decision}
+
+\begin{pitfall}[the pipeline that lies green]
+Symptom: every run is green; production still breaks. The classic
+causes: tests skipped in the build command (\code{-DskipTests} --- which
+\emph{this} pipeline does in its build stage, accepted consciously
+because \code{mvn verify} runs in CI on GitHub Actions --- know your
+own gates); deploy stage not verifying rollout (this one does ---
+\code{rollout status} fails the build if pods never go Ready); or
+success measured as ``commands exited 0'' rather than ``service
+answers requests.'' A green pipeline is a claim; know precisely what it
+claims.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item CI and CD make different promises. State each in one sentence,
+  and identify which stage of this project's pipeline delivers which.
+  \item Webhook vs.\ polling: name the deciding constraint in this
+  project, and a corporate setting with the same constraint.
+  \item Why must a promoted artifact never be rebuilt per environment,
+  and which mechanism from Chapter~1 makes single-artifact promotion
+  possible?
+  \item Your pipeline is green and prod is down. List three distinct
+  ways a pipeline can lie, and the fix for each.
+\end{enumerate}
+\end{quiz}

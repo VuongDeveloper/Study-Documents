@@ -1,0 +1,51 @@
+﻿# Topics as declared objects, reconciled by Strimzi's topic operator.
+#
+# Kafka would auto-create these on first use (auto.create.topics.enable
+# defaults to true), but declared topics beat auto-created ones: partition
+# count and retention are decisions, not defaults; they exist before the
+# first producer runs (no race on day one); and `kubectl get kafkatopics`
+# becomes the inventory of every event contract in the system.
+#
+# partitions: 1 -- total order per topic, which trivially preserves the
+# per-user ordering the publishers key for. Raise partitions later only
+# with a consumer that scales past one instance; note partitions can be
+# added but never removed.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: ts.user.registered
+  labels:
+    strimzi.io/cluster: ts-kafka
+spec:
+  partitions: 1
+  replicas: 1
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: ts.user.activated
+  labels:
+    strimzi.io/cluster: ts-kafka
+spec:
+  partitions: 1
+  replicas: 1
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: ts.user.admin-provisioned
+  labels:
+    strimzi.io/cluster: ts-kafka
+spec:
+  partitions: 1
+  replicas: 1
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: ts.assignment.created
+  labels:
+    strimzi.io/cluster: ts-kafka
+spec:
+  partitions: 1
+  replicas: 1

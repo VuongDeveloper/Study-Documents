@@ -1,0 +1,68 @@
+\chapter{How to Read This Book}
+
+This book teaches every technology inside the TeacherSupporter project ---
+Spring Boot and Spring Cloud, Postgres and MongoDB, Kafka, Docker,
+Kubernetes, and the Jenkins pipeline that ties them together --- using the
+project's own files as the worked examples. Nothing is invented for the
+page: every configuration you will read is deployed, or about to be
+deployed, on a real two-core home server called \code{ts-server}.
+
+\section*{The rules the book follows}
+
+\begin{description}
+  \item[Concepts before configs.] Each chapter first teaches the idea in
+  vendor-neutral terms, then reads the project's real file line by line,
+  then shows one or two examples from \emph{outside} the project so you can
+  tell what generalizes from what is local habit.
+  \item[Decisions are first-class.] Wherever the project chose between
+  alternatives (Jib over \code{docker build}, Kustomize over Helm, a second
+  Postgres server over a second database) the reasoning is in a
+  \textsc{decision} box. These are the ``why did you\ldots'' questions
+  interviews are made of.
+  \item[Failure is shown symptom-first.] \textsc{pitfall} boxes start with
+  what you would actually see (\code{CrashLoopBackOff}, a TLS error, a
+  silent 404) and work back to the cause, because that is the direction
+  real debugging runs in.
+\end{description}
+
+\section*{The box legend}
+
+\begin{decision}[example]
+Why the project chose one design over another, and what would have to
+change for the other choice to win.
+\end{decision}
+
+\begin{pitfall}[example]
+A symptom you will eventually meet, followed by its cause and fix.
+\end{pitfall}
+
+\begin{handson}[example]
+A command to run against the real stack, with the output you should
+expect. The book is meant to be read next to a terminal.
+\end{handson}
+
+\begin{hardware}[example]
+A choice that is only correct on this machine (2 cores, 19.4\,GB RAM,
+SATA SSD, Wi-Fi). Do not copy these into a data center.
+\end{hardware}
+
+\begin{quiz}
+Every chapter ends with a few questions in this box. Answers are in
+Appendix~A. Write your answer down before checking --- recognition is not
+recall.
+\end{quiz}
+
+\section*{Notation}
+
+Inline code and file names look like \code{application.yml}. Annotated
+listings carry circled markers --- \co{1}, \co{2} --- explained directly
+beneath the listing. Shell commands are shown with a \code{\$} prompt for
+the server and \code{PS>} for Windows PowerShell; do not type the prompt.
+
+\section*{What is assumed, and what is not}
+
+Assumed: you can read Java, and you have used Maven and git. Not assumed:
+any prior Kubernetes, Jenkins, Kafka, Docker internals, or frontend
+knowledge. Where the project's own documentation already covers one-time
+machine setup (\code{docs/RUNBOOK-SERVER-SETUP.md}), this book summarizes
+and moves on.

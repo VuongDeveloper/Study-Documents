@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dictionary-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: dictionary-service }
+  template:
+    metadata:
+      labels: { app: dictionary-service }
+    spec:
+      containers:
+        - name: dictionary-service
+          image: localhost:5000/dictionary-service:1.0.0-SNAPSHOT
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8083 }
+          env:
+            - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
+            - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE, value: "http://discovery-server:8761/eureka/" }
+            - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+
+            # Config-server's dictionary-service.yml says localhost:27017;
+            # in the cluster mongo lives behind the `mongodb` Service.
+            - { name: SPRING_DATA_MONGODB_URI, value: "mongodb://mongodb:27017/ts_dictionary" }
+
+            # Zipkin arrives with observability (milestone 8).
+            - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
+
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+
+          # This service's SecurityConfig permits /actuator/** -- so unlike
+          # course-service (which had to use /v3/api-docs), the probe can hit
+          # the purpose-built health endpoint. It aggregates a Mongo ping, so
+          # "ready" here really means "can serve dictionary lookups".
+          startupProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 10
+            failureThreshold: 12
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests: { memory: 512Mi, cpu: 200m }
+            limits: { memory: 768Mi }
+            # No CPU limit -- same class-loading argument as course-service.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dictionary-service
+spec:
+  selector: { app: dictionary-service }
+  ports:
+    - { name: http, port: 8083, targetPort: 8083 }

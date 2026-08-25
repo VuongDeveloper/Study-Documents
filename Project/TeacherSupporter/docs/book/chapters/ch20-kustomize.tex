@@ -1,0 +1,137 @@
+\chapter{Kustomize: Manifests as a Set}
+\label{ch:kustomize}
+
+\section{The problem}
+
+Part~V produced a dozen YAML files. Applying them one by one invites
+forgetting one; and the moment a second environment exists (``prod, but
+with 2 replicas and real secrets''), copy-pasting manifests per
+environment guarantees drift. Two tools dominate this space; this
+project uses the one built into kubectl.
+
+\section{The kustomization, annotated}
+
+\code{kubectl apply -k deploy/k8s/base} reads one file:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/kustomization.yaml
+namespace: ts                       (*@\co{1}@*)
+resources:                          (*@\co{2}@*)
+  - postgres-course.yaml
+  - postgres-auth.yaml
+  - mongodb.yaml
+  - minio.yaml
+  # kafka.yaml requires the Strimzi operator (one-time admin step:
+  # ../install-strimzi.sh) -- without its CRDs, apply fails on kind Kafka.
+  - kafka.yaml
+  - kafka-topics.yaml
+  - maildev.yaml
+  - config-server.yaml
+  - discovery-server.yaml
+  - course-service.yaml
+  - auth-service.yaml
+  - dictionary-service.yaml
+  - notification-service.yaml
+  - api-gateway.yaml
+commonLabels:                       (*@\co{3}@*)
+  app.kubernetes.io/part-of: teacher-supporter
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Stamped onto every resource --- no manifest needs its
+  own \code{namespace:} line, and retargeting the whole app to another
+  namespace is a one-line change.
+  \item[\co{2}] The definitive list. Two deliberate absences teach more
+  than the presences: \code{namespace.yaml} is out because it is
+  cluster-scoped and Jenkins' namespaced Role could not apply it
+  (Chapter~22); Secrets are out for Chapter~16's reasons. A third
+  object with the same admin-only status is not a file at all: the
+  Strimzi operator and its CRDs, installed once by
+  \code{install-strimzi.sh} (Chapter~25) --- \code{kafka.yaml} is listed
+  here but cannot apply until they exist. The listed order is
+  documentation only --- the API server accepts everything and
+  reconciliation sorts out reality.
+  \item[\co{3}] A label stamped on all objects, making the whole
+  application one selector: \code{kubectl get all -l
+  app.kubernetes.io/part-of=teacher-supporter} --- or, in a disaster
+  drill, one delete.
+\end{description}
+
+\section{Bases and overlays}
+
+Kustomize's real feature arrives with the second environment. A
+\emph{base} holds the truth; \emph{overlays} patch it:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/overlays/prod/kustomization.yaml
+resources:
+  - ../../base
+patches:
+  - target: { kind: Deployment, name: course-service }
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+images:
+  - name: localhost:5000/course-service
+    newTag: v1.4.2
+\end{lstlisting}
+
+No templates, no variables --- overlays are \emph{merges of plain YAML}.
+Every layer is valid Kubernetes YAML you can read, diff, and pipe
+through \code{kubectl kustomize} to inspect the final output before
+anything touches the cluster. The directory layout is already
+overlay-shaped (\code{base/}), so the day a prod overlay is needed, it
+is an \code{mkdir}, not a migration.
+
+\begin{decision}[Kustomize, not Helm]
+Helm is the other answer: manifests as Go templates
+(\code{replicas: \{\{ .Values.replicaCount \}\}}) with per-environment
+value files, packaged as versioned, shareable \emph{charts}. Templating
+is strictly more powerful --- loops, conditionals, one chart deploying
+anyone's app --- and that is the point of divergence: Helm shines when
+you \emph{distribute} software to strangers' clusters; for deploying
+your own app, templates make every manifest unreadable until rendered.
+Kustomize keeps plain YAML plain, ships inside kubectl, and covers
+replicas/images/labels patching --- the whole need here. You will still
+\emph{consume} Helm charts for third-party software (Strimzi,
+kube-prometheus-stack); writing one can wait until you have users.
+\end{decision}
+
+\begin{pitfall}[it worked yesterday: the prune illusion]
+Symptom: you delete a manifest from \code{resources:}, re-apply, and
+the object is still running --- for months, until it conflicts with
+something. Cause: apply-the-set is still apply --- Chapter~14's rule
+that apply never deletes holds for Kustomize too. The removed Ingress
+of Chapter~4 needed a manual \code{kubectl delete}. The systematic
+fixes: \code{kubectl apply -k --prune} (still gated behind flags for
+good reason --- a mislabeled selector can mass-delete), or GitOps
+controllers (Chapter~26) whose whole job is making git and cluster
+converge, deletions included.
+\end{pitfall}
+
+\begin{handson}[render before you trust]
+\begin{lstlisting}[language=bash]
+kubectl kustomize deploy/k8s/base | less     # the final YAML, merged
+kubectl kustomize deploy/k8s/base | grep -c 'kind:'   # object count
+kubectl apply -k deploy/k8s/base --dry-run=server     # validate, no changes
+\end{lstlisting}
+\code{kubectl kustomize} is pure text transformation --- reading its
+output is how you review what an overlay actually changes, and
+\code{--dry-run=server} is the closest thing to a manifest unit test.
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item What two problems does a kustomization solve over
+  \code{kubectl apply -f} per file, even with zero overlays?
+  \item Why are the namespace and the Secrets deliberately missing from
+  \code{resources:}? (Two different reasons.)
+  \item Helm vs.\ Kustomize: state each tool's home turf in one
+  sentence, and name the third-party software in this project's future
+  that will arrive as a chart.
+  \item A teammate removes \code{mongodb.yaml} from the list to
+  ``decommission'' it. What actually happens, and what are the two
+  correct procedures?
+\end{enumerate}
+\end{quiz}

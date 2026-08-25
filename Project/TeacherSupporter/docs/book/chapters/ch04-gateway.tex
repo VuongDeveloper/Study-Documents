@@ -1,0 +1,154 @@
+\chapter{The API Gateway}
+\label{ch:gateway}
+
+\section{The problem}
+
+Without a gateway, the frontend must know six service addresses, each
+service must implement its own authentication, and cross-cutting concerns
+(CORS, rate limits, tracing headers) are done six times or not at all. A
+gateway gives external clients \emph{one} address and centralizes the
+edge concerns; behind it, services can trust their caller.
+
+\section{Spring Cloud Gateway's model}
+
+Three concepts compose every route:
+
+\begin{description}
+  \item[Route] a destination URI plus the conditions and rewrites below.
+  \item[Predicates] conditions deciding whether a request matches:
+  path, method, header, host. First matching route wins.
+  \item[Filters] transformations applied on the way through:
+  strip or add path segments, add headers, rate-limit, retry.
+\end{description}
+
+The gateway is built on the \emph{reactive} stack (Project Reactor +
+Netty, \code{web-application-type: reactive} in its
+\code{application.yml}) rather than servlet Tomcat. A proxy spends its
+life waiting on other servers; an event-loop model holds thousands of
+in-flight requests without one thread each. Operationally this is why
+the gateway gets a smaller memory request than the MVC services in its
+Deployment (384\,Mi vs.\ 512\,Mi) and boots faster --- which
+Chapter~17 exploits with a shorter startup probe.
+
+\section{The project's routes, annotated}
+
+From \code{configurations/api-gateway.yml} (abridged --- the
+course-service block repeats for students, assignments, enrollments,
+submissions):
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: auth-service
+          uri: lb://auth-service          (*@\co{1}@*)
+          predicates:
+            - Path=/api/auth/**           (*@\co{2}@*)
+          filters:
+            - StripPrefix=2               (*@\co{3}@*)
+        - id: auth-oauth2
+          uri: lb://auth-service
+          predicates:
+            - Path=/oauth2/**             (*@\co{4}@*)
+        - id: course-service-courses
+          uri: lb://course-service
+          predicates:
+            - Path=/api/courses/**
+          filters:
+            - StripPrefix=2
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecret...}     (*@\co{5}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{lb://} = ``resolve this name via the discovery
+  client and load-balance.'' The name is the target's
+  \code{spring.application.name}. Swap \code{lb://} for \code{http://}
+  and you have a static proxy with no Eureka involved.
+  \item[\co{2}] Path predicate. \code{**} matches any depth.
+  \item[\co{3}] \code{StripPrefix=2} removes two segments:
+  \code{/api/auth/login} arrives at auth-service as \code{/login}.
+  This is why auth-service's SecurityConfig (Chapter~5) permits
+  \code{/login}, not \code{/api/auth/login} --- the service is unaware of
+  its public prefix.
+  \item[\co{4}] No StripPrefix here: Google's OAuth2 redirect URI is
+  registered with the full path, so it must arrive at auth-service
+  unchanged.
+  \item[\co{5}] The gateway holds the JWT \emph{validation} key. Same
+  secret as auth-service, which \emph{signs} --- one shared secret, two
+  roles, and in Kubernetes one Secret object mounted into both
+  (Chapter~16).
+\end{description}
+
+\begin{pitfall}[404 from the service, 200 from curl-on-the-pod]
+Symptom: calling \code{/api/courses/list} through the gateway returns
+404, but the same endpoint answers when called directly on the service.
+Cause: prefix mismatch --- either StripPrefix removed segments the
+controller expects, or the controller mapping includes a prefix the
+gateway already stripped. Debug by logging the \emph{rewritten} path:
+enable \code{spring.cloud.gateway} debug logging and compare with the
+controller's \code{@RequestMapping}.
+\end{pitfall}
+
+\section{Two routers: the gateway and the Ingress}
+
+On Kubernetes this project has \emph{two} L7 routers in series: Traefik
+(the Ingress controller, Chapter~18) at the cluster edge, then this
+gateway. The division of labor is deliberate:
+
+\begin{itemize}
+  \item Traefik owns the \emph{host}: TLS later, one public entry,
+  path-prefix fan-out. It sends \code{/api}, \code{/oauth2},
+  \code{/login/oauth2} to the gateway and will send \code{/} to the
+  frontend.
+  \item The gateway owns the \emph{application edge}: Eureka resolution,
+  JWT validation, per-route rewrites.
+\end{itemize}
+
+\begin{decision}[no side doors]
+Milestone~3 had an Ingress sending \code{/courses} straight to
+course-service --- useful scaffolding, but it bypassed JWT validation:
+an unauthenticated path to protected data. It was deleted the day the
+gateway was deployed. The rule it teaches: \emph{every} external route
+must pass the component that enforces authentication, or the
+authentication is decorative.
+\end{decision}
+
+\section{Advanced corners}
+
+Worth knowing, not yet used here: \code{RequestRateLimiter} filter
+(token bucket backed by Redis), \code{Retry} with backoff for idempotent
+GETs, \code{CircuitBreaker} filter (Resilience4j) returning fallbacks
+when a service is down, and default filters applied to all routes. Each
+is a few YAML lines --- the gateway is where such policies belong,
+because it is the one place every external request passes.
+
+\section{Outside the project}
+
+The same three-route idea in a Kubernetes-native gateway (no Eureka,
+Service DNS instead) --- an nginx-ingress annotation style:
+
+\begin{lstlisting}[language=yaml]
+nginx.ingress.kubernetes.io/rewrite-target: /$2
+# path: /api/courses(/|$)(.*)  ->  service: course-service
+\end{lstlisting}
+
+And the cloud-managed version: an AWS API Gateway or GCP API Gateway
+route table doing predicates/filters as vendor config, with JWT
+validation delegated to the provider (Cognito, IAP). The concepts
+transfer 1:1; only the syntax and the billing change.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Follow \code{POST /api/auth/login} from browser to controller
+  method on Kubernetes: name every hop and every path rewrite.
+  \item Why must the OAuth2 routes not strip their prefix while the API
+  routes must?
+  \item The gateway validates JWTs; auth-service signs them. What
+  breaks, and with what symptom, if the two ever hold different secrets?
+  \item Why is a reactive stack the right choice for a proxy but not
+  automatically for course-service?
+\end{enumerate}
+\end{quiz}

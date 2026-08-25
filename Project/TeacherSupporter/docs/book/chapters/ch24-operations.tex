@@ -1,0 +1,138 @@
+\chapter{Operating the Stack: A Debugging Field Manual}
+\label{ch:operations}
+
+This chapter is the one to reread with a broken cluster in front of
+you. It assembles the debugging workflow the earlier chapters earned,
+ordered the way real incidents unfold.
+
+\section{The four questions}
+
+Almost every Kubernetes incident is located by asking, in order:
+
+\begin{enumerate}
+  \item \textbf{Is the pod running?} \code{kubectl -n ts get pods} ---
+  read the STATUS and RESTARTS columns; the taxonomy below.
+  \item \textbf{What does the platform say about it?}
+  \code{kubectl -n ts describe pod <pod>} --- the Events section at the
+  bottom is the kubelet and scheduler narrating their decisions:
+  image pulls, probe failures, OOM kills, scheduling refusals.
+  \item \textbf{What does the app say?} \code{kubectl -n ts logs
+  <pod>} (add \code{--previous} for the container that just died ---
+  the single most-forgotten flag in incident response).
+  \item \textbf{Can I reproduce its view of the world?}
+  \code{kubectl -n ts exec -it <pod> -- sh} and try the connection the
+  app claims is failing.
+\end{enumerate}
+
+\section{A status taxonomy}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lp{6.6cm}@{}}
+\toprule
+Status & Meaning and first move \\
+\midrule
+\code{Pending} & unschedulable: requests exceed free
+resources, or PVC unbound. \code{describe} shows which. \\
+\code{ImagePullBackOff} & registry unreachable, name typo'd, or the
+HTTPS-vs-HTTP trap of Chapter~13. \\
+\code{CrashLoopBackOff} & process exits soon after start; backoff
+doubles between retries. \code{logs --previous}. \\
+\code{OOMKilled} (exit 137) & memory limit hit; no Java trace exists
+--- Chapter~17's kernel kill. Raise limit or shrink heap. \\
+\code{Running 0/1} & alive but readiness failing: normal during
+startup; a problem when persistent --- probe the probe's own URL. \\
+\code{Completed}/\code{Error} & for Jobs; for a service pod,
+\code{Error} means the process exited nonzero once. \\
+\bottomrule
+\end{tabular}
+\caption{What the STATUS column is trying to tell you.}
+\end{table}
+
+\begin{handson}[break it on purpose --- three drills]
+Deliberate sabotage, on a quiet day, teaches more than any outage:
+\begin{lstlisting}[language=bash]
+# 1. wrong image tag -> watch ImagePullBackOff, then roll back
+kubectl -n ts set image deployment/course-service \
+    course-service=localhost:5000/course-service:nope
+kubectl -n ts rollout undo deployment/course-service
+
+# 2. scale the database down -> watch dependents degrade honestly
+kubectl -n ts scale statefulset/postgres-course --replicas=0
+kubectl -n ts get pods -w     # course-service readiness reacts
+kubectl -n ts scale statefulset/postgres-course --replicas=1
+
+# 3. kill Eureka -> verify existing routes survive on client caches
+kubectl -n ts delete pod -l app=discovery-server
+\end{lstlisting}
+Each drill pairs a chapter's theory with its observable behavior:
+13 (naming), 17--18 (probes and endpoints), 3 (client-side caching).
+\end{handson}
+
+\section{Reading a service's world from inside}
+
+When logs claim a connection failure, verify the claim from the pod's
+own network position --- DNS and reachability differ between your
+machine and the pod:
+
+\begin{lstlisting}[language=bash]
+kubectl -n ts exec -it deploy/course-service -- sh
+wget -qO- http://config-server:8888/actuator/health   # DNS + service up?
+nc -zv postgres-course 5432                           # TCP reachable?
+env | grep SPRING                                     # what was injected?
+\end{lstlisting}
+
+That last command settles arguments fast: it prints what configuration
+the pod \emph{actually} received, which beats re-reading manifests.
+
+\section{The routine that keeps weekends free}
+
+\begin{description}
+  \item[After every deploy] the pipeline already verifies rollouts;
+  glance at \code{kubectl -n ts get pods} anyway --- RESTARTS creeping
+  upward is tomorrow's outage announcing itself.
+  \item[Weekly] \code{kubectl top pods -n ts} (requires
+  metrics-server, bundled with k3s): compare actual usage against the
+  requests of Chapter~17 and correct the fiction. Check disk:
+  \code{df -h} on the server --- registries and log files grow;
+  \code{registry:2} needs occasional garbage collection.
+  \item[Before demos] \emph{do not build} --- Chapter~5's hardware box:
+  two cores mean a Maven build and a demo contend for the same CPU
+  that keeps readiness probes answering.
+\end{description}
+
+\begin{hardware}
+ufw on the server must exempt the pod and service CIDRs
+(\code{10.42.0.0/16}, \code{10.43.0.0/16}) --- firewalling them breaks
+DNS and pod-to-pod traffic in ways that impersonate application bugs:
+intermittent timeouts, resolvable-sometimes names. When \emph{weird}
+networking happens on k3s, suspect the host firewall before the app.
+And k3s reads \code{registries.yaml} only at startup --- after editing,
+\code{systemctl restart k3s}, which briefly restarts every pod: not
+during a demo.
+\end{hardware}
+
+\begin{pitfall}[debugging the wrong layer]
+The most expensive habit in Kubernetes debugging is starting where the
+symptom appeared instead of where the cause lives. A browser 502 can be
+Traefik (no endpoints), the gateway (Eureka staleness), the service
+(readiness failing), the database (pod evicted), or the disk (full).
+The four questions exist to walk the layers in order; resist the
+temptation to open application logs first just because they are the
+most familiar layer. \code{describe} before \code{logs} --- the
+platform usually already knows.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Order the four questions and name the command for each. Which
+  one uses a flag people forget, and when does that flag matter?
+  \item \code{CrashLoopBackOff} vs.\ \code{Running 0/1}: different
+  layers are failing --- which probe concept distinguishes them?
+  \item A service claims it cannot reach Postgres; from your laptop
+  Postgres answers. What is the next diagnostic step and why is your
+  laptop's success irrelevant?
+  \item Why can a host firewall change masquerade as an application
+  bug on k3s, and which two CIDRs must stay exempt?
+\end{enumerate}
+\end{quiz}

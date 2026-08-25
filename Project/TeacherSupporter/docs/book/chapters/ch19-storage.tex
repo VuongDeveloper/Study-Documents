@@ -1,0 +1,121 @@
+\chapter{Storage: Volumes, Claims, and State on a Single Node}
+\label{ch:storage}
+
+\section{The abstraction stack}
+
+Containers' filesystems die with them. Kubernetes separates the
+\emph{request} for storage from its \emph{provision} through three
+objects:
+
+\begin{description}
+  \item[PersistentVolume (PV)] an actual piece of storage --- a
+  directory, an EBS volume, an NFS export.
+  \item[PersistentVolumeClaim (PVC)] a workload's request: ``5\,Gi,
+  ReadWriteOnce.'' The claim is what pods mount; it binds to a PV.
+  \item[StorageClass] the factory: how to make a PV on demand when a
+  claim appears (\emph{dynamic provisioning}).
+\end{description}
+
+The indirection is portability: \code{postgres-course.yaml} says only
+``I need 5\,Gi''; \emph{how} that becomes disk is the cluster's
+business. The same manifest gets a local directory on k3s and an EBS
+volume on EKS.
+
+\section{local-path on k3s}
+
+k3s bundles the \code{local-path} StorageClass: a PVC becomes a
+directory under \code{/var/lib/rancher/k3s/storage/} on the node's SSD.
+Simple, fast, and honest about its limits --- the data is on \emph{that
+node's disk}. On multi-node clusters that pins the pod to the node; on
+this single-node cluster it just means what it says.
+
+\begin{hardware}
+local-path provides \emph{persistence} (data survives pod and node
+restarts), not \emph{durability} (one SSD failure loses everything) and
+not \emph{backup} (a bad \code{DELETE} replicates to nowhere).
+The honest missing piece is a CronJob running \code{pg\_dump} to MinIO
+or off-box. Rule of thumb worth keeping: a database without tested
+restores is a cache.
+\end{hardware}
+
+\section{Two claim styles in the manifests}
+
+MinIO (a Deployment with one replica) uses a standalone PVC; the
+databases use \code{volumeClaimTemplates} inside their StatefulSets ---
+a PVC \emph{minted per replica} and, crucially, \emph{re-bound to the
+replacement pod} rather than a second live pod. That distinction is
+the storage half of Chapter~15's corruption pitfall.
+
+\begin{lstlisting}[language=yaml]
+volumeClaimTemplates:
+  - metadata: { name: data }
+    spec:
+      accessModes: [ReadWriteOnce]     (*@\co{1}@*)
+      resources: { requests: { storage: 5Gi } }
+# in the pod template:
+volumeMounts:
+  - { name: data, mountPath: /var/lib/postgresql/data }
+env:
+  - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }  (*@\co{2}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{ReadWriteOnce} = mountable read-write by one
+  \emph{node} at a time --- fits a database exactly. (\code{RWX} ---
+  many nodes --- needs NFS-like storage and is the mode people want for
+  shared uploads before discovering object storage, Chapter~9, is the
+  better answer.)
+  \item[\co{2}] The PGDATA trick, a genuine classic: the Postgres image
+  refuses to initialize into a non-empty directory, and ext4 volumes
+  arrive with \code{lost+found}. Pointing PGDATA one directory deeper
+  sidesteps it. You will meet this exact pattern in
+  StackOverflow-years' worth of Postgres-on-Kubernetes setups.
+\end{description}
+
+\begin{pitfall}[deleted the StatefulSet, data still there --- or gone]
+Two surprises in one. First: deleting a StatefulSet does \emph{not}
+delete its PVCs --- by design, data outlives orchestration mistakes;
+re-create the StatefulSet and it re-binds. Second, the reverse trap:
+deleting the PVC while experimenting \emph{does} delete the PV and its
+directory (reclaimPolicy \code{Delete}, the dynamic-provisioning
+default). The asymmetry is worth memorizing before you clean up a
+namespace: workload objects are disposable; claims are where the data
+is.
+\end{pitfall}
+
+\begin{handson}[see through the abstraction]
+\begin{lstlisting}[language=bash]
+kubectl -n ts get pvc                       # claims and their PVs
+kubectl get pv                              # cluster-scoped, note the paths
+ssh ts-server 'sudo ls /var/lib/rancher/k3s/storage/'
+# pvc-...  one directory per PV -- your databases, as plain files
+\end{lstlisting}
+Demystification is the point: a PVC on this cluster is a directory.
+On EKS the same two kubectl commands would show EBS volume IDs ---
+same objects, different factory.
+\end{handson}
+
+\section{Outside the project}
+
+On managed Kubernetes, StorageClasses map to cloud disks (EBS/gp3 on
+EKS, Persistent Disks on GKE) with snapshots, encryption and resizing
+--- \code{VolumeSnapshot} objects make backup part of the same
+declarative model. The industrial pattern this chapter points toward,
+though, is subtraction: teams increasingly keep \emph{databases outside
+the cluster} (RDS, Cloud SQL) and let Kubernetes run only stateless
+things --- trading Chapter~15's StatefulSet care for a managed bill.
+Both sides of that trade are now visible to you.
+
+\begin{quiz}
+\begin{enumerate}
+  \item PV, PVC, StorageClass: which does a pod mount, which is
+  cluster-scoped, and what does the indirection buy this project's
+  manifests on a future EKS?
+  \item Why is \code{ReadWriteOnce} sufficient for Postgres, and what
+  kind of workload pushes people toward RWX --- usually wrongly?
+  \item Explain both directions of the deletion asymmetry: StatefulSet
+  gone/PVC stays, PVC gone/data gone.
+  \item What do persistence, durability, and backup each mean, and
+  which does local-path provide?
+\end{enumerate}
+\end{quiz}

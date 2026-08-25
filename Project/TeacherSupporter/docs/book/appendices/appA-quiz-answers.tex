@@ -1,0 +1,490 @@
+\chapter{Quiz Answers}
+\label{app:answers}
+
+\section*{Chapter 1 --- Spring Boot}
+\begin{enumerate}
+  \item The env var wins: env vars outrank the config-server document,
+  which outranks the packaged YAML. Right for containers because the
+  image must be immutable across environments; the runtime injects
+  what differs.
+  \item \code{@Configuration}, \code{@ComponentScan},
+  \code{@EnableAutoConfiguration}. The last: auto-configuration is
+  conditional on the classpath, so removing a dependency silently
+  removes the beans it triggered.
+  \item It resolves to the literal string \code{placeholder}. The
+  service can therefore \emph{start} without Google credentials ---
+  OAuth fails at click time instead of boot time.
+  \item Exposure makes the endpoint exist; Spring Security still
+  authorizes each request. If \code{/actuator/**} is not permitted,
+  probes get 401, which the kubelet counts as failure.
+\end{enumerate}
+
+\section*{Chapter 2 --- Config Server}
+\begin{enumerate}
+  \item Env var $>$ config-server $>$ packaged YAML.
+  \item Native serves files from the classpath directory inside the
+  jar; git adds audit, review, revert, and config changes without
+  rebuilding the config-server.
+  \item \code{optional:} lets a service boot when the config-server is
+  down --- but then it boots on localhost defaults and fails later,
+  far from the cause.
+  \item In its own \code{application.yml}, packaged in its jar. The
+  bootstrapping principle: the source of configuration cannot
+  configure itself; every such chain needs a self-contained root.
+\end{enumerate}
+
+\section*{Chapter 3 --- Eureka}
+\begin{enumerate}
+  \item course-service registers (POST) at startup; the gateway's
+  discovery client refreshes its registry cache (default up to
+  30\,s); routing then load-balances from cache. Worst case for a new
+  instance to receive traffic: registration interval + cache refresh,
+  tens of seconds.
+  \item Compose makes service \emph{names} resolvable, and hostnames
+  match them; in Kubernetes the pod hostname is the pod name, which
+  no one can resolve --- so the IP must be registered instead.
+  \item Availability of registry data over accuracy. Helps: a switch
+  reboot silences all heartbeats but instances still run. Hurts: mass
+  real crashes leave dead instances registered.
+  \item The Service's endpoint list replaces the registry; readiness
+  probes replace heartbeats; kube-proxy/DNS replace client-side
+  lookup; the ReplicaSet replaces self-registration of new instances.
+\end{enumerate}
+
+\section*{Chapter 4 --- API Gateway}
+\begin{enumerate}
+  \item Browser $\rightarrow$ ts.local (hosts file) $\rightarrow$
+  Traefik (Ingress: \code{/api} $\rightarrow$ api-gateway Service)
+  $\rightarrow$ gateway pod (predicate \code{/api/auth/**},
+  StripPrefix=2, JWT not required for \code{/api/auth}) $\rightarrow$
+  Eureka-resolved auth-service pod, arriving as \code{/login}
+  $\rightarrow$ controller.
+  \item Google validates the redirect URI byte-for-byte; it was
+  registered with the full \code{/login/oauth2/...} path, so it must
+  arrive unmodified. API routes strip because controllers are written
+  prefix-less.
+  \item Every request with a token signed by auth-service fails the
+  gateway's validation --- universal 401s on protected routes while
+  login itself appears to work.
+  \item A proxy is I/O-bound with high concurrency --- event loops
+  excel. course-service does blocking JDBC work; reactive would
+  complicate it without benefit until proven otherwise.
+\end{enumerate}
+
+\section*{Chapter 5 --- Security}
+\begin{enumerate}
+  \item CSRF rides an ambient credential (the session cookie sent
+  automatically). A JWT in an Authorization header is attached
+  explicitly by code; a forged cross-site request cannot add it.
+  \item Fifteen minutes (its expiry). Nothing --- a signature cannot be
+  revoked. \code{/refresh}: the refresh token is checked against the
+  database, where revocation lives.
+  \item Invariant: every network path to a service passes the
+  gateway's JWT filter. Breaks: an Ingress routing straight to a
+  service (the deleted \code{/courses} route), or any in-cluster
+  caller forging headers on the flat pod network.
+  \item The client-secret never leaves servers; the authorization
+  code transits the browser. The code is single-use, short-lived, and
+  worthless without the client-secret at exchange time.
+  \item HS256: one shared secret; anyone who can validate can also
+  sign. RS256: private key signs, public key validates --- so an IdP
+  can let thousands of services validate without any of them being
+  able to mint tokens.
+\end{enumerate}
+
+\section*{Chapter 6 --- Services and Common}
+\begin{enumerate}
+  \item (a) HTTP --- the caller needs the data now. (b) Event --- a
+  fact others react to; grading must not wait on mail. (c) Neither:
+  validation is local cryptography with the shared secret; no call.
+  \item auth-service only \emph{produces} --- sends fail per-call,
+  boot succeeds. notification-service only \emph{consumes}; without a
+  broker it is pure idle cost, so it ships with Kafka.
+  \item Belongs: event records --- both sides must agree on shape.
+  Never: business logic/entities --- shared behavior couples services'
+  release cycles and hides the boundary.
+  \item Consumers deploy before producers, and changes are
+  additive-only (new optional fields). Then old consumers ignore new
+  fields and new consumers tolerate old events.
+\end{enumerate}
+
+\section*{Chapter 7 --- Postgres, JPA, Flyway}
+\begin{enumerate}
+  \item Two developers' schemas silently diverging (update applies
+  per-database, no history); and destructive changes being impossible
+  --- update never drops/renames, so entity refactors quietly desync
+  from the schema.
+  \item Each history row stores a checksum of its script; an edited
+  script mismatches and Flyway refuses to start --- the history is
+  the audit trail, and edits would falsify it.
+  \item Release 1: add new column, write both (or trigger). Backfill
+  migration. Release 2: read new column, stop writing old.
+  Release 3: drop old column. Each step compatible with the version
+  before it.
+  \item For: fault and blast-radius isolation --- one server's crash,
+  upgrade, or misconfiguration cannot touch the other's data. Against:
+  double memory and operational surface for a homelab. Managed clouds
+  usually take credential-isolation on one instance because servers
+  are the billing unit.
+\end{enumerate}
+
+\section*{Chapter 8 --- MongoDB}
+\begin{enumerate}
+  \item Dictionary entries: self-contained, read/written as a unit,
+  naturally nested, no cross-entry consistency. Enrollments: reference
+  two other aggregates and require consistency between them --- joins
+  and transactions are the point.
+  \item Into the application code (and optional collection
+  validators). Disciplines: backward-readable document classes (new
+  fields optional), and explicit data-fix scripts for shape changes.
+  \item Postgres refuses connections to a nonexistent database;
+  Mongo creates databases on first write, so a wrong name yields
+  empty results. Loud --- failures you notice at deploy beat failures
+  you notice at audit.
+  \item ClusterIP-only + no Ingress means only in-cluster callers can
+  reach it; the compose parity also keeps dev friction zero.
+  Invalidated the moment it is exposed beyond the cluster or shares
+  the cluster with untrusted workloads.
+\end{enumerate}
+
+\section*{Chapter 9 --- MinIO / S3}
+\begin{enumerate}
+  \item The service signs (microseconds) instead of streaming
+  (seconds); storage serves bytes directly. New failure mode: the
+  URL embeds an endpoint and expiry --- wrong endpoint or clock skew
+  breaks downloads in the browser only, invisible to the service.
+  \item The signing service reaches MinIO as \code{minio:9000}
+  (cluster DNS); the browser cannot resolve that name. The signature
+  covers the host, so rewriting after signing invalidates it ---
+  hence signing against a second, public endpoint.
+  \item Expiry (15 minutes) bounds the damage window; the URL grants
+  one object, not the bucket; and it cannot be re-signed without the
+  keys.
+  \item Changes: endpoint(s), credentials (ideally to an IAM role),
+  durability guarantees. Unchanged: every SDK call, bucket/key/presign
+  logic --- the API is the standard.
+\end{enumerate}
+
+\section*{Chapter 10 --- Kafka Core}
+\begin{enumerate}
+  \item Key by userId --- per-key order is per-partition order.
+  Partitions $\geq$ max consumers you ever want in the group;
+  parallelism is capped by partition count.
+  \item Groups are independent: each keeps its own offsets per
+  partition, so both groups traverse the full log; consumption is
+  non-destructive reading plus a per-group cursor.
+  \item \code{LISTENERS} = sockets bound; \code{ADVERTISED\_LISTENERS}
+  = addresses \emph{returned to clients} in metadata. Bootstrap uses
+  the address you supplied; all subsequent connections use the
+  advertised ones --- so the failure begins after a successful hello.
+  \item Retries and post-processing crashes both re-deliver;
+  the broker cannot know if you acted. Notification: dedupe by event
+  id (or accept a rare duplicate mail --- idempotence by tolerance).
+\end{enumerate}
+
+\section*{Chapter 11 --- Spring Kafka}
+\begin{enumerate}
+  \item \code{send()} buffers client-side and returns a future; no
+  broker needed until delivery. The outage surfaces per-send: futures
+  fail after timeouts, and buffered events are lost if the process
+  dies.
+  \item With no committed offsets, \code{earliest} starts from the
+  oldest retained record --- history is processed. Once the group
+  commits offsets, the setting is never consulted again.
+  \item Without: deserialization throws inside poll, offset never
+  advances, the partition stalls on one record forever. With: the
+  error is materialized as a typed failure, the error handler skips
+  (or retries then routes) --- in full production, to
+  \code{<topic>.DLT}.
+  \item JSON deserialization instantiates classes named in headers; an
+  unrestricted trust list lets a message make the consumer construct
+  arbitrary classpath types --- a gadget-injection vector.
+  \item When ``DB write + event publish'' must not diverge. It makes
+  the state change and the \emph{recording of the intent to publish}
+  atomic --- one local transaction; a relay makes the publish
+  eventually happen.
+\end{enumerate}
+
+\section*{Chapter 12 --- Docker}
+\begin{enumerate}
+  \item Namespaces (isolated views) and cgroups (resource limits).
+  No guest kernel: millisecond starts and no per-instance OS cost ---
+  but also: the kernel is shared (weaker isolation than a VM) and the
+  JVM sees host resources unless told otherwise.
+  \item Inside a container \code{localhost} is the container itself.
+  Compose fixes it with service-name DNS on the bridge network;
+  Kubernetes with Service DNS --- both via env-var overrides of the
+  localhost defaults.
+  \item Each container has its own network namespace, so both bind
+  ``their'' 5432. Conflicts return at the shared host: published
+  host ports (hence 5433/5434) --- and with \code{--network host},
+  where there is no namespace separation at all.
+  \item Plain \code{depends\_on} waits for \emph{started};
+  \code{service\_healthy} waits for the healthcheck to pass ---
+  here, config-server's curl of its own \code{/actuator/health},
+  exposed by its management config.
+\end{enumerate}
+
+\section*{Chapter 13 --- Jib and the Registry}
+\begin{enumerate}
+  \item No daemon in CI, volatility-based layering (small re-pushes),
+  non-root/OpenShift-ready images. The security one: no daemon means
+  no docker socket in CI --- the socket is root on the host.
+  \item The image name doubles as pull address for the cluster. They
+  agree here because Jenkins shares the host's network namespace; if
+  Jenkins were bridge-networked, its \code{localhost:5000} would be
+  itself and pushes would fail while pulls worked.
+  \item An import per node per deploy, minutes of serialization, and
+  no immutable tag history; the pipeline's \code{set image} to a
+  SHA-tagged name has nothing to point at --- the registry is what
+  makes tags addressable.
+  \item Same tag, new content: with \code{IfNotPresent} the node's
+  cached image wins silently. Fixes: \code{imagePullPolicy: Always}
+  (the manifests' choice), or deploy by immutable tags/digests
+  (the pipeline's choice) --- this project does both.
+\end{enumerate}
+
+\section*{Chapter 14 --- Cluster Anatomy}
+\begin{enumerate}
+  \item You write desired state; controllers reconcile actual toward
+  it forever. A second apply produces zero diff, so zero action ---
+  idempotence by architecture.
+  \item Ordering is a procedural concept; convergence replaces it:
+  everything starts, dependents crash and retry with backoff until
+  dependencies exist. CrashLoop during convergence is the mechanism,
+  not a bug.
+  \item kubectl sends a REST delete to the API server; state store
+  updates; the ReplicaSet controller's loop sees replicas 0 $<$ 1 and
+  creates a pod object; the scheduler assigns it; the kubelet on the
+  node starts the container.
+  \item Apply merges desired state; it never deletes what is absent
+  from input. \code{kubectl delete ingress course-service -n ts}, or
+  an apply with \code{--prune} (or a GitOps controller) would.
+\end{enumerate}
+
+\section*{Chapter 15 --- Workloads}
+\begin{enumerate}
+  \item Each template change births a new ReplicaSet while old ones
+  are retained at scale 0 --- rolling update and one-command rollback
+  fall out of keeping the counter separate from the versioned
+  template.
+  \item Deployment: N interchangeable replicas, any can die, order
+  irrelevant. StatefulSet: named replicas with per-identity storage
+  and ordered replacement. Eureka: Deployment (registry rebuilt by
+  re-registration). Redis cache: Deployment if truly cache.
+  Kafka broker: StatefulSet. Gateway: Deployment.
+  \item New pods must pass readiness before old pods terminate ---
+  Chapter~17's probes gate Chapter~15's rollout.
+  \item A Deployment update runs old and new pods concurrently; two
+  postgres processes opening one data directory corrupt it. The
+  StatefulSet replaces one-at-a-time and re-binds the claim to the
+  successor, never two at once.
+\end{enumerate}
+
+\section*{Chapter 16 --- Config and Secrets}
+\begin{enumerate}
+  \item RBAC on who may read Secret objects; lifecycle separation
+  from git; encryption at rest (optional). This project: RBAC yes
+  (Jenkins' Role omits secret-read... it grants create/patch but the
+  practical control is namespace scoping), git-separation yes (script),
+  encryption at rest no.
+  \item Server image reads \code{POSTGRES\_*}; Spring reads
+  \code{SPRING\_DATASOURCE\_*}. Split Secrets mean each pod imports
+  only names it understands --- no foreign variables that mask typos
+  or leak scope.
+  \item Update: \code{JWT\_SECRET=new ./create-secrets.sh}; then
+  immediately \code{kubectl -n ts rollout restart deployment/auth-service
+  deployment/api-gateway}. Half-done: signer and validator hold
+  different keys --- every login 401s, or worse, only after the next
+  unrelated restart.
+  \item The config-server's \code{configurations/*.yml} tree, mounted
+  as files --- retiring the config-server itself.
+\end{enumerate}
+
+\section*{Chapter 17 --- Probes and Resources}
+\begin{enumerate}
+  \item Startup failing past budget: restart. Readiness failing:
+  removed from endpoints, no restart --- safe to be aggressive.
+  Liveness failing: restart --- the one to be conservative with.
+  \item \code{/v3/api-docs} answers only after the full context
+  (Flyway included) is up and is permitAll'd; a bound port proves
+  only Tomcat exists. \code{/actuator/health} is 401 where security
+  does not permit it (course/auth) and honest where it does
+  (dictionary, gateway).
+  \item The kernel's OOM killer terminated the cgroup for exceeding
+  its memory limit --- no JVM involvement, so no exception. Check:
+  the limit vs.\ \code{MaxRAMPercentage} arithmetic, and whether
+  load or a leak grew the heap.
+  \item Scheduler reads requests (placement); kernel enforces limits.
+  Memory is incompressible --- exceeding it kills someone, so bound
+  it predictably; CPU is compressible --- limits would throttle
+  startup exactly when the JVM needs burst.
+\end{enumerate}
+
+\section*{Chapter 18 --- Networking}
+\begin{enumerate}
+  \item DNS resolves the Service name to a stable virtual IP; the
+  endpoint controller keeps the Ready-pod list current; kube-proxy
+  (or k3s' equivalent) rewrites virtual-IP traffic to a chosen pod
+  IP; readiness decides membership.
+  \item Only Ready pods are endpoints, so a rolling update shifts
+  traffic exactly when new pods pass probes and old ones terminate
+  --- zero-downtime is the probe-endpoint interaction.
+  \item Selector/label mismatch --- the Service matches zero pods.
+  Nothing errors because a Service with no endpoints is a legal
+  state; the symptom is only visible in \code{get endpoints}.
+  \item \code{ts.local} is not real DNS; the hosts file pins it to
+  the tailnet IP. Replacements: a real domain with actual DNS +
+  cert-manager TLS, or a Cloudflare Tunnel publishing the hostname.
+\end{enumerate}
+
+\section*{Chapter 19 --- Storage}
+\begin{enumerate}
+  \item Pods mount PVCs; PVs (and StorageClasses) are cluster-scoped;
+  the indirection lets the same claim get local-path here and EBS on
+  EKS --- manifests unchanged.
+  \item Postgres runs on one node at a time --- RWO suffices. Shared
+  uploads push people to RWX; object storage is usually the right
+  answer instead.
+  \item StatefulSet deletion spares PVCs so data survives
+  orchestration mistakes; PVC deletion (reclaim \code{Delete})
+  removes PV and data --- claims, not workloads, are where data
+  lives.
+  \item Persistence: survives restarts (yes). Durability: survives
+  hardware failure (no --- one SSD). Backup: survives your own
+  mistakes (no --- absent, the honest gap).
+\end{enumerate}
+
+\section*{Chapter 20 --- Kustomize}
+\begin{enumerate}
+  \item A definitive set (nothing forgotten, one command) and
+  cross-cutting edits (namespace, labels) stamped consistently.
+  \item Namespace: cluster-scoped --- Jenkins' namespaced Role cannot
+  apply it. Secrets: values must not exist in git at all --- shape in
+  script, values in the operator's environment.
+  \item Kustomize: deploying your own app as readable YAML. Helm:
+  distributing parameterized software to other people's clusters.
+  Arriving as charts: Strimzi and kube-prometheus-stack.
+  \item Nothing --- apply does not prune; mongodb keeps running,
+  now unmanaged. Correct: \code{kubectl delete -f mongodb.yaml}
+  (then remove from the list), or prune/GitOps machinery that
+  reconciles deletions.
+\end{enumerate}
+
+\section*{Chapter 21 --- CI/CD Concepts}
+\begin{enumerate}
+  \item CI: main is always verified buildable --- the Build stage.
+  CD: every verified change reaches production unaided --- the Deploy
+  stage plus its rollout gate.
+  \item Jenkins sits behind NAT with no public address --- GitHub
+  cannot call in, so Jenkins polls. Same constraint: CI inside a
+  corporate network that the cloud git host cannot reach.
+  \item A rebuild is a different binary --- different dependency
+  resolutions, timestamps, toolchain --- so tests certified something
+  else. Chapter~1's env-var precedence lets one artifact take
+  per-environment config at runtime.
+  \item Tests skipped (re-enable, or gate elsewhere and know it);
+  deploy not verified (rollout status/smoke tests); success defined
+  as exit-codes not behavior (probe-backed verification, alerts).
+\end{enumerate}
+
+\section*{Chapter 22 --- Jenkins}
+\begin{enumerate}
+  \item Jobs, credentials, plugin state, build history. Image =
+  reproducible binary+plugins; volume = irreplaceable state; together
+  the server is cattle with a pet directory.
+  \item Jenkins runs on the base image's JDK\,21; builds export
+  \code{JAVA\_HOME=JDK25\_HOME} in the Jenkinsfile's environment
+  block --- per-pipeline, not global.
+  \item apply -k needs get/list + create/patch/update on every
+  applied kind; rollout status needs get/list/watch on deployments
+  and replicasets. Droppable without \code{set image}: nothing new
+  --- set image's get+patch is already covered; the pods/log read
+  rules exist only for the failure handler.
+  \item Jib pushes to \code{localhost:5000}, and that name must mean
+  the same machine to pusher and puller; host networking makes
+  Jenkins' localhost the host's, which is what the image name
+  promised k3s.
+  \item ServiceAccount = identity; Role = capability list;
+  RoleBinding = the join. Role-not-ClusterRole caps a compromised
+  pipeline at one namespace --- blast radius as a type choice.
+\end{enumerate}
+
+\section*{Chapter 23 --- The Pipeline}
+\begin{enumerate}
+  \item SNAPSHOT is mutable --- a node could serve any historical
+  build under the same name; the SHA pins the exact commit and makes
+  ``what is running?'' answerable from \code{kubectl describe}.
+  \item Build only listed modules plus their dependencies. A
+  forgotten MODULES entry: the new service never gets an image; the
+  deploy loop then fails (or deploys a stale image if one exists) ---
+  the pipeline's one manual coupling.
+  \item \code{kubectl rollout status --timeout=300s} --- it converts
+  probe results (Chapter~17) into pipeline exit codes.
+  \item All rollouts should proceed concurrently; waiting per-service
+  serializes convergence that Kubernetes happily parallelizes ---
+  same total work, longer wall clock.
+  \item Changes: trigger (webhook), where builds run (ephemeral
+  runners), secret mechanism (repo secrets). Unchanged: stage order,
+  Maven commands, SHA tagging, the rollout verification.
+\end{enumerate}
+
+\section*{Chapter 24 --- Operations}
+\begin{enumerate}
+  \item get pods $\rightarrow$ describe pod $\rightarrow$ logs
+  (\code{--previous} --- essential for CrashLoop, where the current
+  container has no history yet) $\rightarrow$ exec and probe from
+  inside.
+  \item CrashLoop: the process exits --- application layer.
+  \code{Running 0/1}: the process lives but readiness fails ---
+  the probe's target (often a dependency) is the layer to inspect.
+  \item Exec into the pod and try the connection from there --- the
+  pod's DNS, network path, and injected env differ from your
+  laptop's; your laptop proves only that Postgres is alive, not that
+  the pod can reach it.
+  \item k3s pod/service traffic traverses the host firewall;
+  blocking \code{10.42.0.0/16} or \code{10.43.0.0/16} breaks DNS and
+  pod-to-pod calls intermittently --- symptoms indistinguishable from
+  flaky applications.
+\end{enumerate}
+
+\section*{Chapter 25 --- Kafka in the Cluster}
+\begin{enumerate}
+  \item A controller whose reconciliation loop targets custom resource
+  kinds defined by CRDs. Strimzi added \code{Kafka}/\code{KafkaNodePool}
+  (the cluster) and \code{KafkaTopic} (the contracts) --- plus user,
+  connect and bridge kinds this project does not use.
+  \item The operator bundle contains cluster-scoped objects (CRDs,
+  ClusterRoles) that a namespaced Role cannot grant; \code{kafka.yaml}
+  contains only namespaced custom resources, which the Role now
+  permits. Role vs.\ ClusterRole is the line.
+  \item Advertised listeners, the controller quorum voters, the
+  per-listener security protocol map (also the cluster ID and per-broker
+  Services). The operator computes them from the listener declaration
+  and the node pool.
+  \item The broker pod's actual status (\code{get pods}) and the
+  operator log's reconciliation lines. The condition may be a stale
+  write from a reconciliation that timed out during a long image pull;
+  the next periodic loop corrects it.
+  \item Reviewed partition counts, no day-one producer/topic race, and
+  an inventory of event contracts as objects. One partition: total
+  order per topic, sufficient while every consumer group has one
+  instance; partitions can be added later but never removed.
+\end{enumerate}
+
+\section*{Chapter 26 --- The Road Ahead}
+\begin{enumerate}
+  \item Consumer-group lag: the distance between the newest offset in a
+  partition and the group's committed offset --- growing lag means
+  notification-service is falling behind or down.
+  \item Push: the credential lives in CI (Jenkins' kubeconfig).
+  Pull: it never leaves the cluster; CI only writes git. Pruning
+  resolves Chapter~20's apply-never-deletes pitfall.
+  \item Gateway routes change \code{lb://name} to
+  \code{http://name:port}; Service endpoints replace registration,
+  readiness probes replace heartbeats; delete discovery-server (and
+  eureka client deps), free its resources.
+  \item They already run as non-root with group-0 permissions, so
+  OpenShift's arbitrary-UID SCC admits them unmodified; only
+  Ingress $\rightarrow$ Route remains.
+\end{enumerate}

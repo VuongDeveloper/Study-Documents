@@ -1,0 +1,41 @@
+# Maildev: an SMTP server that delivers nothing -- it catches every mail
+# and shows it in a web UI. The dev/homelab stand-in for a real relay;
+# swapping to real mail later is only MAIL_HOST/credentials env changes
+# on notification-service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maildev
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: maildev }
+  template:
+    metadata:
+      labels: { app: maildev }
+    spec:
+      containers:
+        - name: maildev
+          image: maildev/maildev:2.2.1
+          ports:
+            - { name: web, containerPort: 1080 }
+            - { name: smtp, containerPort: 1025 }
+          readinessProbe:
+            tcpSocket: { port: smtp }
+            periodSeconds: 5
+          resources:
+            requests: { memory: 64Mi, cpu: 25m }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maildev
+spec:
+  selector: { app: maildev }
+  ports:
+    - { name: web, port: 1080, targetPort: 1080 }
+    - { name: smtp, port: 1025, targetPort: 1025 }
+# No Ingress on purpose: the UI is an operator tool, not part of the app.
+# To read caught mail:  kubectl -n ts port-forward svc/maildev 1080:1080
+# then open http://localhost:1080 on Windows.

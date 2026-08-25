@@ -1,0 +1,132 @@
+\chapter{Kubernetes: Cluster Anatomy and the Reconciliation Loop}
+\label{ch:cluster}
+
+\section{The one idea everything else hangs on}
+
+You do not tell Kubernetes to \emph{do} things; you tell it what should
+\emph{be true}. You write \emph{desired state} (``a Deployment named
+course-service with 1 replica of image X'') into its database via the
+API server; \emph{controllers} run reconciliation loops forever
+comparing desired with actual and acting on the difference. Delete a
+pod: its controller notices actual $\neq$ desired and makes another.
+Nobody replays your commands --- the state converges.
+
+This explains behaviors that otherwise seem strange:
+
+\begin{itemize}
+  \item \code{kubectl apply} is a merge into desired state, not a
+  script run --- apply the same file twice, nothing happens the second
+  time (idempotence --- the property the pipeline leans on in
+  Chapter~23).
+  \item There is no ``startup order.'' Everything starts at once;
+  services that need absent dependencies crash and are restarted until
+  the world is ready. Crash-looping \emph{during} convergence is normal
+  operation, not failure.
+  \item Deleting from a manifest file does not delete from the cluster
+  --- apply adds and updates, it does not prune. Removing the old
+  course-service Ingress took an explicit \code{kubectl delete}.
+\end{itemize}
+
+\section{The moving parts}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 10mm]
+  \node[boxdark] (api) {API server};
+  \node[boxfill, right=of api] (etcd) {state store\\\scriptsize (etcd / sqlite)};
+  \node[box, below left=6mm and -2mm of api] (sched) {scheduler};
+  \node[box, below right=6mm and -2mm of api] (cm) {controller\\manager};
+  \node[box, below=16mm of api] (kubelet) {kubelet + containerd\\\scriptsize on the node};
+  \draw[flow] (api) -- (etcd);
+  \draw[flowdash] (sched) -- (api);
+  \draw[flowdash] (cm) -- node[lbl,right]{reconcile loops} (api);
+  \draw[flow] (kubelet) -- node[lbl,left]{watch \& report} (api);
+  \node[lbl, left=8mm of api] (kubectl) {kubectl};
+  \draw[flow] (kubectl) -- (api);
+\end{tikzpicture}
+\caption{Everything talks only to the API server.}
+\end{figure}
+
+\begin{description}
+  \item[API server] the single front door; \code{kubectl} is a REST
+  client for it. Authentication, authorization (Chapter~22's RBAC), and
+  validation happen here.
+  \item[State store] the desired-state database (etcd in standard
+  clusters; k3s embeds sqlite on a single node).
+  \item[Scheduler] assigns unscheduled pods to nodes, honoring the
+  resource \emph{requests} of Chapter~17.
+  \item[Controller manager] the reconciliation loops: Deployment
+  $\rightarrow$ ReplicaSet $\rightarrow$ pods, endpoints, and dozens
+  more.
+  \item[kubelet] the node agent: watches for pods assigned to its node,
+  drives containerd to run them, executes the probes, reports status.
+\end{description}
+
+k3s packages all of this into one binary --- a CNCF-certified
+Kubernetes, minus a VM's overhead, plus batteries: Traefik as Ingress
+controller, local-path storage, containerd. Every manifest in this
+book would apply unchanged to EKS or OpenShift; that certification is
+why learning on k3s transfers.
+
+\section{Objects, labels, namespaces}
+
+Every object is a YAML document with the same skeleton ---
+\code{apiVersion}, \code{kind}, \code{metadata} (name, namespace,
+labels), \code{spec} (desired), \code{status} (observed, written by
+controllers). Two organizing mechanisms:
+
+\begin{description}
+  \item[Namespaces] partition the cluster; this project puts everything
+  in \code{ts}, keeping it separable from \code{kube-system} and making
+  RBAC scopeable --- Jenkins' permissions stop at the namespace edge
+  (Chapter~22).
+  \item[Labels] arbitrary key/value pairs; \emph{selectors} query them.
+  Every wiring in Part~V is a label selector: a Service finds pods by
+  label, a Deployment owns pods by label. The kustomization stamps
+  \code{app.kubernetes.io/part-of: teacher-supporter} onto everything so
+  one selector can list --- or delete --- the whole application.
+\end{description}
+
+\section{Getting kubectl to the cluster}
+
+\code{kubectl} reads \code{\textasciitilde/.kube/config}: cluster URL, CA
+certificate, and a credential. From Windows, this project reaches
+\code{https://100.85.66.43:6443} over Tailscale --- which required
+installing k3s with \code{--tls-san 100.85.66.43}, because the API
+server's certificate is only valid for the names baked in at install
+time.
+
+\begin{handson}[feel the loop]
+\begin{lstlisting}[language=bash]
+kubectl -n ts get pods
+kubectl -n ts delete pod -l app=course-service
+kubectl -n ts get pods -w
+\end{lstlisting}
+Delete the pod, then watch: a replacement appears within seconds,
+created not by your command but by the ReplicaSet controller noticing a
+missing replica. You never ordered a restart --- you made actual state
+diverge from desired, and the loop closed the gap.
+\end{handson}
+
+\begin{pitfall}[certificate is valid for\ldots{} not 100.85.66.43]
+Symptom: \code{kubectl} from Windows fails TLS validation while working
+fine on the server. Cause: the API server certificate lacks the
+tailnet address as a SAN --- it was installed without
+\code{--tls-san}. Fix at install time is one flag; fix afterwards means
+deleting the server TLS directory and restarting k3s. A concrete
+instance of a general rule: certificates bind to \emph{names}, so
+decide every name a server will be called \emph{before} issuing.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Explain ``declarative'': what do you write, who acts on it, and
+  why does applying the same manifest twice change nothing?
+  \item Why is there deliberately no \code{depends\_on} in Kubernetes,
+  and what replaces startup ordering during convergence?
+  \item Trace \code{kubectl -n ts delete pod ...} through the
+  components: who receives it, who notices, who acts, on which machine?
+  \item Why did removing the old Ingress from git not remove it from
+  the cluster, and what two commands would each have removed it?
+\end{enumerate}
+\end{quiz}

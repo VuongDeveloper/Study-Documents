@@ -1,0 +1,135 @@
+\chapter{Spring Kafka: Producers, Listeners, Poison Pills}
+\label{ch:springkafka}
+
+\section{Producing}
+
+Publishing an event in this project is two moving parts: a
+\code{KafkaTemplate} and configuration choosing serializers. From
+auth-service:
+
+\begin{lstlisting}[language=Java]
+kafkaTemplate.send("ts.user.registered", event.userId(), event);
+//                  topic                key             value
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml]
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+\end{lstlisting}
+
+The key (\code{userId}) is a string; the value is the event record
+serialized to JSON. Keying by user id is the ordering decision from
+Chapter~10 made concrete. \code{send()} is asynchronous --- it returns a
+future; the message sits in a client-side buffer until the broker acks.
+Two operational consequences: a service can \emph{start} without a broker
+(sends fail later, per call --- which is why auth-service could deploy to
+the cluster before Kafka), and a service that crashes right after
+\code{send()} returns may lose the buffered message --- the
+outbox pattern below exists for when that matters.
+
+\section{Consuming}
+
+\begin{lstlisting}[language=Java]
+@KafkaListener(topics = "ts.user.registered",
+               groupId = "notification-group")
+public void on(UserRegisteredEvent event) {
+    mailService.sendActivation(event);
+}
+\end{lstlisting}
+
+Spring runs a polling loop per listener container, deserializes each
+record, invokes the method, and commits offsets after successful
+processing --- at-least-once out of the box. The consumer half of the
+YAML holds this chapter's most production-relevant lines:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  kafka:
+    consumer:
+      group-id: course-group
+      auto-offset-reset: earliest                    (*@\co{1}@*)
+      key-deserializer: ...ErrorHandlingDeserializer (*@\co{2}@*)
+      value-deserializer: ...ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: ...JsonDeserializer
+        spring.json.trusted.packages: com.ts.common.dto  (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Where a \emph{brand-new} group starts when it has no
+  committed offset: \code{earliest} = from the beginning of retention;
+  the default \code{latest} = only new messages. \code{earliest} means a
+  consumer deployed late still processes events published before it
+  existed --- the right choice when events are facts to act on.
+  Irrelevant once the group has offsets.
+  \item[\co{2}] The poison-pill defense --- next section.
+  \item[\co{3}] JSON deserialization instantiates classes named in
+  message headers; trusting only \code{com.ts.common.dto} stops a
+  malicious or buggy producer from making the consumer instantiate
+  arbitrary classes. A security boundary, not boilerplate.
+\end{description}
+
+\section{The poison pill}
+
+A \emph{poison pill} is a message that fails deserialization forever ---
+a producer bug, a renamed field, a corrupted payload. Without defenses
+the listener throws \emph{before} the message can be skipped, the offset
+never advances, and the container retries the same record endlessly:
+the partition is stalled and the logs fill at full speed.
+
+\code{ErrorHandlingDeserializer} wraps the real deserializer: on
+failure it emits a typed error instead of throwing inside the poll loop,
+letting Spring's error handler skip past the record (optionally after
+retries, optionally publishing it to a dead-letter topic). The
+composition --- error-handler outside, JSON delegate inside --- is the
+standard production pattern, and it is why the config names \emph{two}
+deserializer classes per side.
+
+\begin{pitfall}[one bad message, total silence]
+Symptom: notification mails stop entirely; the consumer logs the same
+deserialization stack trace thousands of times. Cause: a poison pill on
+one partition with no error-handling deserializer --- the loop can
+neither process nor pass it. This failure hides in systems that never
+tested a malformed message. Verify your defense once, deliberately:
+publish garbage to a dev topic and watch it get skipped.
+\end{pitfall}
+
+\section{Advanced corners}
+
+\begin{description}
+  \item[Dead-letter topics.] \code{DefaultErrorHandler} +
+  \code{DeadLetterPublishingRecordRecoverer}: after N failed attempts,
+  the record lands on \code{<topic>.DLT} for inspection and replay ---
+  failure handling with an audit trail.
+  \item[The outbox pattern.] ``Save the user \emph{and} publish the
+  event'' is two systems and cannot be atomic directly. The outbox:
+  write the event into an \code{outbox} table in the \emph{same database
+  transaction} as the user row; a relay (or Debezium reading the WAL)
+  publishes from that table. If auth-service ever must not lose a
+  registration event, this is the answer.
+  \item[Schema registry.] Chapter~6's shared event classes solve
+  producer/consumer agreement inside one repo. At organization scale the
+  contract moves into a schema registry (Avro/Protobuf schemas, checked
+  for compatibility at publish time) --- the same idea, enforced by
+  infrastructure instead of a shared jar.
+\end{description}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Why can auth-service start when Kafka is down, and at what
+  moment does a Kafka outage become visible to it?
+  \item A new consumer group is deployed today. Explain what
+  \code{auto-offset-reset: earliest} makes it do, and when this setting
+  stops having any effect for that group.
+  \item Walk through the poison-pill failure without
+  \code{ErrorHandlingDeserializer}, then with it. Where does the bad
+  record end up in a full production setup?
+  \item Why is \code{spring.json.trusted.packages} a security control?
+  \item When is the outbox pattern necessary, and what pair of writes
+  does it make effectively atomic?
+\end{enumerate}
+\end{quiz}

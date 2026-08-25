@@ -1,0 +1,165 @@
+\chapter{Jenkins: The CI Server}
+\label{ch:jenkins}
+
+\section{Architecture}
+
+Jenkins is a Java web application --- the \emph{controller} --- that
+stores jobs, credentials, plugins and build history in one directory,
+\code{JENKINS\_HOME}, and executes builds either on itself (via
+\emph{executors}, its parallel-build slots) or on remote \emph{agents}.
+The enterprise pattern is a controller that builds nothing, farming
+work out to disposable agents (often pods, via the Kubernetes plugin).
+
+\begin{decision}[builds on the controller, Jenkins outside the cluster]
+Two homelab inversions of enterprise practice, both CPU arithmetic.
+Agent pods would cost scheduling and image pulls per build on the same
+two cores the build needs; the controller's two executors spend those
+cycles on Maven instead. And Jenkins runs in Docker on the host, not in
+k3s: if you break the cluster --- and while learning, you will ---
+the thing that can rebuild the cluster must not have died with it.
+Both revert cleanly at enterprise scale: in-cluster Jenkins with pod
+agents is Chapter~26 material, and the migration itself is the lesson.
+\end{decision}
+
+\section{The controller image, annotated}
+
+Rather than clicking tools into a stock Jenkins, the project bakes its
+toolchain into an image --- \code{deploy/jenkins/Dockerfile}:
+
+\begin{lstlisting}[language=dockerfile]
+FROM jenkins/jenkins:lts-jdk21          (*@\co{1}@*)
+USER root
+RUN ... temurin-25-jdk ...              (*@\co{2}@*)
+RUN ... apache-maven-3.9.9 ...          (*@\co{3}@*)
+RUN wget -qO /usr/local/bin/kubectl ... (*@\co{4}@*)
+ENV JDK25_HOME=/usr/lib/jvm/temurin-25-jdk-amd64  (*@\co{5}@*)
+USER jenkins
+RUN jenkins-plugin-cli --plugins \
+      git workflow-aggregator ... credentials-binding  (*@\co{6}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] LTS Jenkins running on JDK\,21 --- the version
+  \emph{Jenkins itself} runs on.
+  \item[\co{2}] The project targets Java\,25, so a second JDK is
+  installed for \emph{builds}. Note \code{JAVA\_HOME} is \emph{not}
+  changed globally \co{5} --- the Jenkinsfile sets it per pipeline.
+  Controller runtime and build toolchain are independent concerns; this
+  Dockerfile keeps them visibly separate.
+  \item[\co{3}] Maven pinned to 3.9.9 --- distro packages lag.
+  \item[\co{4}] \code{kubectl}: the deploy stage is just this binary
+  plus a kubeconfig.
+  \item[\co{6}] Plugins pinned in the image, not clicked in the UI:
+  pipeline support, git, JUnit reporting, and
+  \code{credentials-binding} (used by \code{withCredentials} in
+  Chapter~23). The whole point: \emph{the CI server itself is now
+  reproducible} --- destroy the container, rebuild from the Dockerfile,
+  and only \code{JENKINS\_HOME} (a named volume) carries state.
+\end{description}
+
+One run-time flag from \code{run.sh} deserves its own paragraph:
+\code{--network host}. Jib inside Jenkins pushes to
+\code{localhost:5000} --- and inside a bridge-networked container,
+\code{localhost} would be the \emph{container}. Host networking makes
+Jenkins share the host's network namespace, so its
+\code{localhost:5000} is the same registry k3s pulls from
+(Chapter~13's naming contract). Not a shortcut --- a requirement of the
+image-naming scheme.
+
+\section{Credentials}
+
+Jenkins stores secrets in an encrypted store, referenced by ID;
+pipelines bind them to environment variables only for the duration of a
+block (\code{withCredentials}), and the log masker redacts their
+values from console output. This project stores one credential:
+\code{kubeconfig-ts}, a file credential holding the kubeconfig Jenkins
+uses to deploy --- which is the interesting part.
+
+\section{The deploy identity: a ServiceAccount, not admin}
+
+The lazy path is giving Jenkins the k3s admin kubeconfig ---
+\code{cluster-admin}, licensed to delete every namespace. Instead,
+\code{deploy/k8s/jenkins-rbac.yaml} builds a minimal identity:
+
+\begin{lstlisting}[language=yaml]
+kind: ServiceAccount          # the identity
+metadata: { name: jenkins, namespace: ts }
+---
+kind: Role                    # namespaced permissions
+metadata: { name: jenkins-deployer, namespace: ts }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"] (*@\co{1}@*)
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]                              (*@\co{2}@*)
+  # + services, PVCs, secrets, configmaps, ingresses, pods/log ...
+  - apiGroups: ["kafka.strimzi.io"]                              (*@\co{3}@*)
+    resources: ["kafkas", "kafkanodepools", "kafkatopics"]
+    verbs: ["get", "list", "create", "patch", "update"]
+---
+kind: RoleBinding             # identity <- permissions
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The verbs are derived from the pipeline's actual
+  commands: \code{kubectl apply} needs get+create+patch;
+  \code{set image} needs get+patch. \emph{No delete anywhere}: CI rolls
+  forward; a human deletes. A compromised pipeline can thus corrupt
+  deployments in \code{ts} but cannot wipe them, and cannot see beyond
+  the namespace --- a Role, not a ClusterRole, is the blast-radius
+  decision.
+  \item[\co{2}] Discovered the honest way: \code{rollout status}
+  watches the Deployment's ReplicaSets, so read access to them is
+  required --- the kind of permission you find by running the pipeline
+  against the Role and reading the first \code{Forbidden}.
+  \item[\co{3}] Added with milestone~6: the pipeline may declare Kafka
+  clusters and topics (namespaced custom resources), but installing
+  the operator and its CRDs --- cluster-scoped --- stays an admin act
+  (Chapter~25). RBAC grows one rule per API group the pipeline touches;
+  the Role file is a changelog of what CI has been trusted with.
+\end{description}
+
+The kubeconfig stored in Jenkins simply pairs the cluster address with
+this ServiceAccount's token instead of the admin certificate.
+
+\begin{pitfall}[Forbidden: cannot create resource ``namespaces'']
+Symptom: the deploy stage dies with a Forbidden error on
+\code{namespaces} although the RBAC file looks complete. Cause:
+namespaces are \emph{cluster-scoped}, and a namespaced Role cannot
+grant them --- which is exactly why \code{namespace.yaml} is excluded
+from the kustomization (Chapter~20) and the namespace is created once
+by an admin. RBAC debugging in general:
+\code{kubectl auth can-i patch deployments -n ts --as
+system:serviceaccount:ts:jenkins} answers ``would this be allowed''
+without running the pipeline.
+\end{pitfall}
+
+\begin{handson}[prove the boundary exists]
+\begin{lstlisting}[language=bash]
+kubectl auth can-i patch deployments -n ts \
+  --as system:serviceaccount:ts:jenkins        # yes
+kubectl auth can-i delete deployments -n ts \
+  --as system:serviceaccount:ts:jenkins        # no
+kubectl auth can-i list pods -n kube-system \
+  --as system:serviceaccount:ts:jenkins        # no
+\end{lstlisting}
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item What lives in \code{JENKINS\_HOME}, and why does baking plugins
+  into the image plus a volume for home make the CI server disposable?
+  \item Why does the controller run two JDKs, and where is each
+  selected?
+  \item Reconstruct the RBAC verb list for a pipeline that only ever
+  runs \code{kubectl apply -k} and \code{rollout status} --- which verb
+  in the project's Role could then be dropped?
+  \item Explain \code{--network host} on the Jenkins container in terms
+  of Chapter~13's image-naming contract.
+  \item ServiceAccount, Role, RoleBinding: which is identity, which is
+  capability, which is the join --- and why is Role-not-ClusterRole the
+  security headline?
+\end{enumerate}
+\end{quiz}

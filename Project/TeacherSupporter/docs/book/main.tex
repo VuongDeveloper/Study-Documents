@@ -1,0 +1,88 @@
+% TeacherSupporter: The Complete Stack
+% Build:  tectonic main.tex   (from this directory)
+\documentclass[11pt,twoside,openany]{book}
+\usepackage{tsbook}
+
+\title{TeacherSupporter: The Complete Stack}
+\author{Vuong Dang}
+\date{August 2026}
+
+\begin{document}
+
+% ================= front matter =================
+\frontmatter
+
+% ---- title page ----
+\begin{titlepage}
+  \centering
+  \vspace*{1.6in}
+  {\Huge\bfseries TeacherSupporter\par}
+  \vspace{0.15in}
+  {\LARGE The Complete Stack\par}
+  \vspace{0.35in}
+  {\large From Spring Boot to Kubernetes and CI/CD ---\par
+   a self-contained field guide, taught from one real project\par}
+  \vspace{1.2in}
+  {\large Vuong Dang\par}
+  \vspace{0.1in}
+  {\normalsize written with Claude\par}
+  \vfill
+  {\small August 2026 \par}
+\end{titlepage}
+
+\include{frontmatter/howtoread}
+\include{frontmatter/projectmap}
+
+\tableofcontents
+
+% ================= main matter =================
+\mainmatter
+
+\part{The Application}
+\include{chapters/ch01-spring-boot}
+\include{chapters/ch02-config-server}
+\include{chapters/ch03-eureka}
+\include{chapters/ch04-gateway}
+\include{chapters/ch05-security}
+\include{chapters/ch06-services}
+
+\part{Data}
+\include{chapters/ch07-postgres}
+\include{chapters/ch08-mongodb}
+\include{chapters/ch09-minio}
+
+\part{Messaging}
+\include{chapters/ch10-kafka-core}
+\include{chapters/ch11-spring-kafka}
+
+\part{Containers}
+\include{chapters/ch12-docker}
+\include{chapters/ch13-jib-registry}
+
+\part{Kubernetes}
+\include{chapters/ch14-cluster}
+\include{chapters/ch15-workloads}
+\include{chapters/ch16-config-secrets}
+\include{chapters/ch17-health-resources}
+\include{chapters/ch18-networking}
+\include{chapters/ch19-storage}
+\include{chapters/ch20-kustomize}
+
+\part{CI/CD}
+\include{chapters/ch21-cicd-concepts}
+\include{chapters/ch22-jenkins}
+\include{chapters/ch23-pipeline}
+
+\part{Operations and the Road Ahead}
+\include{chapters/ch24-operations}
+\include{chapters/ch25-kafka-cluster}
+\include{chapters/ch26-road-ahead}
+
+% ================= appendices =================
+\appendix
+\include{appendices/appA-quiz-answers}
+\include{appendices/appB-glossary}
+\include{appendices/appC-cheatsheet}
+\include{appendices/appD-listings}
+
+\end{document}

@@ -1,0 +1,223 @@
+\chapter{Spring Boot: The Machine Under Every Service}
+\label{ch:springboot}
+
+Seven of the eight deployables in this project are Spring Boot
+applications. Before any YAML file can make sense, you need three ideas:
+what a \emph{starter} pulls in, what \emph{auto-configuration} decides on
+your behalf, and --- most important for everything in Parts~V and VI ---
+exactly \emph{how Spring resolves a configuration property} when the same
+key is defined in several places at once.
+
+\section{The problem Spring Boot solves}
+
+Classic Spring asked you to wire everything: a servlet container to deploy
+into, XML or Java config declaring every bean, and a long list of
+version-compatible dependencies. Spring Boot inverts this.
+An application is a plain \code{main()} method:
+
+\begin{lstlisting}[language=Java]
+@SpringBootApplication
+public class CourseServiceApplication {
+  public static void main(String[] args) {
+    SpringApplication.run(CourseServiceApplication.class, args);
+  }
+}
+\end{lstlisting}
+
+\code{@SpringBootApplication} is three annotations in a trench coat:
+\code{@Configuration} (this class may define beans),
+\code{@ComponentScan} (find \code{@Service}, \code{@RestController},
+\ldots{} in this package and below), and \code{@EnableAutoConfiguration}
+--- the interesting one.
+
+\subsection{Starters}
+
+A starter such as \code{spring-boot-starter-web} is an empty jar whose
+only job is a curated dependency list: Spring MVC, Jackson, and an
+\emph{embedded} Tomcat. ``Embedded'' matters operationally: the server is
+inside the jar, so \code{java -jar course-service.jar} is a complete web
+server. That single fact is what makes the container images of
+Chapter~13 so simple --- there is no Tomcat to install, only a JVM to
+provide.
+
+\subsection{Auto-configuration}
+
+At startup, Spring Boot walks a list of candidate configurations
+and applies each one whose conditions hold. The conditions read like:
+
+\begin{itemize}
+  \item \emph{is this class on the classpath?} (\code{@ConditionalOnClass}
+  --- you added the Postgres driver, so a \code{DataSource} is configured)
+  \item \emph{has the user defined their own bean already?}
+  (\code{@ConditionalOnMissingBean} --- your explicit bean always wins)
+  \item \emph{is a property set?} (\code{@ConditionalOnProperty})
+\end{itemize}
+
+Auto-configuration is why \code{course-service} contains no code creating
+a connection pool, a Kafka producer, or an S3 client wiring --- adding the
+dependency plus a few properties \emph{is} the configuration. When
+behavior seems to appear from nowhere, run the app with
+\code{--debug} once: the ``condition evaluation report'' lists every
+auto-configuration applied and skipped, with reasons.
+
+\section{Externalized configuration: the property resolution order}
+\label{sec:property-order}
+
+This is the single most load-bearing mechanism in the whole book.
+Every trick the Kubernetes manifests play in Part~V works because of it.
+
+A Spring property such as \code{spring.datasource.url} can be defined in
+many \emph{property sources}. Spring merges them all into one
+\code{Environment}, and when two sources define the same key, the more
+specific source wins. Simplified to the sources this project actually
+uses, from weakest to strongest:
+
+\begin{enumerate}
+  \item defaults inside \code{application.yml} packaged in the jar
+  \item config fetched from config-server (Chapter~2)
+  \item OS environment variables
+  \item command-line arguments
+\end{enumerate}
+
+\begin{decision}[why the cluster overrides with env vars]
+The same image must run unchanged on a laptop (Compose) and in k3s. Baking
+environment differences into the jar would mean one image per environment
+--- exactly what containers are meant to avoid. Environment variables
+outrank both the packaged YAML and the config-server, so the Kubernetes
+Deployment can repoint a service at \code{postgres-course:5432} without
+touching a single file the developers own. One artifact, many
+environments, differences injected at the edge.
+\end{decision}
+
+\subsection{Relaxed binding}
+
+Environment variable names cannot contain dots. Spring therefore maps
+\code{SPRING\_DATASOURCE\_URL} $\rightarrow$ \code{spring.datasource.url}:
+uppercase, dots become underscores. Read any Deployment in
+\code{deploy/k8s/base/} and you can now decode every \code{env:} entry as
+``this overrides that YAML key.'' For example
+\code{SPRING\_DATA\_MONGODB\_URI} in \code{dictionary-service.yaml}
+overrides \code{spring.data.mongodb.uri} from the config-server.
+
+\subsection{Placeholders with defaults}
+
+The project's config files use one more idiom:
+
+\begin{lstlisting}[language=yaml]
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecretKeyThatIs...}
+\end{lstlisting}
+
+\code{\$\{NAME:default\}} means ``use the environment variable if present,
+else the default.'' This is why a developer can run auth-service with zero
+setup, while production injects the real secret --- and why in
+Chapter~16 the Kubernetes Secret only has to provide \code{JWT\_SECRET} to
+take control of this value.
+
+\section{The project's file, annotated}
+
+Every service carries only a tiny \code{application.yml}; the interesting
+config lives on the config-server. Here is course-service's, complete:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  application:
+    name: course-service            (*@\co{1}@*)
+  config:
+    import: optional:configserver:http://localhost:8888   (*@\co{2}@*)
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/          (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The service's identity. The config-server uses it to pick
+  which file to serve (\code{configurations/course-service.yml}); Eureka
+  uses it as the registration name; the gateway routes to it as
+  \code{lb://course-service}. One string ties all three systems together.
+  \item[\co{2}] Bootstrap-time import of remote config.
+  \code{optional:} means ``start anyway if the config-server is down'' ---
+  kind in dev, and debatable in production (a service that boots with
+  half its config may fail in stranger ways than one that refuses to
+  boot). The \code{localhost:8888} default is overridden by
+  \code{SPRING\_CONFIG\_IMPORT} in Compose and Kubernetes alike.
+  \item[\co{3}] Where Eureka lives --- again a localhost default, again
+  overridden per environment by \code{EUREKA\_CLIENT\_SERVICEURL\_DEFAULTZONE}.
+\end{description}
+
+\section{Profiles}
+
+A Spring \emph{profile} is a named variant of configuration.
+\code{spring.profiles.active=native} on the config-server (Chapter~2) is
+the project's only profile use so far, but the mechanism generalizes:
+\code{application-prod.yml} is loaded on top of \code{application.yml}
+when the \code{prod} profile is active, letting one jar carry several
+personalities. Kubernetes reduces the need --- the environment injects
+differences instead --- which is why this project leans on env vars, not
+profile files, for per-environment change.
+
+\section{Actuator}
+
+\code{spring-boot-starter-actuator} adds operational endpoints under
+\code{/actuator}: \code{/health} (aggregated readiness of DB, disk,
+custom checks), \code{/info}, \code{/metrics}, \code{/prometheus}.
+Two facts matter now:
+
+\begin{itemize}
+  \item Endpoints must be \emph{exposed}
+  (\code{management.endpoints.web.exposure.include}) --- the project
+  exposes \code{health,info,metrics,prometheus}.
+  \item Exposure is not \emph{authorization}: if Spring Security protects
+  \code{/actuator/**}, the endpoint exists but answers 401. This
+  exact interaction decides which Kubernetes probes each service can use
+  in Chapter~17 --- dictionary-service permits actuator and probes
+  \code{/actuator/health}; auth-service does not, and must be probed via
+  \code{/v3/api-docs} instead.
+\end{itemize}
+
+\section{Outside the project}
+
+Two contrasting examples of the same property machinery:
+
+\emph{A Heroku-style twelve-factor app} configures everything by
+environment variable --- \code{DATABASE\_URL}, \code{PORT} --- and carries
+an \code{application.yml} of nothing but \code{\$\{...\}} placeholders.
+Spring's resolution order makes that style native.
+
+\emph{A bank running one artifact through five environments}
+(dev/test/uat/preprod/prod) typically pairs a config-server backed by a
+git repository with profiles per environment:
+\code{course-service-uat.yml} lives in an audited repo, and promotion is a
+git merge. The project's classpath-native config-server (Chapter~2) is
+the single-developer version of the same shape.
+
+\begin{pitfall}[my override is being ignored]
+Symptom: you set an environment variable but the service still uses the
+old value. Usual causes, in order of frequency: the variable name does
+not map to the key you think (check the relaxed-binding spelling ---
+\code{SERVICEURL} in the Eureka key is one word, an irregular name that
+must be copied exactly); the value is also set by a \emph{stronger}
+source (a command-line arg); or the service reads the key at build time
+rather than from the Environment. Diagnose with the actuator
+\code{/actuator/env} endpoint (when exposed), which lists every property
+source and which one won.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item A key is defined in the jar's \code{application.yml}, in the
+  config-server's file for that service, and as an env var in the
+  Deployment. Which value wins, and why is that ordering the right one
+  for containers?
+  \item What three annotations does \code{@SpringBootApplication}
+  combine, and which of them explains why deleting an unused dependency
+  can change runtime behavior?
+  \item \code{\$\{GOOGLE\_CLIENT\_ID:placeholder\}} --- what does this
+  resolve to when the variable is unset, and what operational property
+  does that give auth-service at startup?
+  \item Why does exposing an actuator endpoint not guarantee that a
+  Kubernetes probe can use it?
+\end{enumerate}
+\end{quiz}

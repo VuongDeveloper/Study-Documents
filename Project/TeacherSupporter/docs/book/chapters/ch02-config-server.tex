@@ -1,0 +1,150 @@
+\chapter{Centralized Configuration: Config Server}
+\label{ch:configserver}
+
+\section{The problem}
+
+Seven services each need database URLs, Kafka addresses, JWT settings,
+mail hosts. Copy that into seven \code{application.yml} files and every
+change becomes seven edits, seven rebuilds, and the guarantee that two
+copies will eventually disagree. The classic Spring Cloud answer:
+one small HTTP service whose only job is handing each application its
+configuration at startup.
+
+\section{How Spring Cloud Config works}
+
+The server exposes configuration over a plain HTTP contract:
+
+\begin{lstlisting}
+GET /{application}/{profile}
+GET /course-service/default      -> the config for course-service
+\end{lstlisting}
+
+The client side is the \code{spring.config.import:} \code{configserver:...}
+line you saw in Chapter~1. During startup --- \emph{before} most beans are
+created --- the client fetches its document and merges it into the
+Environment as a property source that outranks the packaged YAML but
+loses to environment variables. The resolution order of
+Section~\ref{sec:property-order} is doing all the work; the config-server
+is just one more source in the stack.
+
+\section{The project's server, annotated}
+
+\begin{lstlisting}[language=yaml]
+server:
+  port: 8888                       (*@\co{1}@*)
+spring:
+  application:
+    name: config-server
+  profiles:
+    active: native                 (*@\co{2}@*)
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: classpath:/configurations   (*@\co{3}@*)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health            (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] 8888 is the conventional config-server port, the way 8761
+  is Eureka's. Convention saves documentation.
+  \item[\co{2}] The \code{native} profile means ``serve files from a
+  filesystem/classpath location'' instead of the default git backend.
+  \item[\co{3}] The served files are \emph{inside the config-server's own
+  jar}: \code{configurations/course-service.yml},
+  \code{auth-service.yml}, and so on --- selected by matching file name to
+  the requesting service's \code{spring.application.name}.
+  \item[\co{4}] Only \code{health} is exposed --- and this is the endpoint
+  the Compose healthcheck and the Kubernetes probes rely on.
+\end{description}
+
+\begin{decision}[native classpath vs.\ git backend]
+The enterprise-standard backend is a git repository: config changes are
+commits --- audited, reviewed, revertible without rebuilding anything.
+The cost is a second repository and credentials management. For a
+single-developer project whose config changes ship with code changes
+anyway, classpath-native keeps everything in one repo and one pipeline.
+The trade traded away: changing a value now requires rebuilding the
+config-server image. Know which side of that trade your employer sits on.
+\end{decision}
+
+\begin{pitfall}[a service starts with defaults and fails oddly]
+Symptom: auth-service boots but every request fails with connection
+errors to \code{localhost:5432}. Cause: the config-server was unreachable
+at startup, and \code{optional:configserver:} let the service boot from
+its packaged defaults --- which point at localhost. Because the failure
+appears minutes later and far from the cause, it reads as a database
+problem. Check: the startup log prints whether remote config was fetched.
+The Compose file prevents this ordering problem with
+\code{depends\_on: condition: service\_healthy}; Kubernetes has no
+startup ordering (Chapter~15), so services must tolerate a late
+config-server by crashing and restarting until it appears.
+\end{pitfall}
+
+\section{Startup order and the bootstrap dance}
+
+The config-server creates a hidden sequencing constraint across the whole
+system: every other service wants it up first. You will meet the
+consequences three times in this book:
+
+\begin{itemize}
+  \item Compose encodes the order explicitly with \code{depends\_on} and a
+  \code{curl}-based healthcheck (Chapter~12).
+  \item Kubernetes refuses to encode startup order at all; the system
+  converges by retry (Chapter~15).
+  \item The Jenkins pipeline deploys all manifests in one
+  \code{kubectl apply -k} and lets rollouts settle concurrently
+  (Chapter~23).
+\end{itemize}
+
+\section{Refreshing config without restart}
+
+Out of the box, a client reads its config once at startup. Spring Cloud
+offers \code{/actuator/refresh} (re-fetch on demand, per instance,
+applies to \code{@RefreshScope} beans) and Spring Cloud Bus (broadcast
+refresh over a message broker). This project uses neither: on Kubernetes
+a config change ships as a new image or env change, and the Deployment's
+rolling update (Chapter~15) restarts pods anyway. That is the modern
+answer to a question the config-server was originally designed around.
+
+\section{Outside the project}
+
+A typical git-backed enterprise setup, for contrast:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://git.company.com/platform/config-repo
+          default-label: main
+          search-paths: '{application}'
+\end{lstlisting}
+
+Config lives per-service in folders of a dedicated repo; the label is a
+branch, so \code{default-label: release-42} pins an environment to a
+release. The second widespread pattern skips the config-server entirely:
+Kubernetes ConfigMaps and Secrets mounted as env vars --- which is
+exactly where this project is heading (Chapters~16 and 26); the
+config-server survives here mostly as a working example of the classic
+stack.
+
+\begin{quiz}
+\begin{enumerate}
+  \item In which order do these sources win for
+  \code{spring.datasource.url}: packaged YAML, config-server document,
+  Deployment env var?
+  \item What does \code{profiles.active: native} change about where the
+  server finds its documents, and what does the git backend buy that
+  native cannot?
+  \item Why is \code{optional:} in \code{spring.config.import} a
+  double-edged sword? Describe the failure mode it permits.
+  \item The config-server's own config cannot come from a config-server.
+  Where must it live, and what general bootstrapping principle is that?
+\end{enumerate}
+\end{quiz}

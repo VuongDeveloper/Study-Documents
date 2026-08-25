@@ -1,0 +1,57 @@
+# Second Postgres, same shape as postgres-course.yaml -- see the comments
+# there for why StatefulSet, PGDATA subdirectory, and volumeClaimTemplates.
+#
+# Deliberately a SEPARATE server rather than a second database in the same
+# one: database-per-service is the microservice contract. auth and course
+# must not be able to join each other's tables, today or by accident later.
+# On this box it costs ~256Mi -- cheap insurance.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-auth
+spec:
+  serviceName: postgres-auth
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres-auth }
+  template:
+    metadata:
+      labels: { app: postgres-auth }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          envFrom:
+            - secretRef: { name: postgres-auth }
+          env:
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "ts_auth"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { memory: 256Mi, cpu: 100m }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-auth
+spec:
+  selector: { app: postgres-auth }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }

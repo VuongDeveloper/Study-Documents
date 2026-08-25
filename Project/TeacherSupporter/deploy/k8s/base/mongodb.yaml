@@ -1,0 +1,58 @@
+# Same reasoning as postgres-course.yaml: databases get a StatefulSet for the
+# stable identity + a volumeClaimTemplate PVC that is never shared.
+#
+# No credentials, matching docker-compose.yml -- the official mongo image only
+# enables auth when MONGO_INITDB_ROOT_USERNAME/PASSWORD are set. Acceptable
+# here because the Service is ClusterIP: only pods inside the cluster can
+# reach it, and there is no Ingress to it. If this ever went multi-tenant or
+# network policies were the goal, auth would come first.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+spec:
+  serviceName: mongodb
+  replicas: 1
+  selector:
+    matchLabels: { app: mongodb }
+  template:
+    metadata:
+      labels: { app: mongodb }
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:8
+          ports:
+            - { name: mongo, containerPort: 27017 }
+          volumeMounts:
+            # Unlike postgres, mongod is happy with a lost+found in its data
+            # dir, so no PGDATA-style subdirectory trick is needed.
+            - { name: data, mountPath: /data/db }
+          readinessProbe:
+            # mongosh ping: same idea as pg_isready -- "is the server
+            # accepting commands", not just "is the port open".
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { memory: 256Mi, cpu: 100m }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+spec:
+  selector: { app: mongodb }
+  ports:
+    - { name: mongo, port: 27017, targetPort: 27017 }

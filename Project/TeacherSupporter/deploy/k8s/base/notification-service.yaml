@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: notification-service }
+  template:
+    metadata:
+      labels: { app: notification-service }
+    spec:
+      containers:
+        - name: notification-service
+          image: localhost:5000/notification-service:1.0.0-SNAPSHOT
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8084 }
+          env:
+            - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
+            - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE, value: "http://discovery-server:8761/eureka/" }
+            - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+
+            # Strimzi's bootstrap Service: <cluster>-kafka-bootstrap.
+            - { name: SPRING_KAFKA_BOOTSTRAP_SERVERS, value: "ts-kafka-kafka-bootstrap:9092" }
+
+            # The config's ${MAIL_HOST:localhost} default, repointed at the
+            # maildev Service. Overriding the spring.mail.* keys directly
+            # (relaxed binding) rather than the custom placeholder names --
+            # same result, and consistent with how compose does it.
+            - { name: SPRING_MAIL_HOST, value: "maildev" }
+            - { name: SPRING_MAIL_PORT, value: "1025" }
+
+            # Zipkin arrives with observability (milestone 8).
+            - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
+
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+
+          # This service has no Spring Security at all -- no SecurityConfig,
+          # no security starter -- so /actuator/health is open and the probes
+          # can use the real endpoint (compare auth-service's workaround).
+          startupProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 10
+            failureThreshold: 12
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests: { memory: 512Mi, cpu: 100m }
+            limits: { memory: 768Mi }
+---
+# Even a pure consumer gets a Service: Eureka registration aside, the
+# actuator endpoints (and later Prometheus scraping) need an address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+spec:
+  selector: { app: notification-service }
+  ports:
+    - { name: http, port: 8084, targetPort: 8084 }

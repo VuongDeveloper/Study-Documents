@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: api-gateway }
+  template:
+    metadata:
+      labels: { app: api-gateway }
+    spec:
+      containers:
+        - name: api-gateway
+          image: localhost:5000/api-gateway:1.0.0-SNAPSHOT
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
+            - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE, value: "http://discovery-server:8761/eureka/" }
+            - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+
+            # Zipkin is not in the cluster yet (observability is milestone 8).
+            - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
+
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+          envFrom:
+            # JWT_SECRET -- shared with auth-service, which signs the tokens the
+            # gateway validates. One secret, two consumers, or logins break in a
+            # way that looks like a gateway bug.
+            - secretRef: { name: jwt }
+
+          # Unlike course-service, the gateway exposes actuator, so probes can
+          # use the real health endpoint. Reactive stack (Netty) boots faster
+          # than the MVC services: 6 x 10s of startup grace instead of 12.
+          startupProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests: { memory: 384Mi, cpu: 100m }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+spec:
+  selector: { app: api-gateway }
+  ports:
+    - { name: http, port: 8080, targetPort: 8080 }
+---
+# Edge routing decision: with the gateway in the cluster there are two routers.
+# Traefik (this Ingress) is the front door on ts.local; Spring Cloud Gateway
+# knows Eureka and validates JWTs. Decision made here:
+#
+#   /api          -> gateway   (all REST traffic, JWT-checked)
+#   /oauth2       -> gateway   (Google login redirect start)
+#   /login/oauth2 -> gateway   (Google login callback)
+#   /             -> free      (reserved for the frontend, milestone 7)
+#
+# The old direct `/courses` Ingress on course-service is deleted with this
+# change: it reached the service without passing the gateway's JWT filter,
+# i.e. an unauthenticated side door. From now on the ONLY way in is through
+# the gateway -- which is the entire point of having one.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-gateway
+spec:
+  rules:
+    - host: ts.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+          - path: /oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+          - path: /login/oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }

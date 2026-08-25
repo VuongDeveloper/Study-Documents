@@ -1,0 +1,120 @@
+\chapter{Docker: Images, Containers, Compose}
+\label{ch:docker}
+
+\section{What a container actually is}
+
+A container is not a small virtual machine. It is an ordinary Linux
+process, isolated by two kernel features: \emph{namespaces} (its own view
+of processes, network, filesystem mounts, hostname) and \emph{cgroups}
+(limits on CPU and memory). No guest OS, no hypervisor --- which is why a
+container starts in milliseconds and why the JVM inside one must be told
+about its memory limit (Chapter~17's \code{MaxRAMPercentage}) --- from
+inside, it can see the \emph{host's} RAM.
+
+An \emph{image} is the packaged filesystem plus metadata (entrypoint,
+env, exposed ports), built as a stack of immutable \emph{layers}. Layers
+are content-addressed and shared: fifty images \code{FROM
+eclipse-temurin:25-jre-alpine} store the JRE layer once. A
+\emph{registry} (Docker Hub, GHCR, the project's \code{registry:2})
+stores images; \code{docker push}/\code{pull} move only layers the other
+side lacks.
+
+\section{The project's Dockerfile, annotated}
+
+Every service carries the same five lines:
+
+\begin{lstlisting}[language=dockerfile]
+FROM eclipse-temurin:25-jre-alpine    (*@\co{1}@*)
+WORKDIR /app
+COPY target/*.jar app.jar             (*@\co{2}@*)
+EXPOSE 8082                           (*@\co{3}@*)
+ENTRYPOINT ["java", "-jar", "app.jar"](*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Base image: a JRE (not JDK --- no compiler needed at
+  runtime) on Alpine Linux. Smaller base = smaller attack surface and
+  faster pulls.
+  \item[\co{2}] Copies the Maven-built fat jar. Subtlety: this
+  Dockerfile requires \code{mvn package} to have run \emph{first} ---
+  the build happens outside. The consequence: one \code{COPY} of a
+  \(\sim\)60\,MB jar makes one big layer, so \emph{every} build re-pushes
+  everything even for a one-line change. Jib (Chapter~13) exists to fix
+  exactly this.
+  \item[\co{3}] Documentation, not action --- it opens nothing.
+  Publishing ports happens at run time.
+  \item[\co{4}] Exec-form entrypoint: java is PID~1, receives signals
+  directly, so \code{docker stop} triggers a clean Spring shutdown.
+\end{description}
+
+\section{Networking and Compose}
+
+Containers on a Docker \emph{bridge network} reach each other by
+\emph{service name} --- Docker runs a DNS server answering
+\code{postgres-course}, \code{kafka}, \code{minio}. \code{localhost},
+inside a container, is \emph{that container} --- the number-one beginner
+trap, and the reason every dev-default URL in the configs needed a
+per-environment override. Ports are only reachable from the host when
+\emph{published} (\code{-p 5434:5432}).
+
+Compose turns a fleet of \code{docker run} commands into one declarative
+file --- the project's \code{docker-compose.yml} is the whole dev stack:
+four datastores, Kafka, Zipkin, Maildev, and the seven services, with
+three idioms worth naming:
+
+\begin{lstlisting}[language=yaml]
+  discovery-server:
+    depends_on:
+      config-server:
+        condition: service_healthy    (*@\co{1}@*)
+  config-server:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"] (*@\co{2}@*)
+  postgres-course:
+    ports:
+      - "5434:5432"                   (*@\co{3}@*)
+    volumes:
+      - postgres-course-data:/var/lib/postgresql/data
+\end{lstlisting}
+
+\co{1}+\co{2} encode startup order --- and not merely ``started'' but
+``answering its health endpoint,'' which is what makes the ordering
+real. \co{3} maps distinct host ports (5433, 5434) onto the two
+Postgres containers' identical internal 5432 --- names are per-network,
+host ports are global. The named volume keeps data across container
+recreation; Chapter~19 is the Kubernetes version of the same need.
+
+\begin{decision}[why Compose survives alongside Kubernetes]
+The cluster is the deployment target, but Compose remains the inner
+loop: one command, laptop-local, debug ports mapped (every service opens
+a JDWP port in Compose --- attach the IDE debugger to 5082 and step
+through course-service). Kubernetes buys self-healing and rolling
+deploys at the cost of ceremony; a developer iterating on business logic
+wants neither cost. Two environments, one image contract between them.
+\end{decision}
+
+\begin{pitfall}[works in Compose, dies in Kubernetes]
+Symptom: the stack is green locally; the same image crash-loops in the
+cluster. The usual suspects, all environmental: a URL still pointing at
+a Compose service name that has a different Service name in k8s; a
+\code{depends\_on} ordering the cluster does not honor (Kubernetes has
+no startup ordering --- Chapter~15); or memory limits present in the
+cluster but absent locally, turning a fat JVM into an OOMKill. The
+image is identical --- diff the \emph{environment}, not the code:
+\code{docker inspect} vs.\ \code{kubectl describe pod}.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item A container and a VM both isolate. Name two mechanisms the
+  container uses, and two consequences of not having a guest kernel.
+  \item Why does \code{localhost:5432} fail inside a container that
+  works on your laptop, and what two different fixes do Compose and
+  Kubernetes offer?
+  \item Both Postgres containers listen on 5432 internally without
+  conflict --- explain. Where do conflicts become possible again?
+  \item What makes \code{condition: service\_healthy} stronger than
+  plain \code{depends\_on}, and which project file supplies the health
+  signal it waits for?
+\end{enumerate}
+\end{quiz}

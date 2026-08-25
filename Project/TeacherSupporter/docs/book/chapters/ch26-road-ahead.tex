@@ -1,0 +1,120 @@
+\chapter{The Road Ahead}
+\label{ch:roadahead}
+
+With Kafka in the cluster (Chapter~25), every service the project has is
+deployable. The remaining milestones each swap something hand-rolled
+for the industrial mechanism --- and each makes most sense now that you
+know what it replaces.
+
+\section{Observability}
+
+Beyond \code{kubectl logs} lies the standard trio: \textbf{metrics}
+(Prometheus scraping the \code{/actuator/prometheus} endpoints every
+service already exposes; Grafana dashboards over the RED trio ---
+rate, errors, duration), \textbf{traces} (the Zipkin wiring already in
+every config, currently sampled at zero in the cluster --- one env var
+turns it on once a Zipkin pod exists), and \textbf{alerts}
+(Alertmanager: a page when a service's error rate or a PVC's fullness
+crosses a line). This lands via the \code{kube-prometheus-stack} Helm
+chart --- the promised moment where you \emph{consume} Helm without
+authoring charts (Chapter~20's decision box, honored). Strimzi can
+export broker metrics into the same Prometheus with a few lines of
+\code{metricsConfig} on the Kafka resource --- consumer-group lag is
+the first Kafka alert worth having.
+
+\begin{hardware}
+The full stack costs $\sim$1.5\,GB and nontrivial CPU --- the budget
+says it fits, but it is the first thing to shed under load. Droppable
+observability is a homelab luxury; production teams size for it first.
+\end{hardware}
+
+\section{Frontend and the single host}
+
+Milestone~7 serves the React frontend from the cluster and claims the
+\code{/} path on \code{ts.local} that Chapter~18's Ingress deliberately
+left free. One host, one origin --- no CORS, cookies and OAuth
+redirects behave --- and the two-router division of Chapter~4 is
+complete: Traefik fans out static assets to the frontend and
+\code{/api} to the gateway.
+
+\section{GitOps: Argo CD}
+
+The pipeline \emph{pushes} deployments (Jenkins holds a kubeconfig and
+runs kubectl). GitOps inverts the arrow: an in-cluster agent
+(Argo CD) \emph{pulls} --- continuously comparing a git repository's
+manifests with the cluster and converging. What that buys, in the
+vocabulary you now have: the cluster credential never leaves the
+cluster (Chapter~22's RBAC concern dissolves --- CI only pushes images
+and commits a tag bump); deletions finally propagate (Chapter~20's
+prune pitfall, solved by design); drift becomes visible (a hand-edited
+Deployment shows as ``OutOfSync''); and rollback is \code{git revert}.
+Jenkins keeps CI --- build, test, push, update the tag in git ---
+Argo CD takes CD. The Jenkinsfile's deploy stage, this book's
+Chapter~23, becomes a commit.
+
+\section{Retiring the classic stack}
+
+The deliberate redundancy of Chapters~2 and 3 can now be paid off,
+service by service:
+
+\begin{itemize}
+  \item \textbf{Eureka out}: set the gateway's routes from
+  \code{lb://course-service} to \code{http://course-service:8082} ---
+  Service DNS and readiness-gated endpoints do everything the registry
+  did here. Delete a deployable, free 512\,Mi.
+  \item \textbf{Config-server out}: mount the \code{configurations/}
+  files as a ConfigMap and point
+  \code{spring.config.import} at the mounted directory
+  (\code{optional:file:/config/}). Same files, one fewer service, and
+  config changes become manifest changes flowing through GitOps.
+\end{itemize}
+
+Both migrations are résumé material precisely because they run
+\emph{toward} the platform: knowing why Eureka exists \emph{and} why
+Kubernetes obsoletes it is the difference between using either and
+understanding both.
+
+\section{Jenkins into the cluster}
+
+Chapter~22's homelab inversion --- builds on the controller, Jenkins
+outside k3s --- reverses cleanly once the pipeline is stable: the
+Kubernetes plugin spawns an agent pod per build, and Jenkins itself
+becomes a StatefulSet with \code{JENKINS\_HOME} on a PVC. The
+migration touches every concept in Part~V at once, which is why it is
+scheduled last.
+
+\section{OpenShift, briefly}
+
+The manifests were kept portable on purpose: Jib's non-root images
+(Chapter~13) satisfy OpenShift's arbitrary-UID security model, so
+deploying to a free OpenShift sandbox should need only the
+Ingress-to-Route translation (Chapter~18). Running that experiment
+once validates the portability claims this book has been making ---
+and OpenShift vocabulary (Routes, SCCs, BuildConfigs) maps one-to-one
+onto chapters you have read.
+
+\section{Where this leaves you}
+
+Strip the project names away and the inventory reads like a platform
+job description: the property-resolution machinery that makes one
+artifact run anywhere; logs, consumer groups and delivery semantics;
+images, layers and registries; reconciliation, probes, RBAC, storage
+classes and operators; pipelines, RBAC-scoped deploy identities, and
+the GitOps inversion. The homelab constraints were not limitations ---
+they were the syllabus: every ``on this hardware'' box forced a
+decision that money usually hides.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Which metric would you alert on first for the Kafka path, and
+  what does it measure in Chapter~10's terms?
+  \item Push-based vs.\ pull-based deployment: locate the cluster
+  credential in each, and explain which chapter's pitfall GitOps
+  pruning resolves.
+  \item Sketch the Eureka retirement: what changes in the gateway's
+  config, which two Kubernetes mechanisms replace registration and
+  liveness, and what can be deleted?
+  \item Why do Jib's images make the OpenShift experiment cheap, and
+  which object translation remains?
+\end{enumerate}
+\end{quiz}

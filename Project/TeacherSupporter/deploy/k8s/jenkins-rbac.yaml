@@ -36,6 +36,13 @@ rules:
     resources: ["ingresses"]
     verbs: ["get", "list", "create", "patch", "update"]
 
+  # Strimzi custom resources (milestone 6). Namespaced like everything
+  # else here -- the pipeline may declare Kafka clusters and topics in ts,
+  # but installing the operator/CRDs stays an admin act (install-strimzi.sh).
+  - apiGroups: ["kafka.strimzi.io"]
+    resources: ["kafkas", "kafkanodepools", "kafkatopics"]
+    verbs: ["get", "list", "create", "patch", "update"]
+
   # -- Read-only extras for `rollout status` and post-failure debugging -------
   # A Deployment rolls out via ReplicaSets it owns; rollout status watches them.
   - apiGroups: ["apps"]

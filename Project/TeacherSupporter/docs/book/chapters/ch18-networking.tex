@@ -1,0 +1,144 @@
+\chapter{Networking: Services, DNS, Ingress}
+\label{ch:networking}
+
+\section{The problem pods create}
+
+Pods have cluster-routable IPs --- and lose them at every replacement.
+Chapter~15 made pods disposable; something stable must sit in front.
+That something is the \emph{Service}: a fixed virtual IP and DNS name,
+backed by a live list of pod endpoints selected by label:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: v1
+kind: Service
+metadata: { name: course-service }
+spec:
+  selector: { app: course-service }     (*@\co{1}@*)
+  ports:
+    - { port: 8082, targetPort: 8082 }  (*@\co{2}@*)
+\end{lstlisting}
+
+\co{1}~The endpoint controller continuously lists \emph{Ready} pods
+matching this selector --- readiness (Chapter~17) is the membership
+test. \co{2}~Traffic to the Service's port is forwarded to a chosen
+endpoint's targetPort.
+
+Cluster DNS gives every Service a name: \code{course-service} within
+the namespace, \code{course-service.ts.svc.cluster.local} from
+anywhere. This is why the Kubernetes env overrides look so much like
+the Compose ones --- both platforms resolve a service's name on a
+private network; the project deliberately named its k8s Services after
+its Compose services so the overrides match.
+
+The default Service type, \code{ClusterIP}, is reachable \emph{only
+inside} the cluster --- a security property Part~II leaned on for the
+password-less Mongo. \code{NodePort} and \code{LoadBalancer} exist to
+expose Services directly; this project instead funnels everything
+through one Ingress.
+
+\section{Ingress and Traefik}
+
+A Service exposes one thing; an \emph{Ingress} is the L7 front door:
+host- and path-based HTTP routing, later TLS termination, declared as
+data and executed by an \emph{Ingress controller} --- in k3s, the
+bundled Traefik watching Ingress objects. From
+\code{api-gateway.yaml}:
+
+\begin{lstlisting}[language=yaml]
+kind: Ingress
+spec:
+  rules:
+    - host: ts.local                    (*@\co{1}@*)
+      http:
+        paths:
+          - path: /api                  (*@\co{2}@*)
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+          # /oauth2 and /login/oauth2 likewise -> api-gateway
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Host-based rule: this applies to requests whose
+  \code{Host} header says \code{ts.local} --- a name that exists only in
+  the Windows hosts file, pointing at the server's tailnet IP. Multiple
+  hosts can share the cluster's single 80/443.
+  \item[\co{2}] Path fan-out. Only three prefixes enter, all to the
+  gateway; \code{/} is reserved for the frontend milestone.
+\end{description}
+
+\section{The full path of one request}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3.5mm and 5.5mm]
+  \node[boxdark] (b) {Browser};
+  \node[box, right=of b] (t) {Traefik};
+  \node[box, right=of t] (gws) {Service\\\scriptsize api-gateway};
+  \node[box, right=of gws] (gw) {gateway pod};
+  \node[box, below=of gw] (cs) {Service\\\scriptsize course-service};
+  \node[box, left=of cs] (csp) {course pod};
+  \draw[flow] (b) -- node[lbl,above]{\scriptsize Host: ts.local} (t);
+  \draw[flow] (t) -- node[lbl,above]{\scriptsize /api} (gws);
+  \draw[flow] (gws) -- (gw);
+  \draw[flow] (gw) -- node[lbl,right]{\scriptsize lb:// via Eureka}(cs);
+  \draw[flow] (cs) -- (csp);
+\end{tikzpicture}
+\caption{Two routers, two discovery systems, one request.}
+\end{figure}
+
+Worth pausing on: the gateway's Eureka lookup returns a \emph{pod IP}
+(Chapter~3's prefer-ip-address), so hop four technically bypasses the
+course-service Service. Both discovery systems run in parallel ---
+Eureka for gateway-to-service, Service DNS for everything else
+(config-server, databases, Kafka). Chapter~26's simplification
+collapses them into one.
+
+\begin{pitfall}[the Service that selects nothing]
+Symptom: \code{curl} to a Service name times out; pods are Running and
+healthy. Cause \#1: label mismatch --- the Service selector and the pod
+template labels differ by a typo; the endpoint list is empty and
+nothing complains. Check: \code{kubectl -n ts get endpoints
+course-service} --- an empty ENDPOINTS column is this bug. Cause \#2:
+endpoints exist but the pods are not Ready --- same command shows them
+under \code{NotReadyAddresses}. The Service abstraction fails
+\emph{silently}; the endpoints object is where it becomes visible.
+\end{pitfall}
+
+\begin{decision}[one Ingress host + hosts-file, not NodePorts]
+NodePorts (one weird port per service) would work over Tailscale
+without any DNS games --- and produce URLs like
+\code{100.85.66.43:30082} that leak topology, dodge the gateway, and
+can't do TLS sanely. One Ingress host means one address to secure and
+a browser experience identical to production; the \code{ts.local}
+hosts-file entry is the only client-side cost. The upgrade path ---
+a real domain plus cert-manager, or a Cloudflare Tunnel --- changes the
+Ingress host and nothing else.
+\end{decision}
+
+\section{Outside the project}
+
+On EKS the same Ingress object, annotated for the AWS controller,
+provisions an actual ALB; on OpenShift it becomes a \code{Route} ---
+same idea, different noun. The piece this cluster omits:
+\textbf{NetworkPolicies} --- firewall rules for pod-to-pod traffic
+(``only the gateway may reach course-service:8082''), which is the
+in-cluster enforcement the trusted-edge pattern of Chapter~5 called
+its remaining soft spot. Flat-network trust is normal for a homelab
+and negligent for a bank.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Pod IPs change at every replacement, yet
+  \code{course-service:8082} always works. Name each mechanism between
+  the name and the pod's socket.
+  \item How does readiness interact with Service endpoints, and what
+  does that mean during a rolling update?
+  \item Diagnose: Service exists, pods Ready, \code{get endpoints}
+  shows an empty list. What is wrong, and why did nothing error?
+  \item Why does \code{ts.local} require a hosts-file entry, and what
+  replaces that entry in the two production upgrade paths?
+\end{enumerate}
+\end{quiz}

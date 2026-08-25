@@ -1,0 +1,4 @@
+1. Jenkins
+docker run --network host -v jenkins_home:/var/jenkins_home --memory 2g -e JAVA_OPTS="-Xmx1g" --restart=unless-stopped -d --name jenkins jenkins/jenkins:lts-jdk21
+
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword

@@ -1,0 +1,121 @@
+\chapter{Service Discovery: Eureka}
+\label{ch:eureka}
+
+\section{The problem}
+
+The gateway must forward \code{/api/courses} to course-service. To which
+address? In Compose it could hard-code \code{course-service:8082} ---
+but then every new replica, every moved service, every environment is a
+config change. Service discovery replaces addresses with \emph{names
+resolved at runtime}: services register themselves in a registry; clients
+ask the registry.
+
+\section{How Eureka works}
+
+Eureka (from Netflix, the ancestral Spring Cloud stack) is a REST service
+holding a registry of instances:
+
+\begin{itemize}
+  \item \textbf{Registration.} At startup each client POSTs its identity:
+  app name (\code{spring.application.name}), host, port, health URL.
+  \item \textbf{Heartbeats.} Every 30\,s (default) the client renews its
+  lease. Miss a few renewals and the instance is evicted.
+  \item \textbf{Client-side caching.} Consumers fetch the registry and
+  cache it (default refresh 30\,s), then load-balance \emph{locally}
+  across the instances they know. The registry being briefly down does
+  not stop traffic --- callers keep using their cache.
+  \item \textbf{Self-preservation.} If too many heartbeats vanish at once,
+  Eureka assumes a network problem rather than mass death and stops
+  evicting. Fewer surprises during network blips; staler data during real
+  outages.
+\end{itemize}
+
+The consumer side in this project is the gateway's \code{lb://course-service}
+URI (Chapter~4): ``look this name up in the registry, pick an instance.''
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 12mm]
+  \node[boxdark] (eureka) {Eureka\\\scriptsize discovery-server:8761};
+  \node[box, below left=of eureka] (a) {course-service\\\scriptsize instance 1};
+  \node[box, below=of eureka] (b) {course-service\\\scriptsize instance 2};
+  \node[box, below right=of eureka] (gw) {api-gateway};
+  \draw[flow] (a) -- node[lbl,left]{register + heartbeat} (eureka);
+  \draw[flow] (b) -- (eureka);
+  \draw[flowdash] (gw) -- node[lbl,right]{fetch registry} (eureka);
+  \draw[flow] (gw) -- node[lbl,below]{\scriptsize lb:// picks one} (b);
+\end{tikzpicture}
+\caption{Registration, heartbeat, and client-side load balancing.}
+\end{figure}
+
+\section{The server, and the one k8s-critical setting}
+
+The discovery-server module is Eureka with almost no configuration ---
+a \code{@EnableEurekaServer} annotation and a port. The interesting
+configuration is on every \emph{client}, and one line of it earns its own
+section because it decides whether the whole system works on Kubernetes:
+
+\begin{lstlisting}[language=yaml]
+- name: EUREKA_INSTANCE_PREFER_IP_ADDRESS
+  value: "true"
+\end{lstlisting}
+
+By default a client registers its \emph{hostname}. On your laptop that is
+fine. Inside a Kubernetes pod, the hostname is the \emph{pod name} ---
+\code{course-service-7d9f6c-x2vlq} --- which is not resolvable by other
+pods. Every registration would be an address no one can dial.
+Pod \emph{IPs}, by contrast, are routable across the whole cluster.
+So every Deployment in \code{deploy/k8s/base/} sets this flag: register
+the IP, not the name.
+
+\begin{pitfall}[everything registers, nothing can call anything]
+Symptom: the Eureka dashboard shows all services UP, but every
+gateway-routed request fails with \code{UnknownHostException}. Cause: the
+registered hostnames are pod names (see above). This is the single most
+common Eureka-on-Kubernetes failure, and it is invisible until the first
+cross-service call.
+\end{pitfall}
+
+\begin{decision}[why Eureka at all, when Kubernetes has Services]
+Kubernetes already gives every Service a DNS name
+(\code{course-service:8082}) with built-in load balancing --- discovery is
+native to the platform. Eureka here is deliberate résumé-driven
+redundancy: the classic stack is still widespread in industry, and
+migrating \emph{off} it (Chapter~26: replace \code{lb://} with plain
+Service DNS, delete two deployables) is itself the kind of modernization
+work enterprises pay for. Building both stacks teaches the migration.
+\end{decision}
+
+\section{Outside the project}
+
+\emph{Consul} (HashiCorp) is the main non-JVM alternative: agent-based,
+language-agnostic, with health checks executed by the agent rather than
+self-reported heartbeats, plus a key-value store that can replace the
+config-server too. \emph{Kubernetes-native discovery} is the other pole:
+no registry process at all --- the platform's controllers watch pod
+readiness and update Service endpoints; ``registration'' is simply a pod
+becoming Ready (Chapter~17 shows the machinery). Notice the pattern: the
+more the platform provides, the less the application must carry.
+
+\begin{hardware}
+Eureka's conservative defaults (30\,s heartbeat, 30\,s client cache,
+eviction after 90\,s) mean a crashed instance can receive traffic for up
+to a minute. On one replica per service that hardly matters --- the caller
+would fail anyway --- but it explains why rolling deployments in
+Chapter~23 wait on Kubernetes readiness, not on Eureka status.
+\end{hardware}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Trace what happens between course-service starting and the
+  gateway successfully routing to it: which registrations, fetches, and
+  caches are involved, and what is the worst-case delay?
+  \item Why does \code{prefer-ip-address} matter on Kubernetes but not on
+  Compose? (What does each platform make resolvable?)
+  \item Self-preservation mode trades which property for which? Give a
+  scenario where it helps and one where it hurts.
+  \item If Eureka were removed and the gateway pointed at
+  \code{http://course-service:8082} directly, what Kubernetes machinery
+  replaces each Eureka feature?
+\end{enumerate}
+\end{quiz}

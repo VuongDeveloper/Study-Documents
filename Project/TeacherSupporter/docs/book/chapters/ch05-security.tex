@@ -1,0 +1,169 @@
+\chapter{Security: JWT, OAuth2, and the Trusted Edge}
+\label{ch:security}
+
+Security is where this project is most instructive, because it uses three
+mechanisms that industry uses constantly --- stateless JWTs, OAuth2 login,
+TOTP two-factor --- and wires them through a gateway in the standard
+``trusted edge'' pattern.
+
+\section{Spring Security in one page}
+
+Spring Security is a chain of servlet filters in front of your
+controllers. Each request passes through the chain; filters authenticate
+(who are you?) and the authorization rules decide (may you?). The
+project's auth-service chain, from its \code{SecurityConfig}:
+
+\begin{lstlisting}[language=Java]
+http
+  .csrf(AbstractHttpConfigurer::disable)                    (*@\co{1}@*)
+  .sessionManagement(s ->
+      s.sessionCreationPolicy(SessionCreationPolicy.STATELESS)) (*@\co{2}@*)
+  .authorizeHttpRequests(auth -> auth
+      .requestMatchers("/register", "/login", "/activate",
+          "/refresh", "/verify-2fa", "/change-password",
+          "/oauth2/**", "/login/oauth2/**",
+          "/v3/api-docs/**", "/swagger-ui/**").permitAll()  (*@\co{3}@*)
+      .anyRequest().authenticated())
+  .oauth2Login(o -> o.successHandler(oAuth2LoginSuccessHandler))
+  .addFilterBefore(gatewayHeaderAuthFilter,
+      UsernamePasswordAuthenticationFilter.class);          (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] CSRF protection defends browser cookie sessions; a
+  stateless JWT API has no cookie session to ride, so it is disabled.
+  Disable it for that reason --- not because a tutorial did.
+  \item[\co{2}] \code{STATELESS}: no HTTP session is created. Every
+  request must carry its own proof of identity. This is the property that
+  lets any replica answer any request --- the scaling prerequisite.
+  \item[\co{3}] The public paths. Note they are the \emph{stripped} paths
+  (\code{/login}, not \code{/api/auth/login}) --- Chapter~4 explains why.
+  Note also what is \emph{absent}: \code{/actuator/**}. That absence
+  decides this service's Kubernetes probe strategy in Chapter~17.
+  \item[\co{4}] The custom filter that trusts identity headers from the
+  gateway --- the subject of Section~\ref{sec:trusted-edge}.
+\end{description}
+
+\section{JWT: stateless identity}
+
+A JSON Web Token is three base64url parts, \code{header.payload.signature}.
+The payload carries \emph{claims}: subject (user id), role, expiry. The
+signature is HMAC-SHA256 over header and payload with a shared secret ---
+the 256-bit-minimum string both auth-service and the gateway hold.
+
+The properties that matter:
+
+\begin{itemize}
+  \item \textbf{Self-contained.} Validation needs no database call: check
+  signature, check expiry, read claims. This is what lets the
+  \emph{gateway} authenticate without owning user data.
+  \item \textbf{Readable.} Base64 is encoding, not encryption --- anyone
+  can decode the payload. Never put secrets in claims.
+  \item \textbf{Irrevocable until expiry.} A signed token cannot be
+  un-signed. Hence the two-token pattern: a short-lived \emph{access
+  token} (here 15 minutes) paired with a long-lived \emph{refresh token}
+  (7 days) that \emph{is} checked against the database at
+  \code{/refresh} --- revocation happens there.
+\end{itemize}
+
+\section{The trusted-edge pattern}
+\label{sec:trusted-edge}
+
+The gateway's \code{JwtAuthenticationFilter} validates the token, then
+forwards the request with identity as plain headers:
+
+\begin{lstlisting}[language=Java]
+ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+    .header(JwtConstants.HEADER_USER_ID, userId)
+    .header(JwtConstants.HEADER_USER_ROLE, role)
+    .build();
+\end{lstlisting}
+
+Downstream, each service's \code{GatewayHeaderAuthFilter} reads those
+headers and builds the Spring Security context from them --- no
+re-validation. Services stay simple; cryptography happens once.
+
+The pattern's obligation: those headers are only trustworthy if
+\emph{every} path to a service goes through the gateway. A client who can
+reach course-service directly could forge \code{X-User-Id}. This is the
+deep reason the direct \code{/courses} Ingress was deleted (Chapter~4),
+and why in-cluster traffic is the remaining soft spot --- any pod can
+still call \code{course-service:8082} with invented headers.
+NetworkPolicies or mTLS (service mesh) are the industrial hardening;
+Chapter~26 discusses when they earn their complexity.
+
+\section{OAuth2 login with Google}
+
+OAuth2's \emph{authorization code} flow, as it runs here:
+
+\begin{enumerate}
+  \item Browser hits \code{/oauth2/authorization/google} (via the
+  gateway); Spring redirects to Google with the app's client-id and a
+  \code{redirect\_uri}.
+  \item The user consents at Google; Google redirects the browser to the
+  \code{redirect\_uri} --- \code{/login/oauth2/code/google} --- carrying a
+  one-time \emph{code}.
+  \item Auth-service exchanges code + client-secret for tokens
+  server-to-server, reads the user's e-mail/profile, then the project's
+  \code{OAuth2LoginSuccessHandler} takes over: find or create the local
+  account and issue \emph{our own} JWTs. Google authenticates; the
+  application still authorizes with its own tokens.
+\end{enumerate}
+
+\begin{pitfall}[redirect\_uri\_mismatch]
+Symptom: Google shows ``Error 400: redirect\_uri\_mismatch'' instead of a
+consent screen. Cause: the URI the app sent is not byte-identical to one
+registered in the Google Cloud console. It changes per environment
+(\code{localhost:8080} in dev, \code{ts.local} in the cluster --- which is
+why the Deployment overrides
+\code{...GOOGLE\_REDIRECT\_URI}), and every variant must be registered.
+The URI must reach auth-service \emph{unstripped}, which is why the
+OAuth2 gateway routes carry no StripPrefix.
+\end{pitfall}
+
+\section{TOTP two-factor}
+
+Time-based One-Time Passwords (RFC~6238): at enrollment the server
+generates a secret, shows it as a QR code, and the authenticator app
+derives a 6-digit code from \code{HMAC(secret, time/30s)}. Login becomes
+two steps --- password check issues a short-lived pending state, then
+\code{/verify-2fa} checks the code and issues the real tokens. Server and
+phone never communicate; they only share the secret and a clock.
+
+\section{Outside the project}
+
+The main industrial alternative moves token issuing out of your code
+entirely: an identity provider (Keycloak self-hosted, or Auth0/Cognito
+managed) issues tokens signed with an \emph{asymmetric} keypair
+(RS256). Services validate with the \emph{public} key fetched from a
+JWKS URL --- no shared secret to distribute, key rotation built in:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: https://idp.company.com/realms/app/protocol/openid-connect/certs
+\end{lstlisting}
+
+Understanding the hand-rolled HS256 version --- what this project builds
+--- is precisely what makes that configuration meaningful: same claims,
+same validation, different key ceremony.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Why can CSRF protection be disabled for a stateless JWT API but
+  not for a cookie-session webapp?
+  \item An attacker steals an access token. How long is it useful, what
+  cannot the server do about it meanwhile, and which endpoint finally
+  stops the session?
+  \item In the trusted-edge pattern, state the exact invariant that must
+  hold for \code{X-User-Id} to be trustworthy, and name two deployment
+  mistakes that would break it.
+  \item In the Google flow, which secret never leaves the server, which
+  value transits the browser, and why is the browser-visible one safe?
+  \item HS256 vs RS256: who can validate, who can sign, and why do
+  identity providers choose RS256?
+\end{enumerate}
+\end{quiz}

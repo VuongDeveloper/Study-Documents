@@ -1,0 +1,147 @@
+\chapter{Kafka: The Core Model}
+\label{ch:kafkacore}
+
+Kafka is the technology in this stack most worth learning deeply: it
+appears in a large fraction of backend job descriptions, and its model is
+genuinely different from a message queue's. This chapter is
+platform-independent Kafka; Chapter~11 is the Spring side.
+
+\section{A log, not a queue}
+
+Kafka's core abstraction is an \emph{append-only log}. A \emph{topic}
+(e.g.\ \code{ts.user.registered}) is split into \emph{partitions}; each
+partition is an ordered, immutable sequence of \emph{records}, each at a
+numbered \emph{offset}. Records are not deleted when read --- they expire
+by retention policy (this project: 168 hours). Reading is not
+destructive; a consumer just remembers \emph{how far it got}.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3mm and 8mm]
+  \node[lbl] (t) at (0,1.35) {topic ts.user.registered};
+  \foreach \p/\y in {0/0.6, 1/0} {
+    \node[lbl,anchor=east] at (0.1,\y) {p\p};
+    \foreach \i in {0,...,6} {
+      \node[draw,minimum size=5mm,font=\scriptsize] at (0.65+\i*0.62,\y) {\i};
+    }
+  }
+  \draw[flow] (5.2,1.15) node[lbl,right]{producer appends} -- (4.7,0.72);
+  \draw[flow] (2.55,-0.75) node[lbl,below]{consumer group offset: 4} -- (3.13,-0.28);
+\end{tikzpicture}
+\caption{Two partitions; producers append at the head, consumer groups
+remember an offset per partition.}
+\end{figure}
+
+The consequences, each of which a queue lacks:
+
+\begin{itemize}
+  \item \textbf{Replayable.} A new consumer can start from offset 0 and
+  see history. Deploy a new analytics service next year; it can process
+  last week's registrations.
+  \item \textbf{Multi-reader.} Notification-service and course-service
+  both read auth events independently, at their own pace, without
+  stealing from each other --- each \emph{consumer group} keeps its own
+  offsets.
+  \item \textbf{Ordered per partition.} Records with the same \emph{key}
+  hash to the same partition and stay in order. This is why the
+  publishers in this project key by \code{userId}: all events about one
+  user arrive in sequence. Across partitions there is no order --- design
+  around per-key order only.
+\end{itemize}
+
+\section{Consumer groups}
+
+A consumer group is a named team splitting work: each partition is
+assigned to exactly one consumer \emph{within the group}. Two consumers
+in group \code{notification-group} on a 2-partition topic get one
+partition each; a third sits idle --- \emph{partitions are the unit of
+parallelism}. When a consumer joins or dies, the group \emph{rebalances}:
+partitions are reassigned and members briefly pause. Different groups are
+invisible to each other, which is how the same event fans out to both
+\code{notification-group} and \code{course-group}.
+
+\section{Brokers, replication, KRaft}
+
+A production cluster runs several \emph{brokers}; each partition has a
+leader on one broker and \emph{replicas} on others
+(\code{replication-factor}, RF). Producers write to the leader;
+\code{acks=all} waits until in-sync replicas have it. Metadata
+coordination historically required ZooKeeper, a second distributed
+system; modern Kafka replaces it with \emph{KRaft} --- brokers running an
+internal Raft quorum. This project runs KRaft with one node playing both
+\code{broker} and \code{controller} roles, RF\,=\,1: fine for a homelab,
+zero fault tolerance --- one disk failure loses the log.
+
+\section{The advertised-listeners maze}
+
+The single most-Googled Kafka error. From \code{docker-compose.yml}:
+
+\begin{lstlisting}[language=yaml]
+KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092 (*@\co{1}@*)
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092 (*@\co{2}@*)
+KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093                (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \emph{Listeners}: the sockets the broker opens. Three:
+  one for clients inside the Docker network, one for the KRaft
+  controller, one published to the host.
+  \item[\co{2}] \emph{Advertised} listeners: the addresses the broker
+  \emph{tells clients to use}. This is the trap: a Kafka client's first
+  request is ``where are the partition leaders?'', and the broker answers
+  with these strings. Containers must be told \code{kafka:19092}
+  (resolvable on the Docker network); tools on your laptop must be told
+  \code{localhost:9092}. One broker, two audiences, two advertised
+  addresses.
+  \item[\co{3}] KRaft quorum of one: node 1 is the whole election.
+\end{description}
+
+\begin{pitfall}[connects, then times out]
+Symptom: a client connects to the bootstrap address successfully, then
+every send/poll fails with \code{Connection to node -1 could not be
+established} or hangs. Cause: bootstrap worked, but the \emph{metadata
+answer} advertised an address the client cannot reach (e.g.\ your laptop
+was told \code{kafka:19092}). The bootstrap address only starts the
+conversation; the advertised listeners carry all subsequent traffic.
+Diagnose by asking what the broker advertises --- e.g.\
+\code{kcat -L -b localhost:9092} --- and checking those exact strings
+resolve from where the client runs.
+\end{pitfall}
+
+\section{Delivery semantics}
+
+Kafka's default is \emph{at-least-once}: a producer retry after a lost
+ack, or a consumer crash after processing but before committing its
+offset, both cause duplicates --- not loss. Design consumers to be
+\emph{idempotent} (processing the same event twice is harmless):
+notification-service sending one duplicate mail is acceptable; a payment
+service would instead track processed event IDs. Exactly-once exists
+(idempotent producers + transactions) but costs complexity; know that
+at-least-once + idempotent consumer is the industry's bread and butter.
+
+\section{Outside the project}
+
+Managed Kafka (AWS MSK, Confluent Cloud) removes broker operations and
+sells the same protocol --- your clients change a bootstrap string and
+gain SASL/TLS. The other names in this space solve different problems:
+RabbitMQ is a smart-routing \emph{queue} (work distribution, per-message
+acks, no replay); Redpanda reimplements the Kafka protocol without the
+JVM. When Chapter~25 moves this broker into the cluster under Strimzi,
+nothing in this chapter changes --- Strimzi is \emph{operations} for
+the same Kafka.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Registration events for one user must be processed in order, but
+  scaling matters. What do you key by, how many partitions, and what is
+  the parallelism limit?
+  \item Two groups, \code{notification-group} and \code{course-group},
+  read \code{ts.user.activated}. Explain how both get every event.
+  \item Distinguish \code{LISTENERS} from \code{ADVERTISED\_LISTENERS},
+  and explain why the bug they cause appears \emph{after} a successful
+  connection.
+  \item Why does at-least-once delivery push idempotency onto the
+  consumer, and what would notification-service's idempotency strategy
+  reasonably be?
+\end{enumerate}
+\end{quiz}

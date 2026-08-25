@@ -34,8 +34,11 @@ spec:
             # routable cluster-wide, so register the IP instead.
             - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
 
-            # Not in this slice yet. Kafka's consumer retries in the background
-            # and tracing is simply switched off, so neither blocks startup.
+            # Strimzi's bootstrap Service (milestone 6). This service both
+            # produces (ts.assignment.created) and consumes (ts.user.activated).
+            - { name: SPRING_KAFKA_BOOTSTRAP_SERVERS, value: "ts-kafka-kafka-bootstrap:9092" }
+
+            # Zipkin is not in the cluster yet (observability is milestone 8).
             - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
 
             - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
@@ -89,21 +92,9 @@ spec:
   selector: { app: course-service }
   ports:
     - { name: http, port: 8082, targetPort: 8082 }
----
-# Traefik ships with k3s and watches Ingress resources with no extra config.
-# Host-based routing so the frontend and other services can share port 80 later.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: course-service
-spec:
-  rules:
-    - host: ts.local
-      http:
-        paths:
-          - path: /courses
-            pathType: Prefix
-            backend:
-              service:
-                name: course-service
-                port: { number: 8082 }
+# NOTE: the direct Ingress that used to live here (ts.local/courses ->
+# course-service) is gone. It was milestone-3 scaffolding to prove the chain
+# end-to-end, but it bypassed the api-gateway's JWT filter. All external
+# traffic now enters through the gateway's Ingress (api-gateway.yaml).
+# In-cluster callers still reach this Service directly -- that is what the
+# Service object above is for.

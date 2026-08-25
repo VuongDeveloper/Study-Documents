@@ -1,0 +1,99 @@
+\chapter{Object Storage: MinIO and the S3 Model}
+\label{ch:minio}
+
+\section{The problem}
+
+Assignment submissions are files --- PDFs, images, archives. Files in a
+relational database bloat backups and stream badly; files on a pod's
+local disk vanish with the pod. The industry's answer is \emph{object
+storage}: an HTTP service storing immutable blobs in named
+\emph{buckets} under string \emph{keys}, metadata included, no
+directories (the \code{/} in a key is naming convention, not structure).
+Amazon S3 defined the API; MinIO is a self-hostable server speaking the
+same API --- so course-service uses the standard AWS SDK and cannot tell
+the difference.
+
+\section{The configuration, annotated}
+
+From \code{configurations/course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+app:
+  s3:
+    endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}         (*@\co{1}@*)
+    public-endpoint: ${APP_S3_PUBLIC_ENDPOINT:http://localhost:9000} (*@\co{2}@*)
+    access-key: ${APP_S3_ACCESS_KEY:minioadmin}                (*@\co{3}@*)
+    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+    bucket: ${APP_S3_BUCKET:ts-submissions}
+    presigned-url-expiry-minutes: ${APP_S3_PRESIGNED_EXPIRY_MIN:15} (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Where \emph{the service} talks to MinIO. In the cluster:
+  \code{http://minio:9000}.
+  \item[\co{2}] Where \emph{the browser} talks to MinIO --- the subject of
+  the pitfall below.
+  \item[\co{3}] Credentials with dev defaults; the cluster injects real
+  ones from the \code{minio-app} Secret. \code{app.s3.*} is custom
+  (\code{@ConfigurationProperties}) config, not Spring-managed --- the
+  same override machinery applies regardless.
+  \item[\co{4}] How long a presigned link stays valid.
+\end{description}
+
+\section{Presigned URLs: the pattern worth knowing}
+
+Naive file download routes bytes \emph{through} the service:
+browser $\rightarrow$ service $\rightarrow$ MinIO and back, tying up an
+application thread per transfer. The S3-native alternative: the service
+uses its credentials to \emph{sign a URL} --- bucket, key, expiry, HMAC
+signature --- and hands the URL to the browser, which downloads
+\emph{directly} from storage. The service spends microseconds; storage
+does the streaming; the link self-expires. The same trick works for
+uploads.
+
+\begin{pitfall}[the two-endpoints problem]
+Symptom: uploads work, but clicking a download link fails with
+\code{ERR\_NAME\_NOT\_RESOLVED} on \code{minio:9000}. Cause: a presigned
+URL embeds the endpoint \emph{it was signed against}. The service signs
+against \code{minio:9000} --- a name only resolvable inside the cluster
+network --- and the browser lives outside it. Hence two configured
+endpoints: sign download links against \code{public-endpoint}, talk to
+storage over \code{endpoint}. Every containerized S3 setup meets this
+bug once; some meet it again with the signature itself, because the
+signature covers the host --- you cannot sign against one host and
+rewrite the URL to another afterwards.
+\end{pitfall}
+
+\begin{hardware}
+MinIO here is a single container with a single PVC --- fine for a
+homelab's submissions, nothing like production MinIO (multi-node erasure
+coding) or S3's eleven nines of durability. The interesting part is that
+course-service cannot tell: the same SDK calls would hit real S3 with
+only the endpoint and credentials changed. That is the point of speaking
+a standard API.
+\end{hardware}
+
+\section{Outside the project}
+
+The same service on AWS proper: set \code{endpoint} and
+\code{public-endpoint} to the real S3 URL (or leave the SDK's default),
+replace static keys with an IAM role assumed by the pod (IRSA on EKS ---
+no long-lived credentials at all), and turn on bucket versioning and
+lifecycle rules (auto-expire old submissions to cheaper storage). The
+concepts --- buckets, keys, presigning, the identity that signs ---
+transfer unchanged; what changes is who manages durability and how
+identity is proven.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Why do presigned URLs scale better than proxying downloads
+  through the service, and what new failure mode do they introduce?
+  \item Explain why \code{endpoint} and \code{public-endpoint} must
+  differ inside the cluster, and why post-signing URL rewriting is not a
+  fix.
+  \item A presigned URL leaks in a chat log. What limits the damage, by
+  design?
+  \item What changes --- and what does not --- when this code moves from
+  MinIO to real S3?
+\end{enumerate}
+\end{quiz}

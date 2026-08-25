@@ -1,0 +1,91 @@
+\chapter{The Project Map}
+
+TeacherSupporter is a course-management platform built as Spring Cloud
+microservices: teachers manage courses, students, assignments and
+submissions; a dictionary service serves vocabulary lookups; registration
+and login (password, Google OAuth2, and TOTP two-factor) live in a
+dedicated auth service; e-mail notifications flow through Kafka. It is
+deliberately built with the ``classic'' Spring Cloud stack --- Eureka,
+Config Server, Spring Cloud Gateway --- because that stack still runs in a
+great many enterprises, and understanding it makes the cloud-native
+replacements (Chapter~26) meaningful rather than magical.
+
+\section*{The cast}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lllp{4.2cm}@{}}
+\toprule
+Service & Port & Backing store & Job \\
+\midrule
+config-server & 8888 & --- (classpath) & serves every service's config \\
+discovery-server & 8761 & --- & Eureka registry \\
+api-gateway & 8080 & --- & single entry point, JWT check \\
+auth-service & 8081 & Postgres \code{ts\_auth} & accounts, JWT, OAuth2, 2FA \\
+course-service & 8082 & Postgres \code{ts\_course}, MinIO & courses, students, files \\
+dictionary-service & 8083 & MongoDB & vocabulary lookups \\
+notification-service & 8084 & --- (Kafka in) & events $\rightarrow$ e-mail \\
+frontend & 3000 & --- & web UI (React) \\
+\bottomrule
+\end{tabular}
+\caption{The eight deployables and what they own.}
+\end{table}
+
+\section*{One request, end to end}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4.5mm and 9mm]
+  \node[boxdark] (browser) {Browser};
+  \node[box, right=of browser] (traefik) {Traefik\\\scriptsize Ingress};
+  \node[box, right=of traefik] (gw) {api-gateway\\\scriptsize JWT check};
+  \node[box, right=of gw] (svc) {course-service};
+  \node[boxfill, below=of svc] (pg) {Postgres};
+  \node[boxfill, left=of pg] (minio) {MinIO};
+  \node[box, above=of gw] (eureka) {Eureka};
+  \node[box, above=of svc] (config) {config-server};
+  \draw[flow] (browser) -- node[lbl,above]{\scriptsize http://ts.local} (traefik);
+  \draw[flow] (traefik) -- node[lbl,above]{\scriptsize /api/*} (gw);
+  \draw[flow] (gw) -- node[lbl,above]{\scriptsize lb://} (svc);
+  \draw[flow] (svc) -- (pg);
+  \draw[flow] (svc) -- (minio);
+  \draw[flowdash] (gw) -- node[lbl,left]{\scriptsize where is it?} (eureka);
+  \draw[flowdash] (svc) -- node[lbl,right]{\scriptsize config at boot} (config);
+\end{tikzpicture}
+\caption{The request path this book keeps returning to.}
+\end{figure}
+
+Every chapter illuminates one link of this chain. Part~I is the boxes on
+the right; Part~II the data stores; Part~III the Kafka path (not drawn ---
+it carries events, not requests); Parts~IV--VI are how all of it gets
+packaged, run, and shipped.
+
+\section*{Where things live in the repository}
+
+\begin{lstlisting}
+TeacherSupporter/
+  pom.xml                  parent: modules, shared plugin config (Jib!)
+  common/                  shared DTOs and events
+  config-server/           + src/main/resources/configurations/*.yml
+  discovery-server/        api-gateway/        auth-service/
+  course-service/          dictionary-service/ notification-service/
+  frontend/
+  docker-compose.yml       local dev stack
+  Jenkinsfile              the CI/CD pipeline (Chapter 23)
+  deploy/
+    jenkins/               Jenkins controller image + run script
+    k8s/
+      create-secrets.sh    secrets are made, not committed
+      jenkins-rbac.yaml    what Jenkins may touch in the cluster
+      base/                every Kubernetes manifest (Part V)
+  docs/                    design docs, runbooks, and this book
+\end{lstlisting}
+
+\section*{The machine underneath}
+
+Everything deploys to \code{ts-server}: a repurposed laptop running
+Ubuntu~24.04 with 2 physical cores, 19.4\,GB RAM and a SATA SSD, reachable
+from Windows over Tailscale. It runs k3s (a single-node Kubernetes),
+a Docker-hosted Jenkins, and a local image registry. The constraint that
+shapes almost every operational decision in this book is \emph{CPU, not
+memory}: two cores means builds and demos must not overlap.

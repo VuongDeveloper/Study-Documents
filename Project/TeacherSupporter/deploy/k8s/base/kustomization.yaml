@@ -11,10 +11,21 @@ resources:
   # would be Forbidden. The namespace is created once by create-secrets.sh
   # (or `kubectl apply -f namespace.yaml` by an admin).
   - postgres-course.yaml
+  - postgres-auth.yaml
+  - mongodb.yaml
   - minio.yaml
+  # kafka.yaml requires the Strimzi operator (one-time admin step:
+  # ../install-strimzi.sh) -- without its CRDs, apply fails on kind Kafka.
+  - kafka.yaml
+  - kafka-topics.yaml
+  - maildev.yaml
   - config-server.yaml
   - discovery-server.yaml
   - course-service.yaml
+  - auth-service.yaml
+  - dictionary-service.yaml
+  - notification-service.yaml
+  - api-gateway.yaml
 
 # Stamped onto every object, so `kubectl delete -l part-of=teacher-supporter`
 # cleans up the whole slice without touching kube-system.

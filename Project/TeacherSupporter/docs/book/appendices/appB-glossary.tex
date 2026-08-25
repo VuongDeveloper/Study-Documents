@@ -1,0 +1,101 @@
+\chapter{Glossary}
+\label{app:glossary}
+
+\newcommand{\gloss}[2]{\item[#1] #2}
+\begin{description}\setlength{\itemsep}{2pt}
+\gloss{Actuator}{Spring Boot's operational endpoints (\code{/actuator/health},
+  \code{/metrics}, \code{/prometheus}); exposure and authorization are
+  separate decisions (Ch.\,1).}
+\gloss{Advertised listener}{The address a Kafka broker tells clients to
+  use after bootstrap --- the usual cause of connects-then-times-out
+  (Ch.\,10).}
+\gloss{Artifact}{Anything a build produces worth keeping (jar, image,
+  report); must be immutable and traceable (Ch.\,21).}
+\gloss{Auto-configuration}{Spring Boot conditionally applying
+  configuration based on classpath, properties, and user beans (Ch.\,1).}
+\gloss{Bootstrap servers}{The initial Kafka addresses a client contacts
+  to fetch metadata; all later traffic uses advertised listeners
+  (Ch.\,10).}
+\gloss{ClusterIP}{Default Service type: a stable virtual IP reachable
+  only inside the cluster (Ch.\,18).}
+\gloss{Consumer group}{A named team of Kafka consumers splitting a
+  topic's partitions; each group keeps its own offsets (Ch.\,10).}
+\gloss{Controller (k8s)}{A reconciliation loop converging actual state
+  to desired state for one kind of object (Ch.\,14).}
+\gloss{CrashLoopBackOff}{Pod status: the container keeps exiting;
+  restart delay doubles each time (Ch.\,24).}
+\gloss{CRD / Operator}{Custom resource kinds plus a controller for them
+  --- how Strimzi manages Kafka declaratively (Ch.\,25).}
+\gloss{Dead-letter topic}{Where a consumer routes messages that failed
+  processing repeatedly (Ch.\,11).}
+\gloss{Deployment}{Workload controller for interchangeable replicas;
+  manages ReplicaSets; enables rolling updates and rollback (Ch.\,15).}
+\gloss{Digest}{The immutable content hash of an image
+  (\code{@sha256:...}); tags move, digests do not (Ch.\,13).}
+\gloss{Endpoint (k8s)}{A Ready pod backing a Service; the live list is
+  maintained by label selector and readiness (Ch.\,18).}
+\gloss{Eureka}{Netflix/Spring Cloud service registry: registration,
+  heartbeats, client-side caching (Ch.\,3).}
+\gloss{Flyway}{Versioned, immutable SQL migrations applied at startup
+  and recorded in a history table (Ch.\,7).}
+\gloss{GitOps}{Deployment model where an in-cluster agent pulls desired
+  state from git and converges the cluster to it (Ch.\,26).}
+\gloss{Ingress}{L7 HTTP routing object (host/path $\rightarrow$
+  Service), executed by an Ingress controller such as Traefik
+  (Ch.\,18).}
+\gloss{Jib}{Maven plugin building layered OCI images without a Docker
+  daemon (Ch.\,13).}
+\gloss{JWT}{Signed, self-contained identity token:
+  header.payload.signature; validated without a database (Ch.\,5).}
+\gloss{KRaft}{Kafka's built-in Raft consensus replacing ZooKeeper
+  (Ch.\,10).}
+\gloss{kubelet}{The per-node agent that runs pods and executes probes
+  (Ch.\,14).}
+\gloss{Kustomize}{Template-free manifest composition: bases, overlays,
+  patches; built into kubectl (Ch.\,20).}
+\gloss{Liveness probe}{``Restart me if this fails'' --- the probe to be
+  most conservative with (Ch.\,17).}
+\gloss{Namespace}{Cluster partition; scope for names and RBAC
+  (Ch.\,14).}
+\gloss{OOMKilled}{Exit 137: the kernel killed the container for
+  exceeding its memory limit; no application trace exists (Ch.\,17).}
+\gloss{Outbox pattern}{Making DB-write + event-publish effectively
+  atomic by writing the event to a table in the same transaction
+  (Ch.\,11).}
+\gloss{Partition}{Kafka's unit of ordering and parallelism; an ordered
+  immutable record sequence (Ch.\,10).}
+\gloss{Poison pill}{A message that fails deserialization forever,
+  stalling its partition unless error handling skips it (Ch.\,11).}
+\gloss{Presigned URL}{A time-limited, signed link letting a browser
+  access one object directly on S3/MinIO (Ch.\,9).}
+\gloss{Probe (startup/readiness/liveness)}{kubelet health checks
+  gating restart, traffic, and boot grace respectively (Ch.\,17).}
+\gloss{PV / PVC / StorageClass}{Provisioned storage, a workload's
+  claim on it, and the factory that makes PVs on demand (Ch.\,19).}
+\gloss{RBAC}{Role-based access control: ServiceAccount (identity) +
+  Role (verbs on resources) + RoleBinding (the join) (Ch.\,22).}
+\gloss{Reconciliation}{The control loop: compare desired and actual
+  state, act on the difference, forever (Ch.\,14).}
+\gloss{Registry}{Image storage speaking the Docker/OCI protocol; the
+  interface between builder and cluster (Ch.\,13).}
+\gloss{Relaxed binding}{Spring's mapping of
+  \code{SPRING\_DATASOURCE\_URL} to \code{spring.datasource.url}
+  (Ch.\,1).}
+\gloss{ReplicaSet}{The counter keeping N pods of one template alive;
+  managed by Deployments, kept for rollback (Ch.\,15).}
+\gloss{Rolling update}{Replacing pods incrementally, gated on
+  readiness, so service never fully stops (Ch.\,15).}
+\gloss{Secret (k8s)}{Namespaced key/value object for credentials;
+  base64-encoded, protected by RBAC not cryptography (Ch.\,16).}
+\gloss{Service (k8s)}{Stable name + virtual IP over a label-selected,
+  readiness-filtered set of pods (Ch.\,18).}
+\gloss{ServiceAccount}{A non-human identity for API access --- what
+  Jenkins deploys as (Ch.\,22).}
+\gloss{StatefulSet}{Workload controller for stateful replicas: stable
+  names, per-replica PVCs, ordered replacement (Ch.\,15).}
+\gloss{Trusted edge}{Gateway validates JWTs once and forwards identity
+  headers; services trust them --- valid only if no path bypasses the
+  gateway (Ch.\,5).}
+\gloss{TOTP}{Time-based one-time passwords: shared secret + clock,
+  RFC 6238 (Ch.\,5).}
+\end{description}

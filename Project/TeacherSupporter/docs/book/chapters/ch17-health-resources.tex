@@ -1,0 +1,156 @@
+\chapter{Health Probes and Resource Management}
+\label{ch:probes}
+
+This chapter is the operational heart of Part~V: how the kubelet decides
+a pod is alive and ready, and how the scheduler and kernel share two
+cores among a dozen JVMs. Nearly every line was learned by watching a
+real pod misbehave.
+
+\section{The three probes}
+
+\begin{description}
+  \item[startupProbe] ``still booting --- be patient.'' While it fails,
+  the other probes are suspended. Exhaust its budget and the container
+  is restarted.
+  \item[readinessProbe] ``may traffic come \emph{right now}?'' Failing
+  pulls the pod out of Service endpoints --- no restart, no drama, just
+  no new requests until it passes again.
+  \item[livenessProbe] ``is the process beyond saving?'' Failing
+  \emph{restarts} the container. The dangerous one.
+\end{description}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 12mm]
+  \node[box] (boot) {starting\\\scriptsize startup probe failing};
+  \node[boxfill, right=of boot] (ready) {Ready\\\scriptsize in Service endpoints};
+  \node[box, right=of ready] (notready) {not Ready\\\scriptsize removed from endpoints};
+  \draw[flow] (boot) -- node[lbl,above]{startup passes} (ready);
+  \draw[flow, bend left=18] (ready) to node[lbl,above]{readiness fails} (notready);
+  \draw[flow, bend left=18] (notready) to node[lbl,below]{readiness passes} (ready);
+  \draw[flow, bend right=25] (boot.south) to node[lbl,below]{budget exhausted: restart} ++(0,-0.75);
+\end{tikzpicture}
+\caption{The pod's life as the kubelet sees it.}
+\end{figure}
+
+From \code{course-service.yaml}:
+
+\begin{lstlisting}[language=yaml]
+startupProbe:
+  httpGet: { path: /v3/api-docs, port: http }   (*@\co{1}@*)
+  periodSeconds: 10
+  failureThreshold: 12                          (*@\co{2}@*)
+readinessProbe:
+  httpGet: { path: /v3/api-docs, port: http }
+  periodSeconds: 5
+  failureThreshold: 3
+# no livenessProbe                              (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The probe-path decision. \code{/actuator/health} is the
+  purpose-built endpoint --- but course-service and auth-service do not
+  permit it through Spring Security, so it answers 401 and the kubelet
+  counts that as failure. The one unauthenticated path that only answers
+  200 \emph{after the full context is up} --- Flyway migrated, beans
+  built --- is springdoc's \code{/v3/api-docs}. Dictionary-service and
+  the gateway \emph{do} permit actuator and probe it properly; and
+  notification-service has no Spring Security at all, so its health
+  endpoint is open by default --- three services, three answers to the
+  same question. Rule:
+  a probe path must be unauthenticated \emph{and} a true readiness
+  signal; a \code{tcpSocket} check passing the moment Tomcat binds is
+  neither.
+  \item[\co{2}] $12 \times 10$\,s = two minutes of boot grace --- sized
+  to a JVM cold-starting on two contended cores.
+  \item[\co{3}] Deliberate absence. Liveness kills; the only thing it
+  would catch beyond readiness is a truly wedged JVM --- rare --- while a
+  long GC pause on a loaded 2-core box could fail the probe and kill a
+  \emph{healthy} pod. Add liveness when you have observed the hang it
+  is for.
+\end{description}
+
+\begin{pitfall}[the restart loop that creates itself]
+Symptom: a service restarts every few minutes under load, each restart
+making the load worse. Cause: an aggressive liveness probe timing out
+during GC pauses or slow downstream calls --- the probe \emph{causes}
+the outage it was meant to detect. This failure mode is why
+``no liveness probe'' is a defensible default and why liveness, when
+added, should check only ``is the event loop responding,'' never
+downstream dependencies.
+\end{pitfall}
+
+\section{Requests, limits, and the JVM}
+
+\begin{lstlisting}[language=yaml]
+resources:
+  requests: { memory: 512Mi, cpu: 200m }   (*@\co{1}@*)
+  limits: { memory: 768Mi }                (*@\co{2}@*)
+env:
+  - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" } (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \emph{Requests} are the scheduler's accounting: the pod
+  is placed only where 512\,Mi and 0.2 CPU are unclaimed. Requests
+  \emph{reserve}, they do not cap.
+  \item[\co{2}] \emph{Limits} are kernel-enforced ceilings. Exceed the
+  memory limit and the process is OOM-killed --- status
+  \code{OOMKilled}, exit code 137, no Java exception, no log line. Note
+  the asymmetry: a memory limit, but \emph{no CPU limit} --- next
+  decision box.
+  \item[\co{3}] The container-aware JVM sizes its heap as a fraction of
+  the \emph{container's} memory limit: 75\% of 768\,Mi for heap, the
+  rest for metaspace, threads, and off-heap. Without this, defaults
+  leave either waste or an OOM-kill margin of zero.
+\end{description}
+
+\begin{decision}[why no CPU limit]
+CPU limits throttle: a container over its quota is paused until the
+next scheduling period --- and a starting JVM is exactly when a service
+wants every cycle (class loading, JIT). Throttled startup turns 60
+seconds into 200 and fails the startup probe: the limit manufactures
+the failure. Unlike memory, CPU is compressible --- contention slows
+things instead of killing them --- so the pattern used here is standard
+advice: \textbf{always request CPU, rarely limit it}. Memory gets a
+limit because the failure mode of unbounded memory is the kernel
+killing \emph{someone}, and you want the boundary predictable.
+\end{decision}
+
+\begin{hardware}
+The requests across all services sum to roughly what 19\,GB minus
+Jenkins, k3s, and the datastores can hold --- deliberately. Requests are
+promises to the scheduler; over-promising on a single node means pods
+that never schedule (\code{Pending} forever), under-promising means
+OOM roulette. On one node you are doing capacity planning by hand;
+a cloud autoscaler turns the same arithmetic into node-pool sizing.
+\end{hardware}
+
+\begin{handson}[watch a startup through the probe's eyes]
+\begin{lstlisting}[language=bash]
+kubectl -n ts delete pod -l app=course-service
+kubectl -n ts get pods -w
+# Running 0/1  <- startup probe still failing; no traffic yet
+# Running 1/1  <- /v3/api-docs answered; endpoints updated
+kubectl -n ts describe pod -l app=course-service | tail -n 12
+\end{lstlisting}
+The gap between \code{0/1} and \code{1/1} is Flyway plus context
+startup --- the window in which, probe-less, requests would have hit a
+half-started service.
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item For each probe: what does failing it do, and which is safe to
+  be aggressive with?
+  \item Why is \code{/v3/api-docs} an honest readiness signal for
+  course-service while \code{tcpSocket: 8082} is a lie? What makes
+  \code{/actuator/health} unusable there, and usable on
+  dictionary-service?
+  \item A pod shows \code{OOMKilled}, exit 137, clean logs. Explain the
+  mechanism and why no Java exception exists. First two things to check?
+  \item Requests vs.\ limits: which does the scheduler read, which does
+  the kernel enforce, and why does this project limit memory but not
+  CPU?
+\end{enumerate}
+\end{quiz}

@@ -1,0 +1,247 @@
+\chapter{Kafka in the Cluster: Strimzi and the Mail Flow}
+\label{ch:strimzi}
+
+Milestone~6 moves the broker of Chapter~10 from Compose into k3s and
+deploys the last service --- notification-service --- so the first
+end-to-end \emph{event} flow runs in the cluster: register a user,
+receive a mail. It is also the chapter where Chapter~14's reconciliation
+idea grows its most important extension: the \emph{operator}.
+
+\section{Operators and custom resources}
+
+Kubernetes ships controllers for its built-in kinds --- Deployments,
+Services. An \emph{operator} is a controller for kinds you add: a
+\emph{CustomResourceDefinition} (CRD) teaches the API server a new
+noun (\code{Kafka}, \code{KafkaTopic}), and the operator's
+reconciliation loop turns instances of it into ordinary objects ---
+pods, Services, ConfigMaps --- and keeps them converged. Operational
+knowledge that used to live in runbooks (how to roll a broker safely,
+how to compute advertised listeners, how to add a partition) is
+encoded in the operator's code. Strimzi is the Kafka operator; the
+pattern is universal (Postgres operators, Prometheus operator, cert-manager).
+
+\section{Installing the operator: an admin act}
+
+\begin{lstlisting}[language=bash]
+# deploy/k8s/install-strimzi.sh (abridged)
+kubectl apply --server-side --force-conflicts \
+  -f "https://strimzi.io/install/latest?namespace=${NS}" -n "$NS"   (*@\co{1}@*)
+kubectl -n "$NS" rollout status deployment/strimzi-cluster-operator
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The bundle contains the CRDs, the operator Deployment,
+  and its RBAC --- much of it \emph{cluster-scoped}. Two consequences:
+  it is applied by an admin, not by Jenkins (whose Role, Chapter~22,
+  stops at the namespace), and it is applied \emph{server-side}
+  because the CRD documents are too large for the client-side
+  last-applied annotation. Idempotent, so it doubles as the upgrade
+  command. The \code{?namespace=} parameter scopes the operator to
+  watch \code{ts} only.
+\end{description}
+
+The kustomization (Chapter~20) lists \code{kafka.yaml}, but that file
+cannot apply until this script has run once --- the third member of the
+``admin prerequisites'' set, after the namespace and the secrets.
+
+\begin{pitfall}[no matches for kind ``Kafka'' in version v1beta2]
+Symptom: applying a Kafka manifest copied from any tutorial fails with
+this error even though the operator is installed and healthy. Cause:
+Strimzi~1.x serves only \code{kafka.strimzi.io/v1}; the
+\code{v1beta2} version that a decade of blog posts use is gone.
+Check what a CRD actually serves before trusting an example:
+\code{kubectl get crd kafkas.kafka.strimzi.io -o jsonpath=\{.spec.versions[*].name\}}.
+This project hit it live on installation day.
+\end{pitfall}
+
+\section{The cluster, declared}
+
+\begin{lstlisting}[language=yaml]
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool                        (*@\co{1}@*)
+metadata:
+  name: dual-role
+  labels: { strimzi.io/cluster: ts-kafka } (*@\co{2}@*)
+spec:
+  replicas: 1
+  roles: [controller, broker]
+  storage: { type: persistent-claim, size: 5Gi, deleteClaim: false } (*@\co{3}@*)
+  resources:
+    requests: { memory: 768Mi, cpu: 200m }
+    limits: { memory: 1Gi }
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: ts-kafka
+spec:
+  kafka:
+    listeners:
+      - { name: plain, port: 9092, type: internal, tls: false }  (*@\co{4}@*)
+    config:
+      offsets.topic.replication.factor: 1  (*@\co{5}@*)
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      log.retention.hours: 168
+    jvmOptions: { -Xms: 256m, -Xmx: 512m } (*@\co{6}@*)
+  entityOperator:
+    topicOperator: {}                      (*@\co{7}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Two objects: the \emph{pool} says where Kafka runs
+  (replicas, roles, storage, resources); the \code{Kafka} resource says
+  how it behaves. One dual-role KRaft node is the Kubernetes spelling of
+  Compose's \code{process.roles=broker,controller}.
+  \item[\co{2}] The label joins pool to cluster; the operator matches on
+  it. A mismatch is silent --- the pool simply never materializes.
+  \item[\co{3}] A PVC via local-path, exactly like the databases
+  (Chapter~19). \code{deleteClaim: false}: deleting the Kafka resource
+  keeps the log --- the same asymmetry StatefulSets have by default.
+  \item[\co{4}] Compare with the three-listener, two-advertised-address
+  block in \code{docker-compose.yml}: gone. You state \emph{one
+  internal listener}; the operator computes bootstrap and per-broker
+  Services, the advertised addresses, and the KRaft controller listener.
+  Chapter~10's maze was operational knowledge; it now lives in the
+  operator.
+  \item[\co{5}] Single broker means every replication factor must be 1,
+  or the first topic creation fails asking for brokers that do not
+  exist.
+  \item[\co{6}] Kafka's default heap assumes a server; half a GiB
+  serves a homelab trickle and leaves memory for the JVM services.
+  \item[\co{7}] The entity operator's topic half watches
+  \code{KafkaTopic} objects and reconciles them into real topics. The
+  user half is omitted: no authentication, no users to manage.
+\end{description}
+
+Strimzi names the bootstrap Service \code{<cluster>-kafka-bootstrap};
+every producer and consumer therefore gets
+\code{SPRING\_KAFKA\_BOOTSTRAP\_SERVERS=ts-kafka-kafka-bootstrap:9092}
+in its Deployment --- the \code{localhost:9092} config default of
+Part~III overridden the way every other address was.
+
+\begin{decision}[operator, not a hand-written StatefulSet]
+A plain KRaft StatefulSet (one pod, one PVC, the compose env block
+copied in) would cost less memory --- no operator, no entity operator
+--- and it is the honest fallback if CPU contention ever bites. The
+operator wins because it is what Kubernetes shops run (Red Hat sells it
+as AMQ Streams), because topics become declarative objects, and because
+broker upgrades and rolling restarts become someone else's tested code.
+Learning it is the point; the fallback stays documented in
+\code{STACK-K3S-JENKINS.md}.
+\end{decision}
+
+\section{Topics as objects}
+
+\begin{lstlisting}[language=yaml]
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: ts.user.registered
+  labels: { strimzi.io/cluster: ts-kafka }
+spec: { partitions: 1, replicas: 1 }
+\end{lstlisting}
+
+Kafka would auto-create these on first use; declaring them makes
+partition count a reviewed decision, removes the day-one race between
+producer and topic, and turns \code{kubectl get kafkatopics} into the
+inventory of every event contract in the system (four, matching
+Chapter~6's table). One partition per topic: total order, which
+trivially preserves the per-user ordering the publishers key for.
+Partitions can be added later, never removed.
+
+\section{The last service, and its mailbox}
+
+notification-service's manifest is the standard Deployment of
+Chapter~15 with three specifics: the bootstrap address above;
+\code{SPRING\_MAIL\_HOST=maildev} / \code{PORT=1025} overriding the
+config's \code{\$\{MAIL\_HOST:localhost\}} default via relaxed binding;
+and probes on \code{/actuator/health} --- this service has no Spring
+Security at all, so the endpoint is open by default (the third answer
+to Chapter~17's probe question). Maildev is a tiny Deployment plus
+Service (ports 1025 SMTP, 1080 web); it delivers nothing and shows
+everything it caught. No Ingress: it is an operator's tool, reached by
+\code{port-forward}.
+
+\begin{pitfall}[NotReady --- FatalProblem, while the pod is Running]
+Symptom: minutes after applying, \code{kubectl get kafka} shows
+\code{READY} empty and a condition reading ``Pod is unschedulable or is
+not starting'' --- yet \code{get pods} shows the broker \code{1/1
+Running}. Cause: the operator's reconciliation timed out while the
+600\,MB Kafka image was still pulling over Wi-Fi, and wrote a failure
+status; the \emph{next} periodic loop (every two minutes) observed the
+running pod and flipped it to Ready. Operator status is eventually
+honest. Before reacting to a red condition, check the pod it is
+describing --- and check the operator log, where
+``reconciled'' lines show the loops still turning.
+\end{pitfall}
+
+\begin{hardware}
+Operator $+$ broker $+$ entity operator cost about 1.5\,GB here, with
+the broker's heap capped at 512\,MiB. The first image pull is the
+expensive part --- expect ten minutes on residential Wi-Fi, and the
+stale-status pitfall above. Everything afterwards is fast: the image
+is cached on the node, which the smoke test below exploits.
+\end{hardware}
+
+\begin{handson}[prove the broker, then prove the flow]
+A throwaway pod with the Kafka CLI, in the same network position as
+the services, using the image the node already holds:
+\begin{lstlisting}[language=bash]
+kubectl -n ts run kafka-smoke --rm -i --restart=Never \
+  --image=quay.io/strimzi/kafka:1.2.0-kafka-4.3.1 -- sh -c '
+  B=ts-kafka-kafka-bootstrap:9092
+  bin/kafka-topics.sh --bootstrap-server $B --create --topic smoke \
+      --partitions 1 --replication-factor 1
+  echo hello | bin/kafka-console-producer.sh --bootstrap-server $B --topic smoke
+  bin/kafka-console-consumer.sh --bootstrap-server $B --topic smoke \
+      --from-beginning --max-messages 1 --timeout-ms 20000
+  bin/kafka-topics.sh --bootstrap-server $B --delete --topic smoke'
+\end{lstlisting}
+Use a scratch topic, not a real one: a plain-text ``hello'' on
+\code{ts.user.registered} is a poison pill for the JSON consumer
+(Chapter~11) --- skipped gracefully thanks to
+\code{ErrorHandlingDeserializer}, but why find out in production. Then
+the real flow, once the pipeline has deployed the services:
+\begin{lstlisting}[language=bash]
+kubectl -n ts port-forward svc/maildev 1080:1080 &
+curl -X POST http://ts.local/api/auth/register -H 'Content-Type: application/json' \
+  -d '{"email":"t@example.com","password":"Passw0rd!","fullName":"Test"}'
+# open http://localhost:1080 -- the activation mail is there
+kubectl -n ts logs deploy/notification-service | grep -i registered
+\end{lstlisting}
+That request crosses every part of this book: Ingress $\rightarrow$
+gateway $\rightarrow$ auth-service $\rightarrow$ Postgres $\rightarrow$
+Kafka $\rightarrow$ notification-service $\rightarrow$ SMTP.
+\end{handson}
+
+\section{Outside the project}
+
+Managed Kafka --- AWS MSK, Confluent Cloud, Azure Event Hubs' Kafka
+endpoint --- is the operator's operator: the same \code{Kafka}-shaped
+declaration made in a cloud console, with brokers you never see.
+Migration from here is a bootstrap string plus SASL/TLS on the
+listener; the \code{KafkaTopic} objects would give way to Terraform
+resources saying exactly the same thing. The other lesson to carry: the
+operator pattern is how Kubernetes hosts \emph{any} stateful platform
+component --- Postgres (CloudNativePG), Redis, Elasticsearch --- and
+having installed, mis-versioned, and status-debugged one, you know the
+shape of all of them.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Define an operator in terms of Chapter~14's controllers, and
+  name the two kinds of object Strimzi added to this cluster.
+  \item Why is \code{install-strimzi.sh} an admin step while
+  \code{kafka.yaml} is applied by Jenkins? Which RBAC concept draws the
+  line?
+  \item List three things Compose's Kafka block configured by hand that
+  the \code{Kafka} resource does not mention, and say who computes them
+  now.
+  \item You see \code{NotReady / FatalProblem} on the Kafka resource.
+  What two things do you check before acting, and why might the status
+  be wrong?
+  \item Why declare topics as objects when Kafka auto-creates them, and
+  why one partition each?
+\end{enumerate}
+\end{quiz}

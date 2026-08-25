@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: auth-service }
+  template:
+    metadata:
+      labels: { app: auth-service }
+    spec:
+      containers:
+        - name: auth-service
+          image: localhost:5000/auth-service:1.0.0-SNAPSHOT
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 8081 }
+          env:
+            - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
+            - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE, value: "http://discovery-server:8761/eureka/" }
+            - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+            - { name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://postgres-auth:5432/ts_auth" }
+
+            # Strimzi's bootstrap Service (milestone 6). Producer-only here:
+            # registration/activation/admin-provisioned events.
+            - { name: SPRING_KAFKA_BOOTSTRAP_SERVERS, value: "ts-kafka-kafka-bootstrap:9092" }
+
+            # Google's OAuth callback must round-trip through the browser, so
+            # it uses the EXTERNAL name (ts.local via Traefik -> gateway ->
+            # here), not a cluster-internal one. This exact URL must also be
+            # registered under "Authorized redirect URIs" in the Google Cloud
+            # console, or Google refuses with redirect_uri_mismatch.
+            - { name: SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_REDIRECT_URI,
+                value: "http://ts.local/login/oauth2/code/google" }
+
+            # Zipkin arrives with observability (milestone 8).
+            - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
+
+            - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
+          envFrom:
+            - secretRef: { name: postgres-auth-app }
+            # Signs JWTs with the same key the gateway validates with.
+            - secretRef: { name: jwt }
+            - secretRef: { name: google-oauth }
+
+          # /actuator/health is NOT usable here: this service's SecurityConfig
+          # permitAll list covers /register, /login, ... and /v3/api-docs, but
+          # not /actuator/** -- so health answers 401 and the kubelet would
+          # restart a perfectly healthy pod forever. Same fallback as
+          # course-service: /v3/api-docs only turns 200 after the full context
+          # (Flyway migration included) is up, which is an honest ready signal.
+          startupProbe:
+            httpGet: { path: /v3/api-docs, port: http }
+            periodSeconds: 10
+            failureThreshold: 12
+          readinessProbe:
+            httpGet: { path: /v3/api-docs, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests: { memory: 512Mi, cpu: 200m }
+            limits: { memory: 768Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+spec:
+  selector: { app: auth-service }
+  ports:
+    - { name: http, port: 8081, targetPort: 8081 }

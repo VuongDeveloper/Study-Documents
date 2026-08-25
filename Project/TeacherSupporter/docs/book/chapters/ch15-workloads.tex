@@ -1,0 +1,124 @@
+\chapter{Workloads: Pods, Deployments, StatefulSets}
+\label{ch:workloads}
+
+\section{Pods}
+
+The pod is the unit Kubernetes schedules: one or more containers sharing
+a network namespace (one IP, \code{localhost} between them) and volumes.
+Almost every pod here is a single container; the multi-container
+patterns (sidecars for proxies or log shippers) matter when you meet a
+service mesh. Pods are \emph{mortal by design} --- they are never healed,
+only replaced, and their IP dies with them. Everything else in Part~V
+--- controllers, Services, PVCs --- exists to build durable behavior out
+of disposable pods.
+
+\section{Deployments and the rollout}
+
+You never create bare pods. A \emph{Deployment} declares ``N replicas
+of this pod template''; it manages a \emph{ReplicaSet} (the counter),
+which manages the pods. The three-layer indirection is what makes
+updates elegant: change the template (a new image tag), and the
+Deployment creates a \emph{new} ReplicaSet, scaling it up while the old
+scales down:
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3.5mm and 9mm]
+  \node[box] (d) {Deployment\\\scriptsize course-service};
+  \node[box, below left=of d] (rs1) {ReplicaSet (old)\\\scriptsize image :a1b2c3d};
+  \node[box, below right=of d] (rs2) {ReplicaSet (new)\\\scriptsize image :e4f5a6b};
+  \node[boxfill, below=of rs1] (p1) {pod \scriptsize(terminating)};
+  \node[boxfill, below=of rs2] (p2) {pod \scriptsize(starting)};
+  \draw[flow] (d) -- (rs1); \draw[flow] (d) -- (rs2);
+  \draw[flowdash] (rs1) -- (p1); \draw[flow] (rs2) -- (p2);
+\end{tikzpicture}
+\caption{A rolling update mid-flight: two ReplicaSets, traffic shifting.}
+\end{figure}
+
+The rollout only proceeds as new pods become \emph{Ready}
+(Chapter~17's probes --- this is where they earn their keep), so a bad
+image stops the rollout instead of taking the service down; and
+\code{kubectl rollout undo} points back at the previous ReplicaSet,
+which is kept around precisely for this. The pipeline's
+\code{kubectl rollout status} (Chapter~23) is CI waiting on this
+machinery to conclude.
+
+With one replica --- this cluster --- a rolling update still means
+start-new-then-stop-old, a brief two-pod overlap costing a moment of
+double memory. \code{maxUnavailable}/\code{maxSurge} tune that dance at
+scale.
+
+\section{StatefulSets: when identity matters}
+
+For the databases, interchangeability is exactly wrong: whichever pod
+comes up must be \emph{the same Postgres} with \emph{the same data}. A
+StatefulSet provides what a Deployment refuses to: stable names
+(\code{postgres-course-0}, not a random suffix), per-replica PVCs via
+\code{volumeClaimTemplates} (Chapter~19) that survive the pod and
+re-attach to its successor, and ordered, one-at-a-time replacement.
+From \code{postgres-course.yaml}:
+
+\begin{lstlisting}[language=yaml]
+kind: StatefulSet
+spec:
+  serviceName: postgres-course
+  replicas: 1
+  volumeClaimTemplates:          # a PVC per replica, not per manifest
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 5Gi } }
+\end{lstlisting}
+
+The decision rule: does the \emph{process} hold state the next process
+must inherit? Databases yes; Spring services no --- their state lives in
+those databases, which is what made them Deployments, and what makes
+them scalable and rollable at all. (The JWT statelessness of
+Chapter~5 is this same property one layer up.)
+
+\begin{pitfall}[the Deployment-database data loss]
+Symptom: someone runs a database as a Deployment with a plain volume; it
+works for months; then a node problem creates a \emph{second} replica
+pointing at the same files, and the database corrupts. Cause: a
+Deployment's contract is ``interchangeable replicas'' and its rolling
+update briefly runs old and new \emph{simultaneously} --- fatal when
+both open the same data directory. StatefulSet ordering + per-replica
+claims exist to make this impossible. The lesson generalizes: choose
+the controller by its \emph{contract}, not by which YAML you saw first.
+\end{pitfall}
+
+\section{Other workload kinds}
+
+For completeness, the remaining controllers, none yet used here:
+\textbf{DaemonSet} (one pod per node --- log collectors, node metrics),
+\textbf{Job} (run to completion --- Chapter~7's Flyway-as-CI-step would
+be one), \textbf{CronJob} (Jobs on a schedule --- backups, Chapter~19's
+missing piece).
+
+\begin{handson}[watch a rollout happen]
+\begin{lstlisting}[language=bash]
+kubectl -n ts get rs -l app=course-service          # one ReplicaSet
+kubectl -n ts set image deployment/course-service \
+    course-service=localhost:5000/course-service:1.0.0-SNAPSHOT
+kubectl -n ts rollout status deployment/course-service
+kubectl -n ts get rs -l app=course-service          # two -- old kept at 0
+kubectl -n ts rollout undo deployment/course-service
+\end{lstlisting}
+The second \code{get rs} is the point: the old ReplicaSet still exists,
+scaled to zero --- the undo target, kept by default for the last ten
+revisions.
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Why does a Deployment manage ReplicaSets instead of pods
+  directly? What feature falls out of that indirection?
+  \item State the contract difference between Deployment and
+  StatefulSet in one sentence each, then classify: Eureka server, a
+  Redis cache, a Kafka broker, the api-gateway.
+  \item During a rolling update, what condition gates old-pod
+  termination, and which chapter's machinery provides it?
+  \item Explain the exact mechanism by which running Postgres under a
+  Deployment invites corruption where a StatefulSet does not.
+\end{enumerate}
+\end{quiz}

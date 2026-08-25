@@ -1,0 +1,127 @@
+\chapter{Document Data: MongoDB}
+\label{ch:mongodb}
+
+\section{The model}
+
+MongoDB stores \emph{documents} --- JSON-like structures (BSON) --- in
+\emph{collections}, without a fixed schema. Where Postgres normalizes a
+dictionary entry into rows across \code{words}, \code{definitions},
+\code{examples} tables joined by keys, Mongo stores the whole entry as
+one nested document:
+
+\begin{lstlisting}
+{ "word": "ubiquitous",
+  "phonetic": "yoo-BIK-wi-tuhs",
+  "meanings": [
+    { "partOfSpeech": "adjective",
+      "definitions": [
+        { "definition": "present everywhere",
+          "example": "smartphones are ubiquitous" } ] } ] }
+\end{lstlisting}
+
+\begin{decision}[why the dictionary is the Mongo service]
+A dictionary entry is read as a unit, written as a unit, and naturally
+nested --- the document model's best case. There are no cross-entry
+transactions and no joins to lose. Courses and enrollments, by contrast,
+are genuinely relational (a submission references a student \emph{and}
+an assignment; consistency between them matters), so they stay in
+Postgres. ``Polyglot persistence'' is this: pick per service, by data
+shape --- not one blessed database for everything, and not novelty for
+its own sake.
+\end{decision}
+
+\section{Spring Data MongoDB}
+
+The programming model mirrors JPA closely enough that the dictionary
+service is a good Rosetta stone: \code{@Document} instead of
+\code{@Entity}, \code{MongoRepository} instead of \code{JpaRepository},
+derived query methods identical in spirit. What disappears: Flyway and
+schema DDL (collections spring into being on first write), the dialect,
+and the pool tuning (the driver manages its own connection pool).
+What appears: the single connection URI.
+
+\section{The configuration --- all of it}
+
+Dictionary-service's entire data config is one line, plus its cluster
+override:
+
+\begin{lstlisting}[language=yaml]
+# configurations/dictionary-service.yml  (dev default)
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/ts_dictionary
+
+# deploy/k8s/base/dictionary-service.yaml  (the override)
+- name: SPRING_DATA_MONGODB_URI
+  value: "mongodb://mongodb:27017/ts_dictionary"
+\end{lstlisting}
+
+The URI carries host, port, database, and (when enabled) credentials and
+options --- one string to override per environment, which is exactly what
+the relaxed-binding machinery of Chapter~1 is for.
+
+\section{Schemaless cuts both ways}
+
+No migrations does not mean no schema --- it means the schema lives
+\emph{implicitly in the code}. Two documents written by two versions of
+the application can have different shapes in the same collection, and
+nothing but your reading code will notice. Disciplines that replace
+Flyway: keep document classes backward-readable (new fields optional),
+write data-fixing scripts for real shape changes, and validate at the
+boundary. Mongo can also enforce JSON Schema per collection ---
+opt-in, and unused here.
+
+\begin{pitfall}[the collection that was never created]
+Symptom: the service starts, queries run, everything returns empty ---
+no error anywhere. Cause: the URI pointed at a fresh database (a typo,
+or a new PVC in the cluster); Mongo silently created an empty
+\code{ts\_dictionary} on first touch. Postgres would have failed loudly
+(\code{database does not exist}); Mongo's create-on-write turns a wrong
+address into empty results. When a Mongo-backed service ``loses'' data,
+check \emph{which database it is talking to} before anything else:
+\code{kubectl exec} into the pod's node and run
+\code{mongosh --eval 'show dbs'}.
+\end{pitfall}
+
+\section{Operations in this cluster}
+
+The manifest (\code{deploy/k8s/base/mongodb.yaml}) follows the same
+StatefulSet pattern as Postgres (Chapter~15 explains the kind; 19 the
+storage), with two Mongo-specific notes, both from its comments: the
+readiness probe execs \code{mongosh --eval "db.adminCommand('ping')"} ---
+``accepting commands,'' not merely ``port open'' --- and it runs without
+authentication, acceptable only because it is a ClusterIP service with no
+Ingress: unreachable from outside the cluster. The moment that assumption
+changes (an exposed NodePort, multi-tenancy), auth comes first.
+
+\section{Outside the project}
+
+The managed version is MongoDB Atlas; the URI grows credentials and TLS
+and nothing else changes:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  data:
+    mongodb:
+      uri: mongodb+srv://app:${MONGO_PWD}@cluster0.abc.mongodb.net/ts_dictionary?retryWrites=true
+\end{lstlisting}
+
+For contrast, DynamoDB shows a document store with the opposite
+philosophy: schemaless like Mongo, but access patterns must be designed
+into the table (partition keys, no ad-hoc queries) --- a reminder that
+``NoSQL'' is a family of trade-offs, not one thing.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Which properties of the dictionary data make it a good document
+  case, and which properties of enrollments make them a bad one?
+  \item ``Schemaless'' moves schema enforcement from the database to
+  where? Name two disciplines that replace migrations.
+  \item Why does a wrong database name fail loudly in Postgres but
+  silently in Mongo, and which failure do you prefer in production?
+  \item The Mongo pod has no password while Postgres does, in the same
+  cluster. Reconstruct the reasoning and state the condition that
+  invalidates it.
+\end{enumerate}
+\end{quiz}

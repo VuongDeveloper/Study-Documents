@@ -15,6 +15,9 @@ PG_USER="${PG_USER:-postgres}"
 PG_PASSWORD="${PG_PASSWORD:-root}"
 MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASSWORD="${MINIO_PASSWORD:-minioadmin}"
+# Default matches the fallback baked into config-server's api-gateway.yml /
+# auth-service.yml so dev behaviour is unchanged. Override in anything public.
+JWT_SECRET="${JWT_SECRET:-mySecretKeyThatIsAtLeast256BitsLongForHS256Algorithm123456}"
 
 kubectl get namespace "$NS" >/dev/null 2>&1 || kubectl create namespace "$NS"
 
@@ -50,6 +53,34 @@ kubectl -n "$NS" create secret generic minio \
 kubectl -n "$NS" create secret generic minio-app \
   --from-literal=APP_S3_ACCESS_KEY="$MINIO_USER" \
   --from-literal=APP_S3_SECRET_KEY="$MINIO_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# --- postgres-auth, server side ---
+kubectl -n "$NS" create secret generic postgres-auth \
+  --from-literal=POSTGRES_USER="$PG_USER" \
+  --from-literal=POSTGRES_PASSWORD="$PG_PASSWORD" \
+  --from-literal=POSTGRES_DB=ts_auth \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# --- postgres-auth, client side (auth-service) ---
+kubectl -n "$NS" create secret generic postgres-auth-app \
+  --from-literal=SPRING_DATASOURCE_USERNAME="$PG_USER" \
+  --from-literal=SPRING_DATASOURCE_PASSWORD="$PG_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# --- google oauth (auth-service) ---
+# Real values come from .env / the environment; the placeholders keep the pod
+# bootable when they are absent -- Google login then fails at click time, not
+# the whole service at startup. Mirrors the ${GOOGLE_CLIENT_ID:placeholder}
+# defaults in config-server's auth-service.yml.
+kubectl -n "$NS" create secret generic google-oauth \
+  --from-literal=GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-placeholder}" \
+  --from-literal=GOOGLE_CLIENT_SECRET="${GOOGLE_CLIENT_SECRET:-placeholder}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# --- jwt, shared by api-gateway (validates) and auth-service (signs) ---
+kubectl -n "$NS" create secret generic jwt \
+  --from-literal=JWT_SECRET="$JWT_SECRET" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo

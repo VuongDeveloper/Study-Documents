@@ -1,0 +1,176 @@
+\chapter{The Pipeline, Line by Line}
+\label{ch:pipeline}
+
+Everything in this book converges on one 70-line Groovy file. A
+declarative Jenkinsfile lives in the repository it builds --- pipeline
+as code, versioned and reviewed like everything else.
+
+\section{Preamble and environment}
+
+\begin{lstlisting}
+pipeline {
+  agent any                                  (*@\co{1}@*)
+  options {
+    timestamps()
+    disableConcurrentBuilds()                (*@\co{2}@*)
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+  triggers { pollSCM('H/5 * * * *') }        (*@\co{3}@*)
+  environment {
+    JAVA_HOME = "${env.JDK25_HOME}"          (*@\co{4}@*)
+    PATH      = "${env.JDK25_HOME}/bin:${env.PATH}"
+    TAG       = "${env.GIT_COMMIT.take(7)}"  (*@\co{5}@*)
+    NS        = 'ts'
+    REGISTRY  = 'localhost:5000'
+    SERVICES  = 'config-server discovery-server course-service api-gateway auth-service dictionary-service notification-service'
+    MODULES   = 'common,config-server,discovery-server,course-service,api-gateway,auth-service,dictionary-service,notification-service'
+  }
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Any executor on the controller --- Chapter~22's
+  homelab compromise in one word.
+  \item[\co{2}] Two builds at once on two cores would thrash; queued
+  runs also collapse (a new commit during a build supersedes waiting
+  ones).
+  \item[\co{3}] Polling because NAT blocks webhooks. The \code{H} is a
+  hash-spread: ``some fixed minute in each 5,'' so many jobs don't all
+  poll at :00.
+  \item[\co{4}] The per-pipeline JDK switch the controller image
+  prepared: builds see Java\,25, Jenkins itself stays on 21.
+  \item[\co{5}] The deploy tag is the short git SHA --- every image
+  traceable to its commit, every deploy pinned to an immutable tag
+  (Chapter~13's tags-vs-digests lesson applied).
+  \item[\code{SERVICES}/\code{MODULES}] the pipeline's registry of what
+  exists: \code{MODULES} feeds Maven (comma-separated, includes
+  \code{common} which is built but produces no image);
+  \code{SERVICES} feeds kubectl (space-separated, deployables only).
+  Adding a service to the cluster means extending both --- the one
+  manual step per new service.
+\end{description}
+
+\section{The three stages}
+
+\begin{lstlisting}
+stage('Build') {
+  steps {
+    dir('Project/TeacherSupporter') {          (*@\co{1}@*)
+      sh 'mvn -B -DskipTests -pl ${MODULES} -am verify'  (*@\co{2}@*)
+    } } }
+stage('Push images') {
+  steps {
+    dir('Project/TeacherSupporter') {
+      sh 'mvn -B -pl ${MODULES} -am jib:build -Djib.to.tags=${TAG}'  (*@\co{3}@*)
+    } } }
+stage('Deploy') {
+  steps {
+    dir('Project/TeacherSupporter') {
+      withCredentials([file(credentialsId: 'kubeconfig-ts',
+                            variable: 'KUBECONFIG')]) {   (*@\co{4}@*)
+        sh '''
+          set -eu                                         (*@\co{5}@*)
+          kubectl apply -k deploy/k8s/base                (*@\co{6}@*)
+          for s in ${SERVICES}; do
+            kubectl -n ${NS} set image deployment/${s} \
+                ${s}=${REGISTRY}/${s}:${TAG}              (*@\co{7}@*)
+          done
+          for s in ${SERVICES}; do
+            kubectl -n ${NS} rollout status \
+                deployment/${s} --timeout=300s            (*@\co{8}@*)
+          done
+        '''
+      } } } }
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The repository root is a study monorepo; the project
+  lives in a subdirectory, so every stage \code{dir()}s into it.
+  \item[\co{2}] \code{-pl} (project list) + \code{-am} (also make
+  dependencies): build only the listed modules and what they need ---
+  monorepo economics on two cores. \code{-B} is batch mode (no
+  interactive output). \code{-DskipTests} is the consciously accepted
+  gate-weakening from Chapter~21's pitfall box.
+  \item[\co{3}] One command builds and pushes all seven images ---
+  Chapter~13 in a single line. \code{-Djib.to.tags} adds the SHA tag
+  alongside the SNAPSHOT tag.
+  \item[\co{4}] The file credential materializes as a temp file;
+  \code{KUBECONFIG} is the env var kubectl reads. Outside this block
+  the file does not exist; in the log its content never appears.
+  \item[\co{5}] Fail on any error and on unset variables --- without
+  it, a failed apply would be sailed past and ``deployed'' reported.
+  \item[\co{6}] Converge the cluster on the manifests --- idempotent
+  (Chapter~14), so it is safely re-run every build whether or not
+  anything changed.
+  \item[\co{7}] Repoint each Deployment at the SHA-tagged image. This
+  is what actually triggers rollouts --- and note the manifests
+  themselves keep the SNAPSHOT tag, so \emph{apply} alone would not
+  redeploy; the pipeline's pinning and the manifests' default coexist.
+  \item[\co{8}] The verification gate: block until each rollout
+  completes; fail the build if any pod never goes Ready within five
+  minutes. This line is what makes the pipeline's green mean
+  ``running,'' not ``commands executed'' --- it delegates truth to the
+  probes of Chapter~17.
+\end{description}
+
+Two loops, not one, is a small correctness point: all rollouts start
+first, then all are awaited --- otherwise service N's wait serializes
+service N+1's start, stretching total deploy time for no gain.
+
+\section{Failure handling}
+
+\begin{lstlisting}
+post {
+  success { echo "Deployed ${TAG} to namespace ${NS}." }
+  failure {
+    dir('Project/TeacherSupporter') {
+      withCredentials([...]) {
+        sh 'kubectl -n ${NS} get pods || true'
+      } } } }
+\end{lstlisting}
+
+On failure, the build log ends with a pod listing --- the first command
+a human would run, already run. The \code{|| true} keeps the
+diagnostic itself from masking the build's real exit status.
+
+\section{The same pipeline, elsewhere}
+
+For calibration, the identical shape as GitHub Actions:
+
+\begin{lstlisting}[language=yaml]
+on: { push: { branches: [main] } }        # webhook, not polling
+jobs:
+  deploy:
+    runs-on: ubuntu-latest                # disposable agent, not controller
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 25 }
+      - run: mvn -B -pl $MODULES -am verify
+      - run: mvn -B -pl $MODULES -am jib:build -Djib.to.tags=${GITHUB_SHA::7}
+      - run: kubectl apply -k deploy/k8s/base && ...
+        env: { KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }} }
+\end{lstlisting}
+
+Same stages, same tag scheme, same secret-binding idea. The
+differences are the infrastructure trade: GitHub's runners are
+disposable VMs (agents done right, for free) but they live on the
+internet --- so this variant would need the registry and cluster
+reachable from outside, the exact constraint that shaped the homelab
+design. Pipelines are portable; \emph{network topology is what actually
+differs between shops}.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Why tag deploys with the git SHA when the SNAPSHOT tag also
+  exists? Name the failure mode SNAPSHOT-only deploys invite
+  (Chapter~13) and what traceability the SHA adds.
+  \item Explain \code{-pl ... -am} and what it saves in a monorepo.
+  What breaks if you forget to extend \code{MODULES} for a new service?
+  \item Which single line makes this pipeline's success mean ``pods
+  are Ready,'' and which chapter's machinery does it lean on?
+  \item Why two loops in the deploy stage instead of
+  set-image-then-wait per service?
+  \item List three things that change and three that do not when this
+  Jenkinsfile is translated to GitHub Actions.
+\end{enumerate}
+\end{quiz}

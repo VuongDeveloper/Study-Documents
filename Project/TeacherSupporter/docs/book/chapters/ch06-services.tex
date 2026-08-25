@@ -1,0 +1,134 @@
+\chapter{The Business Services and the Common Module}
+\label{ch:services}
+
+The previous chapters covered the plumbing services. This one maps the
+three that do the actual work, plus the shared \code{common} module ---
+and, through them, the two ways microservices talk to each other.
+
+\section{course-service: the workhorse}
+
+Courses, students, assignments, enrollments, submissions --- classic
+CRUD over Postgres (Chapter~7), plus file attachments stored in MinIO
+(Chapter~9). It \emph{publishes} \code{ts.assignment.created} events and
+\emph{listens} for \code{ts.user.activated} --- the pattern to notice is
+that it reacts to another service's business event without ever calling
+that service.
+
+\section{auth-service: identity}
+
+Everything Chapter~5 described: registration with e-mail activation,
+password and Google login, TOTP 2FA, JWT issuing, refresh tokens. It
+publishes three events: \code{ts.user.registered},
+\code{ts.user.activated}, \code{ts.user.admin-provisioned}.
+
+\section{dictionary-service: the small one}
+
+Vocabulary lookups over MongoDB (Chapter~8). Deliberately simple --- it
+exists partly to prove the architecture accommodates a document store and
+partly as the low-stakes service to try things on first.
+
+\section{notification-service: the pure consumer}
+
+No REST API of consequence, no database. It subscribes to three topics
+and turns events into e-mails (Maildev in dev, a real SMTP relay later):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Topic & Producer & Mail sent \\
+\midrule
+\code{ts.user.registered} & auth-service & activation link \\
+\code{ts.user.admin-provisioned} & auth-service & credentials notice \\
+\code{ts.assignment.created} & course-service & new-assignment notice \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Because its \emph{only} input is Kafka, it is the one service that cannot
+usefully run before a broker exists --- which is why its Kubernetes
+manifest shipped with the Kafka milestone (Chapter~25) rather than with
+the other services.
+
+\section{Synchronous vs.\ asynchronous, in this codebase}
+
+The project uses both interaction styles, each where it belongs:
+
+\begin{description}
+  \item[Synchronous (HTTP through the gateway)] when the caller needs the
+  answer to proceed: the frontend fetching a course list. Coupled in
+  time --- both sides must be up.
+  \item[Asynchronous (events through Kafka)] when the caller only needs
+  the fact recorded: a registration happened; whoever cares can act.
+  auth-service does not know notification-service exists. Decoupled in
+  time --- mail goes out late, not never, if the consumer is down.
+\end{description}
+
+The rule of thumb the codebase follows: \emph{commands} that need answers
+are HTTP; \emph{facts} that others may react to are events, named in the
+past tense (\code{UserRegistered}, \code{AssignmentCreated}).
+
+\section{The common module}
+
+\begin{lstlisting}
+com/ts/common/
+  dto/        CourseDto, StudentDto, UserDto, ...
+              UserRegisteredEvent, UserActivatedEvent,
+              AssignmentCreatedEvent, AdminProvisionedUserEvent
+  exception/  ApiException, ErrorResponse
+  security/   JwtConstants     <- header names, claim names
+\end{lstlisting}
+
+Three kinds of sharing, with three different risk profiles:
+
+\begin{itemize}
+  \item \textbf{Event records} are the \emph{contract} between producer
+  and consumer. Sharing the class guarantees both sides agree --- at the
+  price of lockstep deployment when the shape changes. (The industrial
+  alternative --- schema registry --- appears in Chapter~11.)
+  \item \textbf{\code{JwtConstants}} shares header and claim \emph{names}
+  between gateway and services. A typo'd header name would fail silently
+  --- requests simply arrive anonymous --- so centralizing it is cheap
+  insurance.
+  \item \textbf{DTOs and exceptions} are convenience sharing: pleasant in
+  a monorepo, and the first thing to duplicate-instead-of-share if
+  services ever split into separate repositories, because shared
+  convenience classes are how ``independent'' services end up released
+  together.
+\end{itemize}
+
+\begin{decision}[a shared module at all?]
+Microservice purists forbid shared code between services. The purist
+alternative --- each service defines its own copy of every event --- makes
+drift possible precisely where agreement is mandatory. This project
+draws the line at: share \emph{contracts} (events, header names), think
+twice about sharing anything with behavior. \code{jib.skip=true} in
+common's POM marks it as the one module that is a library, not a
+deployable.
+\end{decision}
+
+\begin{pitfall}[the lockstep trap]
+Symptom: after adding a field to \code{UserRegisteredEvent} and deploying
+only auth-service, notification-service starts throwing deserialization
+errors on every message --- and because it shares a consumer group, it
+keeps retrying the same broken message. Cause: the contract changed on
+one side only, and the topic now holds events in two shapes. Rules that
+prevent it: only \emph{add} optional fields, never rename or remove;
+deploy consumers before producers; and configure the consumer's error
+handling (Chapter~11) so one poison message cannot stall the topic.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item For each pair, say whether HTTP or an event fits and why:
+  (a) frontend needs a student list; (b) a submission was graded and the
+  student should be told; (c) course-service must verify a JWT.
+  \item Why is notification-service the only service whose Kubernetes
+  manifest waits for the Kafka milestone, when auth-service also uses
+  Kafka?
+  \item Name one thing that belongs in \code{common} and one that should
+  never be there, with the reasoning.
+  \item What deployment-order rule makes an event schema change safe,
+  and what property must the change itself have?
+\end{enumerate}
+\end{quiz}

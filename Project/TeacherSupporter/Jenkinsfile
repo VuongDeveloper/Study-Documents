@@ -15,8 +15,8 @@ pipeline {
     TAG       = "${env.GIT_COMMIT.take(7)}"
     NS        = 'ts'
     REGISTRY  = 'localhost:5000'
-    SERVICES  = 'config-server discovery-server course-service'
-    MODULES   = 'common,config-server,discovery-server,course-service'
+    SERVICES  = 'config-server discovery-server course-service api-gateway auth-service dictionary-service notification-service'
+    MODULES   = 'common,config-server,discovery-server,course-service,api-gateway,auth-service,dictionary-service,notification-service'
   }
 
   stages {
