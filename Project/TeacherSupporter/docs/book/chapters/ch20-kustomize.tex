@@ -98,6 +98,24 @@ replicas/images/labels patching --- the whole need here. You will still
 kube-prometheus-stack); writing one can wait until you have users.
 \end{decision}
 
+\begin{pitfall}[spec.selector: field is immutable]
+Symptom: the pipeline's \code{kubectl apply -k} fails on one
+Deployment with this error, although the same file applies fine by
+hand. Cause: \code{commonLabels} stamps its label not only onto
+metadata but into every Deployment's \emph{selector} --- and selectors
+are immutable once created. An object first created \emph{outside}
+Kustomize (\code{kubectl apply -f maildev.yaml} during milestone~6's
+setup, selector \code{\{app: maildev\}}) can never be updated by
+Kustomize afterwards (selector
+\code{\{app: maildev, part-of: teacher-supporter\}}). Fix: delete the
+hand-made object and let the pipeline recreate it. Rule: an object
+managed by a kustomization is applied \emph{only} through it --- for a
+one-off test, render with \code{kubectl kustomize} and pipe that,
+never the raw file. (Modern Kustomize's \code{labels:} with
+\code{includeSelectors: false} avoids selector injection --- but
+switching now would break every selector already created the old way.)
+\end{pitfall}
+
 \begin{pitfall}[it worked yesterday: the prune illusion]
 Symptom: you delete a manifest from \code{resources:}, re-apply, and
 the object is still running --- for months, until it conflicts with

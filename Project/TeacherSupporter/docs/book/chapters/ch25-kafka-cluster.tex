@@ -161,7 +161,11 @@ Security at all, so the endpoint is open by default (the third answer
 to Chapter~17's probe question). Maildev is a tiny Deployment plus
 Service (ports 1025 SMTP, 1080 web); it delivers nothing and shows
 everything it caught. No Ingress: it is an operator's tool, reached by
-\code{port-forward}.
+\code{port-forward}. It also supplied this milestone's second live
+lesson: applied by hand before the pipeline ran, its selector lacked
+the label Kustomize injects, and the first pipeline deploy died on
+``field is immutable'' --- Chapter~20's pitfall, learned the
+expensive way.
 
 \begin{pitfall}[NotReady --- FatalProblem, while the pod is Running]
 Symptom: minutes after applying, \code{kubectl get kafka} shows
