@@ -60,7 +60,7 @@ stage('Build') {
 stage('Push images') {
   steps {
     dir('Project/TeacherSupporter') {
-      sh 'mvn -B -pl ${MODULES} -am jib:build -Djib.to.tags=${TAG}'  (*@\co{3}@*)
+      sh 'mvn -B -DskipTests -pl ${MODULES} -am package jib:build -Djib.to.tags=${TAG}'  (*@\co{3}@*)
     } } }
 stage('Deploy') {
   steps {
@@ -92,7 +92,9 @@ stage('Deploy') {
   gate-weakening from Chapter~21's pitfall box.
   \item[\co{3}] One command builds and pushes all seven images ---
   Chapter~13 in a single line. \code{-Djib.to.tags} adds the SHA tag
-  alongside the SNAPSHOT tag.
+  alongside the SNAPSHOT tag. The \code{package} in front of
+  \code{jib:build} is not decoration --- see the pitfall below; it
+  cost two failed builds on the day milestones 5 and 6 shipped.
   \item[\co{4}] The file credential materializes as a temp file;
   \code{KUBECONFIG} is the env var kubectl reads. Outside this block
   the file does not exist; in the log its content never appears.
@@ -111,6 +113,22 @@ stage('Deploy') {
   ``running,'' not ``commands executed'' --- it delegates truth to the
   probes of Chapter~17.
 \end{description}
+
+\begin{pitfall}[Could not find artifact com.ts:common:jar:1.0.0-SNAPSHOT]
+Symptom: the Build stage passes, then the Push stage fails on the
+first module that depends on \code{common}, unable to resolve a jar
+that the previous stage just built. Cause: \code{mvn jib:build} is a
+\emph{bare goal} --- Maven runs it directly with no lifecycle phases,
+so nothing in the reactor is compiled or packaged in that session, and
+sibling dependencies fall back to the local repository, where
+\code{common} was never installed (\code{verify} stops short of
+\code{install}). Modules without a sibling dependency (config-server,
+discovery-server) sail through, which makes the failure look
+module-specific. Fix: put a phase in front --- \code{package jib:build}
+--- so the reactor packages \code{common} before Jib asks for it.
+General rule: a plugin goal that needs other modules' artifacts must
+ride a lifecycle phase, not be invoked alone.
+\end{pitfall}
 
 Two loops, not one, is a small correctness point: all rollouts start
 first, then all are awaited --- otherwise service N's wait serializes

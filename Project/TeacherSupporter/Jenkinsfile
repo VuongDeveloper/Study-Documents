@@ -31,7 +31,10 @@ pipeline {
     stage('Push images') {
       steps {
         dir('Project/TeacherSupporter') {
-          sh 'mvn -B -pl ${MODULES} -am jib:build -Djib.to.tags=${TAG}'
+          // `package` before jib:build is load-bearing: a bare goal runs no
+          // lifecycle, so sibling modules (common) are never built in this
+          // session and Jib cannot resolve com.ts:common from the reactor.
+          sh 'mvn -B -DskipTests -pl ${MODULES} -am package jib:build -Djib.to.tags=${TAG}'
         }
       }
     }
