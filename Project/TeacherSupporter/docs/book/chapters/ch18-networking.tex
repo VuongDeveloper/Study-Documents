@@ -66,7 +66,8 @@ spec:
   the Windows hosts file, pointing at the server's tailnet IP. Multiple
   hosts can share the cluster's single 80/443.
   \item[\co{2}] Path fan-out. Only three prefixes enter, all to the
-  gateway; \code{/} is reserved for the frontend milestone.
+  gateway; \code{/} is left free for the frontend's own Ingress
+  (Chapter~26), which Traefik merges into the same host's routing table.
 \end{description}
 
 \section{The full path of one request}
@@ -93,7 +94,7 @@ Worth pausing on: the gateway's Eureka lookup returns a \emph{pod IP}
 (Chapter~3's prefer-ip-address), so hop four technically bypasses the
 course-service Service. Both discovery systems run in parallel ---
 Eureka for gateway-to-service, Service DNS for everything else
-(config-server, databases, Kafka). Chapter~26's simplification
+(config-server, databases, Kafka). Chapter~27's simplification
 collapses them into one.
 
 \begin{pitfall}[the Service that selects nothing]

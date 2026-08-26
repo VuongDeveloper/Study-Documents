@@ -1,8 +1,9 @@
 \chapter{The Road Ahead}
 \label{ch:roadahead}
 
-With Kafka in the cluster (Chapter~25), every service the project has is
-deployable. The remaining milestones each swap something hand-rolled
+With the frontend served from the cluster (Chapter~26), every
+deployable the project has is deployed and the application is usable
+in a browser. The remaining milestones each swap something hand-rolled
 for the industrial mechanism --- and each makes most sense now that you
 know what it replaces.
 
@@ -27,15 +28,6 @@ The full stack costs $\sim$1.5\,GB and nontrivial CPU --- the budget
 says it fits, but it is the first thing to shed under load. Droppable
 observability is a homelab luxury; production teams size for it first.
 \end{hardware}
-
-\section{Frontend and the single host}
-
-Milestone~7 serves the React frontend from the cluster and claims the
-\code{/} path on \code{ts.local} that Chapter~18's Ingress deliberately
-left free. One host, one origin --- no CORS, cookies and OAuth
-redirects behave --- and the two-router division of Chapter~4 is
-complete: Traefik fans out static assets to the frontend and
-\code{/api} to the gateway.
 
 \section{GitOps: Argo CD}
 

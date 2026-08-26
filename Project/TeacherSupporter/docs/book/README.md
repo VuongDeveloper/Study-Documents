@@ -25,4 +25,4 @@ the repository — and it automatically stays in sync with the manifests.
 - `main.tex` — structure and includes
 - `tsbook.sty` — page geometry, fonts, the box environments
   (decision / pitfall / hands-on / hardware / quiz), listing setup
-- `frontmatter/`, `chapters/ch01..ch25`, `appendices/appA..appD`
+- `frontmatter/`, `chapters/ch01..ch27`, `appendices/appA..appD`

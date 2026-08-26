@@ -124,7 +124,7 @@ that apply never deletes holds for Kustomize too. The removed Ingress
 of Chapter~4 needed a manual \code{kubectl delete}. The systematic
 fixes: \code{kubectl apply -k --prune} (still gated behind flags for
 good reason --- a mislabeled selector can mass-delete), or GitOps
-controllers (Chapter~26) whose whole job is making git and cluster
+controllers (Chapter~27) whose whole job is making git and cluster
 converge, deletions included.
 \end{pitfall}
 

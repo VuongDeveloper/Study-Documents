@@ -472,7 +472,35 @@
   instance; partitions can be added later but never removed.
 \end{enumerate}
 
-\section*{Chapter 26 --- The Road Ahead}
+\section*{Chapter 26 --- The Frontend and the Single Host}
+\begin{enumerate}
+  \item Stage one (Node) compiles and bundles; stage two (nginx) serves.
+  Only \code{dist/} is copied with \code{COPY --from=build}; Node,
+  \code{node\_modules} and the compiler are discarded, leaving a
+  $\sim$15\,MB image with a smaller attack surface.
+  \item Traefik matches \code{/courses/7} against both Ingresses;
+  \code{/} is the longest matching prefix (no \code{/courses} rule
+  exists), so nginx receives it. No such file exists;
+  \code{try\_files \$uri \$uri/ /index.html} falls back to
+  \code{index.html}, the app boots and React Router renders the route
+  from the URL.
+  \item Rules for the same host are merged into one routing table and
+  the longest matching path prefix wins: \code{/api/courses} matches
+  \code{/api} (longer) over \code{/}; \code{/assets/x.js} matches only
+  \code{/}.
+  \item CORS applies only to cross-origin requests. In the cluster the
+  page and the API share scheme, host and port (\code{http://ts.local}),
+  so the browser never sends a preflight; on a laptop the page is
+  \code{localhost:3000} and the API \code{localhost:8080} --- a
+  different port is a different origin.
+  \item The socket is owned by the host's \code{docker} group (GID 984
+  on ts-server); the jenkins user inside the container is not in a
+  group with that numeric ID, so writes are denied. \code{--group-add}
+  attaches the host's GID at run time; computing it keeps the script
+  correct on any host without hard-coding a machine-specific number.
+\end{enumerate}
+
+\section*{Chapter 27 --- The Road Ahead}
 \begin{enumerate}
   \item Consumer-group lag: the distance between the newest offset in a
   partition and the group's committed offset --- growing lag means

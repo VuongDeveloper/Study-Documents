@@ -1,0 +1,336 @@
+\chapter{The Frontend and the Single Host}
+\label{ch:frontend}
+
+Milestone~7 puts the last deployable --- the React frontend --- into
+the cluster and claims the \code{/} path on \code{ts.local} that
+Chapter~18's Ingress deliberately left free. It is a short milestone
+in lines of YAML and a long one in concepts: it is the only image the
+pipeline builds from a Dockerfile, the only pod that is not a JVM, and
+the change that turns ``services reachable with \code{curl}'' into
+``an application usable in a browser''.
+
+\section{What a frontend is, to an operator}
+
+A built React app is not a server. \code{npm run build} (TypeScript
+check, then Vite bundling) produces a directory of static files:
+one \code{index.html}, one content-hashed JavaScript bundle
+(\code{index-CqZING8N.js}), one CSS file, a favicon. Nothing in it
+runs on the server; every line of it runs in the visitor's browser,
+which then calls \code{/api/...} over HTTP like any other client. So
+``deploying the frontend'' means deploying a \emph{file server} with
+those files inside --- nginx here --- and telling the edge router which
+requests are files and which are API.
+
+That framing decides everything else in this chapter. No config
+server (the app has no properties to import), no Eureka (nobody calls
+it by name), no secret (the browser can read anything the frontend
+holds, so nothing secret may be there), and a resource footprint
+smaller than the smallest JVM's class-loading overhead.
+
+\section{Two stages, one Dockerfile}
+
+Jib (Chapter~13) builds JVM images from \code{target/classes}; it
+cannot run \code{npm}. The frontend therefore gets the classic
+multi-stage Dockerfile --- and the reason it has two stages is the same
+reason the JVM images use a JRE base rather than a JDK:
+
+\begin{lstlisting}[language=dockerfile]
+FROM node:24-alpine AS build            (*@\co{1}@*)
+WORKDIR /app
+COPY package.json package-lock.json ./  (*@\co{2}@*)
+RUN npm ci --no-audit --no-fund
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine                  (*@\co{3}@*)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html   (*@\co{4}@*)
+EXPOSE 80
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The build stage has Node, the TypeScript compiler, and
+  after \code{npm ci} roughly 300\,MB of \code{node\_modules}. None of
+  it is needed to \emph{serve} the result.
+  \item[\co{2}] Lockfile first, sources second --- Chapter~12's layer
+  cache rule. \code{npm ci} installs exactly the versions pinned in
+  \code{package-lock.json} and refuses to modify it; a source edit
+  invalidates only the layers from \code{COPY . .} down, so the
+  dependency download is skipped on every rebuild that does not touch
+  \code{package.json}.
+  \item[\co{3}] A fresh base. The final image is nginx plus static
+  files: about 15\,MB, no Node, no compiler, no package manager --- a
+  smaller attack surface and a faster pull, for free.
+  \item[\co{4}] \code{--from=build} is the multi-stage copy: only
+  \code{dist/} crosses from stage one to stage two. Everything else
+  in stage one is discarded when the build ends.
+\end{description}
+
+\begin{decision}[Why not add Node to the Jenkins image and use Jib?]
+Jib can wrap any directory into an image, so a ``Node in Jenkins, Jib
+for packaging'' route exists. It was rejected because it hides the
+most common image-building technique behind the least common one.
+Every team that ships a frontend has this Dockerfile; being able to
+read and write it is a job-market skill in itself, and having one
+non-Jib image in the pipeline also proves the pipeline is not secretly
+Jib-shaped. The cost is a Docker CLI in the Jenkins image and a
+mounted daemon socket --- Section~\ref{sec:dockersock}.
+\end{decision}
+
+\section{nginx: the fallback that makes a SPA work}
+
+\begin{lstlisting}[language=bash]
+server {
+    listen 80;
+    root  /usr/share/nginx/html;
+    location / {
+        try_files $uri $uri/ /index.html;          (*@\co{1}@*)
+    }
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable"; (*@\co{2}@*)
+    }
+    location = /healthz { return 200 "ok\n"; }      (*@\co{3}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The line that every single-page app needs and every
+  first deployment forgets. React Router (\code{BrowserRouter} in
+  \code{main.tsx}) owns URLs like \code{/courses/42} purely in the
+  browser: clicking a link never asks the server. But a refresh, a
+  bookmark or a pasted link \emph{does} ask the server for
+  \code{/courses/42}, no such file exists, and a plain file server
+  answers 404. \code{try\_files} tries the literal path, then a
+  directory, then falls back to \code{index.html} --- the app boots
+  and its router reads the URL. The OAuth callback
+  (\code{/oauth/callback}) relies on this too: Google's redirect is a
+  cold request for a route that exists only in JavaScript.
+  \item[\co{2}] Vite writes a content hash into every asset filename,
+  so a changed file always has a new name. That makes ``cache forever''
+  safe for \code{/assets/} --- and \emph{unsafe} for
+  \code{index.html}, which must be re-fetched to learn the new names
+  after a deploy. Caching the HTML is how users end up with a stale
+  app that requests bundles the server no longer has.
+  \item[\co{3}] A probe target that costs nothing and never touches
+  disk (Chapter~17's probes need something to call).
+\end{description}
+
+Note what the file does \emph{not} do: proxy \code{/api}. On a
+laptop, \code{vite.config.ts} proxies \code{/api} to the gateway on
+\code{localhost:8080} so the dev server and the API look like one
+origin. In the cluster that job belongs to Traefik --- nginx never sees
+an API request at all.
+
+\section{Claiming \code{/}: one origin}
+
+\begin{lstlisting}[language=yaml]
+kind: Ingress
+metadata: { name: frontend }
+spec:
+  rules:
+    - host: ts.local
+      http:
+        paths:
+          - path: /                     (*@\co{1}@*)
+            pathType: Prefix
+            backend: { service: { name: frontend, port: { number: 80 } } }
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A catch-all, in a \emph{second} Ingress object next to
+  the gateway's. Traefik merges every Ingress rule for a host and routes
+  by \emph{longest matching prefix}: \code{/api/courses} matches both
+  \code{/} and \code{/api}, and \code{/api} wins. The gateway's three
+  prefixes therefore keep working unchanged, and everything else ---
+  \code{/}, \code{/login}, \code{/courses/42}, \code{/assets/...} ---
+  falls through to nginx. Two objects, one merged routing table;
+  Chapter~20's ``apply never deletes'' still applies to each.
+\end{description}
+
+The consequence is the reason this milestone exists at all:
+\textbf{one origin}. The browser loads the page from
+\code{http://ts.local} and calls \code{http://ts.local/api/...} ---
+same scheme, host and port. Compare Compose, where the page came from
+\code{localhost:3000} and the API from \code{localhost:8080}: a
+different port is a different origin, so every API call was preceded
+by a CORS preflight and the gateway's \code{CorsConfig} had to list
+\code{localhost:3000} explicitly. In the cluster \code{CorsConfig}
+is simply never consulted --- there is no cross-origin request to
+police. Cookies, the OAuth redirect, and any future
+\code{SameSite} policy all get simpler for the same reason.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 8mm]
+  \node[boxdark] (b) {Browser};
+  \node[box, right=22mm of b] (t) {Traefik};
+  \node[box, right=34mm of t, yshift=9mm] (fe) {frontend\\\scriptsize nginx};
+  \node[box, right=34mm of t, yshift=-9mm] (gw) {api-gateway};
+  \draw[flow] (b) -- node[lbl,above]{\scriptsize Host: ts.local} (t);
+  \draw[flow] (t.east) -- node[lbl,above,sloped,pos=0.5]{\scriptsize /} (fe.west);
+  \draw[flow] (t.east) -- node[lbl,below,sloped,pos=0.5]{\scriptsize /api, /oauth2, /login/oauth2} (gw.west);
+\end{tikzpicture}
+\caption{Longest prefix wins: one host, two backends.}
+\end{figure}
+
+One property follows the host change. \code{OAuth2LoginSuccessHandler}
+finishes Google login by redirecting the browser to
+\code{app.oauth2.success-redirect-uri}, which config-server's
+\code{auth-service.yml} sets to \code{localhost:3000/oauth/callback}
+--- correct on a laptop, wrong in the cluster. \code{auth-service.yaml}
+overrides it with the env var
+\code{APP\_OAUTH2\_SUCCESS\_REDIRECT\_URI=http://ts.local/oauth/callback}
+--- Chapter~16's precedence rule (env var beats config server) doing
+the same job it did for the datasource URL.
+
+\section{The manifest}
+
+The Deployment is Chapter~15's shape with almost everything removed:
+no \code{envFrom}, no \code{SPRING\_*} variables, no
+\code{startupProbe} (nginx is up in milliseconds), and
+\code{requests: \{ memory: 32Mi, cpu: 10m \}} --- one-twelfth of the
+smallest JVM. \code{imagePullPolicy: Always} with the
+\code{:latest} tag as the manifest default, overridden to the commit
+tag by the pipeline exactly as for the JVM services.
+
+\section{The pipeline grows a stage}
+\label{sec:dockersock}
+
+\begin{lstlisting}
+stage('Frontend image') {
+  steps {
+    dir('Project/TeacherSupporter') {
+      sh '''
+        docker build -t ${REGISTRY}/frontend:${TAG} \
+                     -t ${REGISTRY}/frontend:latest frontend   (*@\co{1}@*)
+        docker push ${REGISTRY}/frontend:${TAG}
+        docker push ${REGISTRY}/frontend:latest
+      '''
+    }
+  }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The build context is \code{frontend/}, trimmed by a
+  \code{.dockerignore} that excludes \code{node\_modules} and
+  \code{dist}: the Windows laptop's native modules must not be sent to
+  the daemon, and the image builds its own. \code{frontend} joins
+  \code{SERVICES} (kubectl's list) but not \code{MODULES} (Maven's) ---
+  the Deploy stage's \code{set image} / \code{rollout status} loops
+  handle it without change.
+\end{description}
+
+For \code{docker build} to work inside the Jenkins container, two
+things change in Chapter~22's setup. The image gains the Docker
+\emph{CLI} (\code{docker-ce-cli} --- the client only), and
+\code{run.sh} mounts the host's \code{/var/run/docker.sock} into the
+container. The CLI talks over that socket to the \emph{host's} daemon;
+there is no daemon inside Jenkins and no Docker-in-Docker. The
+resulting image lands in the host's image store, and
+\code{docker push localhost:5000/...} reaches the registry over the
+host network the container already shares.
+
+\begin{pitfall}[permission denied on /var/run/docker.sock]
+Symptom: the CLI is installed, the socket is mounted, and every
+\code{docker} command fails with a permission error. Cause: the
+socket is owned by the host's \code{docker} group --- GID 984 on
+\code{ts-server} --- and that number means nothing inside the image,
+where the \code{jenkins} user belongs to a group of the same name with
+a different GID (or none). Fix in \code{run.sh}:
+\code{--group-add "\$(stat -c \%g /var/run/docker.sock)"} adds the
+host's numeric GID to the container's user at run time, without baking
+a machine-specific number into the Dockerfile.
+\end{pitfall}
+
+\begin{decision}[The socket is root]
+Mounting the Docker socket grants root-equivalent control of the host:
+whoever can run \code{docker run -v /:/host} owns the machine. For a
+single-user homelab whose Jenkins is reachable only over the tailnet
+this is an accepted trade, stated out loud. Production builds images
+without a daemon at all --- Kaniko or BuildKit running as an
+unprivileged pod, or Jib for the JVM --- and the Chapter~27 migration
+of Jenkins into the cluster is where this compromise would be paid
+back.
+\end{decision}
+
+\begin{hardware}
+The frontend pod is the cheapest in the namespace (32\,Mi requested),
+but the \emph{build} is not: \code{npm ci} plus \code{tsc} plus Vite
+runs near a CPU-minute and a gigabyte of RAM on the controller, while
+Maven may still be running in the same 2\,GB container. The Jenkinsfile
+keeps the stages sequential for that reason; on this box, parallel
+stages would only compete.
+\end{hardware}
+
+\section{Verifying the milestone}
+
+\begin{handson}[the milestone-7 checklist]
+\begin{enumerate}
+  \item \code{kubectl -n ts get ingress} --- two objects on
+  \code{ts.local}; \code{kubectl -n ts get pods -l app=frontend} Ready.
+  \item Open \code{http://ts.local/} --- the login page. Then paste
+  \code{http://ts.local/courses} directly into the address bar: a page,
+  not nginx's 404 --- the SPA fallback works.
+  \item Register, log in, create a course: the browser's network tab
+  shows \code{/api/...} requests with no \code{OPTIONS} preflights ---
+  same origin.
+  \item \code{curl -sI http://ts.local/assets/index-*.js | grep
+  Cache-Control} --- \code{immutable}; the same for \code{/} --- no
+  cache header.
+  \item Change any text in a page, push, and watch the pipeline: the
+  \code{Frontend image} stage reuses the \code{npm ci} layer, and the
+  rollout swaps a 15\,MB image.
+\end{enumerate}
+\end{handson}
+
+Build~\#9 was the first run of the new stage: \code{docker build}
+completed in 90 seconds on the controller, the rollout swapped
+\code{frontend:f5d9213} in, and the checklist above passed as written
+--- \code{/courses} answered \code{index.html}, \code{/api/courses}
+answered the gateway's 401 JSON, the asset carried
+\code{immutable} and \code{/} carried no cache header.
+
+\begin{pitfall}[the Ingress that outlived its manifest]
+\code{kubectl get ingress} on that day listed \emph{three} objects on
+\code{ts.local}: the gateway's, the frontend's --- and
+\code{course-service}, eight days old, routing \code{/courses}
+straight to the service with no JWT check. Its manifest had been
+removed from \code{course-service.yaml} back in Chapter~18 with a
+comment saying so, but Chapter~20's rule held: \code{apply} never
+deletes what it no longer sees. It took a manual
+\code{kubectl -n ts delete ingress course-service}. The lesson is not
+the command but the audit: after every milestone, list what the
+cluster \emph{has}, not only what git \emph{says} --- until GitOps
+pruning (Chapter~27) makes the two the same thing.
+\end{pitfall}
+
+\section{Outside the project}
+
+The pattern --- edge router splits static from API by path, static
+comes from a dumb file server --- is universal, with the file server
+usually replaced by object storage plus a CDN (S3 + CloudFront, or a
+static host such as Netlify) and the split done by the CDN's origin
+rules. The build stage stays exactly this Dockerfile's first half.
+Two habits transfer directly: hash-and-cache-forever for assets with
+an uncached \code{index.html}, and the SPA fallback --- which in
+CloudFront terms is ``map 403/404 to \code{/index.html} with status
+200'', the same idea with worse ergonomics.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Why does the frontend image have two \code{FROM} lines, and
+  what exactly crosses between them?
+  \item A user bookmarks \code{http://ts.local/courses/7} and opens it
+  the next morning. Trace the request through Traefik and nginx, and
+  say which line makes it succeed.
+  \item Both Ingress objects declare \code{host: ts.local}. How does
+  Traefik decide that \code{/api/courses} goes to the gateway and
+  \code{/assets/x.js} to nginx?
+  \item Explain why the gateway's \code{CorsConfig} became irrelevant
+  in the cluster while remaining necessary on a laptop.
+  \item What does \code{--group-add "\$(stat -c \%g
+  /var/run/docker.sock)"} fix, and why is the value computed instead
+  of written down?
+\end{enumerate}
+\end{quiz}
