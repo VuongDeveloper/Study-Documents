@@ -1,0 +1,69 @@
+# Frontend (milestone 7): nginx serving the built React app.
+#
+# Image comes from frontend/Dockerfile (docker build in Jenkins), not Jib --
+# it is the one non-JVM deployable. Being static files it has no config
+# server, no Eureka, no secrets: the app talks to "/api" on its own origin,
+# and Traefik (Ingress below) splits that off to the gateway.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: frontend }
+  template:
+    metadata:
+      labels: { app: frontend }
+    spec:
+      containers:
+        - name: frontend
+          image: localhost:5000/frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 80 }
+
+          # nginx is up in milliseconds; no startupProbe needed. /healthz is
+          # a location in nginx.conf that answers without touching disk.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+
+          # Static file serving: the cheapest pod in the namespace by far.
+          resources:
+            requests: { memory: 32Mi, cpu: 10m }
+            limits: { memory: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+spec:
+  selector: { app: frontend }
+  ports:
+    - { name: http, port: 80, targetPort: 80 }
+---
+# Claims "/" on ts.local -- the path api-gateway.yaml's Ingress left free.
+# Traefik merges all Ingress rules for a host and picks the LONGEST matching
+# prefix, so /api, /oauth2 and /login/oauth2 (declared on the gateway
+# Ingress) still win over this catch-all. Net effect: one origin
+# (http://ts.local) for pages and API alike -- no CORS preflights, and the
+# Google-login redirect lands on the same host that started it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend
+spec:
+  rules:
+    - host: ts.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port: { number: 80 }

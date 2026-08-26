@@ -33,6 +33,11 @@ spec:
             # console, or Google refuses with redirect_uri_mismatch.
             - { name: SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_REDIRECT_URI,
                 value: "http://ts.local/login/oauth2/code/google" }
+            # After Google login, OAuth2LoginSuccessHandler redirects the
+            # browser to the frontend with the tokens. config-server's default
+            # says localhost:3000 (laptop Vite dev server); in the cluster the
+            # frontend is the same origin as everything else (milestone 7).
+            - { name: APP_OAUTH2_SUCCESS_REDIRECT_URI, value: "http://ts.local/oauth/callback" }
 
             # Zipkin arrives with observability (milestone 8).
             - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }

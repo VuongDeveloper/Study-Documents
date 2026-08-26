@@ -30,6 +30,17 @@ RUN wget -qO /usr/local/bin/kubectl \
       "https://dl.k8s.io/release/$(wget -qO- https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
  && chmod +x /usr/local/bin/kubectl
 
+# --- Docker CLI (client only): the frontend image is a classic Dockerfile ---
+# build, which Jib cannot do. Only the CLI is installed; it talks to the
+# HOST's daemon through /var/run/docker.sock mounted by run.sh. No daemon
+# inside the container, no docker-in-docker.
+RUN install -m 0755 -d /etc/apt/keyrings \
+ && wget -qO- https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+      > /etc/apt/sources.list.d/docker.list \
+ && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli \
+ && rm -rf /var/lib/apt/lists/*
+
 # Jenkins itself keeps running on the bundled JDK 21; only *builds* see JDK 25.
 # JAVA_HOME is therefore NOT changed here -- the Jenkinsfile sets it per stage.
 ENV MAVEN_HOME=/opt/maven \

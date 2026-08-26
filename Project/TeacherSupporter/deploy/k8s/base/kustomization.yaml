@@ -26,6 +26,8 @@ resources:
   - dictionary-service.yaml
   - notification-service.yaml
   - api-gateway.yaml
+  # Non-JVM deployable: nginx + React build, claims / on ts.local.
+  - frontend.yaml
 
 # Stamped onto every object, so `kubectl delete -l part-of=teacher-supporter`
 # cleans up the whole slice without touching kube-system.

@@ -15,7 +15,9 @@ pipeline {
     TAG       = "${env.GIT_COMMIT.take(7)}"
     NS        = 'ts'
     REGISTRY  = 'localhost:5000'
-    SERVICES  = 'config-server discovery-server course-service api-gateway auth-service dictionary-service notification-service'
+    // frontend is in SERVICES (kubectl) but not MODULES (Maven): it is built by
+    // the 'Frontend image' stage with docker, not by Jib.
+    SERVICES  = 'config-server discovery-server course-service api-gateway auth-service dictionary-service notification-service frontend'
     MODULES   = 'common,config-server,discovery-server,course-service,api-gateway,auth-service,dictionary-service,notification-service'
   }
 
@@ -35,6 +37,22 @@ pipeline {
           // lifecycle, so sibling modules (common) are never built in this
           // session and Jib cannot resolve com.ts:common from the reactor.
           sh 'mvn -B -DskipTests -pl ${MODULES} -am package jib:build -Djib.to.tags=${TAG}'
+        }
+      }
+    }
+
+    stage('Frontend image') {
+      steps {
+        dir('Project/TeacherSupporter') {
+          // Multi-stage Dockerfile: node builds dist/, nginx ships it. The
+          // registry is localhost:5000 from the host's point of view and the
+          // container shares the host network, so push needs no extra config.
+          sh '''
+            set -eu
+            docker build -t ${REGISTRY}/frontend:${TAG} -t ${REGISTRY}/frontend:latest frontend
+            docker push ${REGISTRY}/frontend:${TAG}
+            docker push ${REGISTRY}/frontend:latest
+          '''
         }
       }
     }

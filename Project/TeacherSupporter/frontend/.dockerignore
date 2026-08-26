@@ -1,0 +1,7 @@
+# Sent to the Docker daemon as the build context -- keep it small.
+# node_modules is rebuilt inside the image by `npm ci` (Linux binaries, not
+# whatever the Windows laptop has); dist is produced by the build stage.
+node_modules
+dist
+*.tsbuildinfo
+.env*
