@@ -21,8 +21,8 @@ public class UserRegisteredListener {
         if ("EMAIL".equalsIgnoreCase(event.activationMethod())) {
             emailService.sendActivationEmail(event.email(), event.firstName(), event.activationCode());
         } else {
-            log.info("Activation method is '{}' for user {}. Activation link: http://localhost:8080/api/auth/activate?code={}",
-                    event.activationMethod(), event.userId(), event.activationCode());
+            log.info("Activation method is '{}' for user {}. Activation link: {}",
+                    event.activationMethod(), event.userId(), emailService.activationLink(event.activationCode()));
         }
     }
 }

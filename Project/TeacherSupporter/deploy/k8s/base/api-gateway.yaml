@@ -74,8 +74,34 @@ kind: Ingress
 metadata:
   name: api-gateway
 spec:
+  # Two hosts, identical paths. ts.local is the LAN name (hosts-file entry on
+  # the laptop). The second is the machine's Tailscale MagicDNS name: every
+  # device on the tailnet resolves it with no hosts-file edit, so the app is
+  # reachable from anywhere Tailscale is -- the same Ingress, one more rule.
+  # Traefik routes on the Host header, so a name it does not list gets 404.
   rules:
     - host: ts.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+          - path: /oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+          - path: /login/oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+    - host: ts-server.tailbfe002.ts.net
       http:
         paths:
           - path: /api

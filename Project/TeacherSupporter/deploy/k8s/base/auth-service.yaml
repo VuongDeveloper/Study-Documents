@@ -27,17 +27,18 @@ spec:
             - { name: SPRING_KAFKA_BOOTSTRAP_SERVERS, value: "ts-kafka-kafka-bootstrap:9092" }
 
             # Google's OAuth callback must round-trip through the browser, so
-            # it uses the EXTERNAL name (ts.local via Traefik -> gateway ->
-            # here), not a cluster-internal one. This exact URL must also be
-            # registered under "Authorized redirect URIs" in the Google Cloud
-            # console, or Google refuses with redirect_uri_mismatch.
+            # it uses the PUBLIC name (the Tailscale MagicDNS host, via Traefik
+            # -> gateway -> here), not a cluster-internal one. This exact URL
+            # must also be registered under "Authorized redirect URIs" in the
+            # Google Cloud console, or Google refuses with redirect_uri_mismatch.
+            # (ts.local, the LAN-only name, was the value up to build #9.)
             - { name: SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_REDIRECT_URI,
-                value: "http://ts.local/login/oauth2/code/google" }
+                value: "http://ts-server.tailbfe002.ts.net/login/oauth2/code/google" }
             # After Google login, OAuth2LoginSuccessHandler redirects the
             # browser to the frontend with the tokens. config-server's default
             # says localhost:3000 (laptop Vite dev server); in the cluster the
             # frontend is the same origin as everything else (milestone 7).
-            - { name: APP_OAUTH2_SUCCESS_REDIRECT_URI, value: "http://ts.local/oauth/callback" }
+            - { name: APP_OAUTH2_SUCCESS_REDIRECT_URI, value: "http://ts-server.tailbfe002.ts.net/oauth/callback" }
 
             # Zipkin arrives with observability (milestone 8).
             - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }

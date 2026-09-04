@@ -2,8 +2,8 @@ package com.ts.notification.service;
 
 import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.stereotype.Service;
@@ -11,17 +11,45 @@ import org.thymeleaf.context.Context;
 import org.thymeleaf.spring6.SpringTemplateEngine;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class EmailService {
 
     private final JavaMailSender javaMailSender;
     private final SpringTemplateEngine templateEngine;
 
+    /**
+     * Public origin of the frontend, as a BROWSER reaches it -- never a
+     * cluster-internal name. Every link we put in an email must survive being
+     * clicked from a phone, so it is configuration, not code: the default is
+     * the Vite dev server; docker-compose and the k8s manifest override it
+     * with APP_FRONTEND_BASE_URL (relaxed binding of app.frontend.base-url).
+     * Stored without a trailing slash.
+     */
+    private final String frontendBaseUrl;
+
+    public EmailService(JavaMailSender javaMailSender,
+                        SpringTemplateEngine templateEngine,
+                        @Value("${app.frontend.base-url:http://localhost:3000}") String frontendBaseUrl) {
+        this.javaMailSender = javaMailSender;
+        this.templateEngine = templateEngine;
+        this.frontendBaseUrl = frontendBaseUrl.endsWith("/")
+                ? frontendBaseUrl.substring(0, frontendBaseUrl.length() - 1)
+                : frontendBaseUrl;
+    }
+
+    /**
+     * The link goes to the frontend's /activate page, which POSTs the code to
+     * /api/auth/activate. Linking the API directly would not work anyway: the
+     * endpoint is a POST and a mail client can only issue GETs.
+     */
+    public String activationLink(String activationCode) {
+        return frontendBaseUrl + "/activate?code=" + activationCode;
+    }
+
     public void sendActivationEmail(String to, String firstName, String activationCode) {
         Context context = new Context();
         context.setVariable("firstName", firstName);
-        context.setVariable("activationLink", "http://localhost:8080/api/auth/activate?code=" + activationCode);
+        context.setVariable("activationLink", activationLink(activationCode));
 
         String htmlContent = templateEngine.process("activation-email", context);
 
@@ -41,7 +69,7 @@ public class EmailService {
     public void sendInvitationEmail(String to, String role, String inviteToken) {
         Context context = new Context();
         context.setVariable("role", role);
-        context.setVariable("inviteLink", "http://localhost:3000/invite?token=" + inviteToken);
+        context.setVariable("inviteLink", frontendBaseUrl + "/invite?token=" + inviteToken);
 
         String htmlContent = templateEngine.process("invitation-email", context);
 
@@ -63,7 +91,7 @@ public class EmailService {
         context.setVariable("email", to);
         context.setVariable("role", role);
         context.setVariable("tempPassword", tempPassword);
-        context.setVariable("loginLink", "http://localhost:3000/login");
+        context.setVariable("loginLink", frontendBaseUrl + "/login");
 
         String htmlContent = templateEngine.process("temp-password-email", context);
 

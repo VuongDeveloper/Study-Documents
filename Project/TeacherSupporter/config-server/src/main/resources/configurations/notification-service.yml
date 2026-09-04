@@ -22,6 +22,13 @@ spring:
     properties:
       mail.smtp.auth: false
       mail.smtp.starttls.enable: false
+# Where the links inside outgoing emails point. This is the URL a BROWSER
+# uses to reach the frontend, so it differs per environment: the Vite dev
+# server here and under docker-compose, the public Ingress host in the
+# cluster (overridden there with the APP_FRONTEND_BASE_URL env var).
+app:
+  frontend:
+    base-url: http://localhost:3000
 management:
   tracing:
     sampling:

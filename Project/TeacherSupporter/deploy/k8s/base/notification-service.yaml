@@ -31,6 +31,13 @@ spec:
             - { name: SPRING_MAIL_HOST, value: "maildev" }
             - { name: SPRING_MAIL_PORT, value: "1025" }
 
+            # Links inside emails (activate / invite / login) must work from
+            # whatever device opens the mail, so they carry the PUBLIC origin
+            # -- the Tailscale MagicDNS name every tailnet device resolves --
+            # never a Service name. Overrides app.frontend.base-url from
+            # config-server (relaxed binding), same trick as SPRING_MAIL_HOST.
+            - { name: APP_FRONTEND_BASE_URL, value: "http://ts-server.tailbfe002.ts.net" }
+
             # Zipkin arrives with observability (milestone 8).
             - { name: MANAGEMENT_TRACING_SAMPLING_PROBABILITY, value: "0.0" }
 
