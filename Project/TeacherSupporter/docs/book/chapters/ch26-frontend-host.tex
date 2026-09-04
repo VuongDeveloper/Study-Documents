@@ -305,6 +305,51 @@ cluster \emph{has}, not only what git \emph{says} --- until GitOps
 pruning (Chapter~27) makes the two the same thing.
 \end{pitfall}
 
+\section{Reaching it from anywhere: the tailnet name}
+
+Everything above answered on \code{ts.local} --- a name that exists
+only in one laptop's hosts file, on one LAN. ``Live'' means a URL that
+resolves on every device you own, and the machine already has one:
+Tailscale gives each node a MagicDNS name,
+\code{ts-server.tailbfe002.ts.net}, that every peer on the tailnet
+resolves without any hosts-file edit. Traefik routes on the
+\code{Host} header (Chapter~18), so a name it does not list gets a
+404 even though the packets arrive. The fix is one more \code{rules}
+entry with the same path list in both Ingress objects
+(Appendix~D shows them) --- applied by hand with a filter that
+extracts only the Ingress documents from \code{kubectl kustomize}
+output, because a full \code{apply -k} would reset every
+Deployment's image tag to the manifests' \code{1.0.0-SNAPSHOT} and
+roll the whole namespace (Chapter~23's \code{set image} lives
+\emph{after} \code{apply} for exactly this reason).
+
+The name then surfaced a bug the LAN had hidden. A registration
+through the new host produced its activation mail (Chapter~25's
+chain, end to end over the tailnet), but the link inside read
+\code{http://localhost:8080/api/auth/activate?code=...}: a host no
+phone can reach, and a \code{POST} endpoint that a mail client's
+\code{GET} could never have used anyway. \code{EmailService} built
+every link --- activate, invite, login --- from string literals. The
+correction is the Chapter~16 rule applied to URLs: the public origin
+is \emph{configuration}. \code{app.frontend.base-url} defaults to the
+Vite dev server in config-server's \code{notification-service.yml};
+the manifest overrides it with \code{APP\_FRONTEND\_BASE\_URL} set to
+the tailnet name, the same relaxed-binding trick as
+\code{SPRING\_MAIL\_HOST}; and the links now target the frontend's
+\code{/activate} page, which does the \code{POST}. The two OAuth
+variables moved to the same host, which means one more entry under
+Google's ``Authorized redirect URIs'' --- the registration that
+Chapter~5 called the one thing no manifest can automate.
+
+\begin{pitfall}[a link is an external contract]
+Anything that leaves the system --- an email, a webhook payload, a
+QR code --- carries a URL that must work from \emph{outside}, so it
+can never be a Service name and should never be a literal. The test
+is cheap: register from a device that is not the build laptop and
+click. On this stack it was the first request through the new
+hostname that exposed a bug present since the first commit.
+\end{pitfall}
+
 \section{Outside the project}
 
 The pattern --- edge router splits static from API by path, static
@@ -332,5 +377,10 @@ CloudFront terms is ``map 403/404 to \code{/index.html} with status
   \item What does \code{--group-add "\$(stat -c \%g
   /var/run/docker.sock)"} fix, and why is the value computed instead
   of written down?
+  \item The activation mail's link was wrong for months and nobody
+  noticed. Name the two separate defects in
+  \code{http://localhost:8080/api/auth/activate?code=...}, and say
+  which environment (laptop, compose, cluster) each one would have
+  broken.
 \end{enumerate}
 \end{quiz}
