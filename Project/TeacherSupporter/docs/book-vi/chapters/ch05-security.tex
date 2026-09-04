@@ -1,0 +1,176 @@
+\chapter{Bảo mật: JWT, OAuth2 và biên tin cậy}
+\label{ch:security}
+
+Bảo mật là nơi dự án này dạy được nhiều nhất, vì nó dùng ba cơ chế mà
+ngành dùng liên tục --- JWT phi trạng thái, đăng nhập OAuth2, xác thực
+hai lớp TOTP --- và nối chúng qua một gateway theo mẫu ``biên tin cậy''
+(trusted edge) chuẩn mực.
+
+\section{Spring Security trong một trang}
+
+Spring Security là một chuỗi filter servlet đứng trước các controller
+của bạn. Mỗi request đi qua chuỗi đó; các filter xác thực (bạn là ai?)
+và các quy tắc phân quyền quyết định (bạn được phép không?). Chuỗi của
+auth-service trong dự án, từ \code{SecurityConfig} của nó:
+
+\begin{lstlisting}[language=Java]
+http
+  .csrf(AbstractHttpConfigurer::disable)                    (*@\co{1}@*)
+  .sessionManagement(s ->
+      s.sessionCreationPolicy(SessionCreationPolicy.STATELESS)) (*@\co{2}@*)
+  .authorizeHttpRequests(auth -> auth
+      .requestMatchers("/register", "/login", "/activate",
+          "/refresh", "/verify-2fa", "/change-password",
+          "/oauth2/**", "/login/oauth2/**",
+          "/v3/api-docs/**", "/swagger-ui/**").permitAll()  (*@\co{3}@*)
+      .anyRequest().authenticated())
+  .oauth2Login(o -> o.successHandler(oAuth2LoginSuccessHandler))
+  .addFilterBefore(gatewayHeaderAuthFilter,
+      UsernamePasswordAuthenticationFilter.class);          (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Bảo vệ CSRF che chắn cho phiên cookie của trình duyệt;
+  một API JWT phi trạng thái không có phiên cookie nào để lợi dụng, nên
+  nó bị tắt. Tắt vì lý do đó --- không phải vì một tutorial bảo thế.
+  \item[\co{2}] \code{STATELESS}: không tạo HTTP session. Mỗi request
+  phải tự mang bằng chứng danh tính. Đây là tính chất cho phép bất kỳ
+  replica nào trả lời bất kỳ request nào --- điều kiện tiên quyết để mở
+  rộng.
+  \item[\co{3}] Các đường dẫn công khai. Để ý đó là các đường dẫn
+  \emph{đã bỏ tiền tố} (\code{/login}, không phải \code{/api/auth/login})
+  --- Chương~4 giải thích vì sao. Cũng để ý thứ \emph{vắng mặt}:
+  \code{/actuator/**}. Sự vắng mặt đó quyết định chiến lược probe
+  Kubernetes của service này ở Chương~17.
+  \item[\co{4}] Filter tùy biến tin tưởng các header danh tính từ
+  gateway --- chủ đề của Mục~\ref{sec:trusted-edge}.
+\end{description}
+
+\section{JWT: danh tính phi trạng thái}
+
+Một JSON Web Token gồm ba phần base64url,
+\code{header.payload.signature}. Payload mang các \emph{claim}: subject
+(id người dùng), vai trò, hạn dùng. Chữ ký là HMAC-SHA256 trên header
+và payload với một secret dùng chung --- chuỗi tối thiểu 256 bit mà cả
+auth-service lẫn gateway đều giữ.
+
+Các tính chất quan trọng:
+
+\begin{itemize}
+  \item \textbf{Tự chứa.} Xác minh không cần gọi cơ sở dữ liệu: kiểm tra
+  chữ ký, kiểm tra hạn, đọc claim. Chính điều này cho phép
+  \emph{gateway} xác thực mà không sở hữu dữ liệu người dùng.
+  \item \textbf{Đọc được.} Base64 là encoding, không phải mã hóa
+  (encryption) --- ai cũng giải mã được payload. Đừng bao giờ đặt bí mật
+  trong claim.
+  \item \textbf{Không thu hồi được cho tới khi hết hạn.} Token đã ký thì
+  không thể ``hủy ký''. Vì thế mới có mẫu hai token: một \emph{access
+  token} sống ngắn (ở đây 15 phút) đi cùng một \emph{refresh token} sống
+  dài (7 ngày) mà \emph{có} được đối chiếu với cơ sở dữ liệu tại
+  \code{/refresh} --- việc thu hồi diễn ra ở đó.
+\end{itemize}
+
+\section{Mẫu biên tin cậy}
+\label{sec:trusted-edge}
+
+\code{JwtAuthenticationFilter} của gateway xác minh token, rồi chuyển
+tiếp request với danh tính dưới dạng header thuần:
+
+\begin{lstlisting}[language=Java]
+ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+    .header(JwtConstants.HEADER_USER_ID, userId)
+    .header(JwtConstants.HEADER_USER_ROLE, role)
+    .build();
+\end{lstlisting}
+
+Ở phía sau, \code{GatewayHeaderAuthFilter} của mỗi service đọc các
+header đó và dựng Spring Security context từ chúng --- không xác minh
+lại. Service giữ được sự đơn giản; mật mã chỉ chạy một lần.
+
+Nghĩa vụ đi kèm mẫu này: các header đó chỉ đáng tin nếu \emph{mọi}
+đường tới một service đều đi qua gateway. Một client với được thẳng tới
+course-service có thể giả mạo \code{X-User-Id}. Đây là lý do sâu xa
+khiến Ingress \code{/courses} trực tiếp bị xóa (Chương~4), và là lý do
+lưu lượng nội cụm vẫn là điểm yếu còn lại --- pod nào cũng vẫn có thể
+gọi \code{course-service:8082} với header bịa ra. NetworkPolicy hay
+mTLS (service mesh) là cách gia cố trong công nghiệp; Chương~27 bàn khi
+nào chúng xứng đáng với độ phức tạp của mình.
+
+\section{Đăng nhập OAuth2 với Google}
+
+Luồng \emph{authorization code} của OAuth2, như nó chạy ở đây:
+
+\begin{enumerate}
+  \item Trình duyệt gọi \code{/oauth2/authorization/google} (qua
+  gateway); Spring chuyển hướng tới Google kèm client-id của ứng dụng và
+  một \code{redirect\_uri}.
+  \item Người dùng đồng ý tại Google; Google chuyển hướng trình duyệt về
+  \code{redirect\_uri} --- \code{/login/oauth2/code/google} --- mang theo
+  một \emph{code} dùng một lần.
+  \item Auth-service đổi code + client-secret lấy token theo đường
+  server-tới-server, đọc e-mail/hồ sơ người dùng, rồi
+  \code{OAuth2LoginSuccessHandler} của dự án tiếp quản: tìm hoặc tạo tài
+  khoản cục bộ và phát hành JWT \emph{của chính chúng ta}. Google xác
+  thực; ứng dụng vẫn phân quyền bằng token của riêng mình.
+\end{enumerate}
+
+\begin{pitfall}[redirect\_uri\_mismatch]
+Triệu chứng: Google hiện ``Error 400: redirect\_uri\_mismatch'' thay vì
+màn hình đồng ý. Nguyên nhân: URI ứng dụng gửi đi không trùng từng byte
+với URI đã đăng ký trong Google Cloud console. Nó thay đổi theo môi
+trường (\code{localhost:8080} khi dev, \code{ts.local} trong cụm --- đó
+là lý do Deployment ghi đè \code{...GOOGLE\_REDIRECT\_URI}), và mọi
+biến thể đều phải được đăng ký. URI phải tới auth-service \emph{chưa bị
+bỏ tiền tố}, đó là lý do các route OAuth2 trên gateway không có
+StripPrefix.
+\end{pitfall}
+
+\section{Xác thực hai lớp TOTP}
+
+Mật khẩu dùng một lần theo thời gian (Time-based One-Time Password,
+RFC~6238): khi đăng ký, server sinh một secret, hiện nó dưới dạng mã QR,
+và ứng dụng authenticator suy ra mã 6 chữ số từ
+\code{HMAC(secret, time/30s)}. Đăng nhập thành hai bước --- kiểm tra mật
+khẩu phát ra một trạng thái chờ sống ngắn, rồi \code{/verify-2fa} kiểm
+tra mã và phát hành token thật. Server và điện thoại không bao giờ liên
+lạc với nhau; chúng chỉ chia sẻ secret và một chiếc đồng hồ.
+
+\section{Ngoài dự án}
+
+Lựa chọn thay thế chính trong công nghiệp đưa việc phát hành token ra
+khỏi code của bạn hoàn toàn: một identity provider (Keycloak tự host,
+hoặc Auth0/Cognito được quản lý) phát hành token ký bằng cặp khóa
+\emph{bất đối xứng} (RS256). Service xác minh bằng khóa \emph{công khai}
+lấy từ một URL JWKS --- không có secret dùng chung phải phân phối, xoay
+khóa có sẵn:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: https://idp.company.com/realms/app/protocol/openid-connect/certs
+\end{lstlisting}
+
+Hiểu phiên bản HS256 tự tay làm --- thứ dự án này xây --- chính là điều
+làm cho cấu hình kia có ý nghĩa: cùng claim, cùng cách xác minh, chỉ
+khác nghi thức khóa.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Vì sao có thể tắt bảo vệ CSRF cho một API JWT phi trạng thái
+  nhưng không thể cho một webapp dùng phiên cookie?
+  \item Kẻ tấn công đánh cắp được một access token. Nó dùng được bao
+  lâu, trong lúc đó server không thể làm gì, và endpoint nào cuối cùng
+  chặn được phiên?
+  \item Trong mẫu biên tin cậy, phát biểu chính xác bất biến phải giữ
+  để \code{X-User-Id} đáng tin, và nêu hai sai lầm triển khai sẽ phá vỡ
+  nó.
+  \item Trong luồng Google, secret nào không bao giờ rời server, giá trị
+  nào đi qua trình duyệt, và vì sao giá trị trình duyệt thấy được lại an
+  toàn?
+  \item HS256 so với RS256: ai xác minh được, ai ký được, và vì sao các
+  identity provider chọn RS256?
+\end{enumerate}
+\end{quiz}

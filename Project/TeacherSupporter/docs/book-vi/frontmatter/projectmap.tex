@@ -1,0 +1,92 @@
+\chapter{Bản đồ dự án}
+
+TeacherSupporter là một nền tảng quản lý khóa học được xây dựng dưới dạng
+các microservice Spring Cloud: giáo viên quản lý khóa học, học sinh, bài
+tập và bài nộp; một dictionary service phục vụ tra cứu từ vựng; đăng ký
+và đăng nhập (mật khẩu, Google OAuth2, và xác thực hai lớp TOTP) nằm
+trong một auth service riêng; thông báo e-mail chảy qua Kafka. Dự án cố
+tình dùng stack Spring Cloud ``cổ điển'' --- Eureka, Config Server,
+Spring Cloud Gateway --- vì stack đó vẫn đang chạy ở rất nhiều doanh
+nghiệp, và hiểu nó khiến các lựa chọn thay thế cloud-native (Chương~27)
+trở nên có ý nghĩa thay vì huyền bí.
+
+\section*{Dàn nhân vật}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lllp{4.2cm}@{}}
+\toprule
+Service & Cổng & Kho lưu trữ & Nhiệm vụ \\
+\midrule
+config-server & 8888 & --- (classpath) & phục vụ cấu hình cho mọi service \\
+discovery-server & 8761 & --- & registry Eureka \\
+api-gateway & 8080 & --- & điểm vào duy nhất, kiểm tra JWT \\
+auth-service & 8081 & Postgres \code{ts\_auth} & tài khoản, JWT, OAuth2, 2FA \\
+course-service & 8082 & Postgres \code{ts\_course}, MinIO & khóa học, học sinh, file \\
+dictionary-service & 8083 & MongoDB & tra cứu từ vựng \\
+notification-service & 8084 & --- (Kafka vào) & sự kiện $\rightarrow$ e-mail \\
+frontend & 3000 & --- & giao diện web (React) \\
+\bottomrule
+\end{tabular}
+\caption{Tám đơn vị triển khai và những gì mỗi cái sở hữu.}
+\end{table}
+
+\section*{Một request, từ đầu đến cuối}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4.5mm and 9mm]
+  \node[boxdark] (browser) {Browser};
+  \node[box, right=of browser] (traefik) {Traefik\\\scriptsize Ingress};
+  \node[box, right=of traefik] (gw) {api-gateway\\\scriptsize JWT check};
+  \node[box, right=of gw] (svc) {course-service};
+  \node[boxfill, below=of svc] (pg) {Postgres};
+  \node[boxfill, left=of pg] (minio) {MinIO};
+  \node[box, above=of gw] (eureka) {Eureka};
+  \node[box, above=of svc] (config) {config-server};
+  \draw[flow] (browser) -- node[lbl,above]{\scriptsize http://ts.local} (traefik);
+  \draw[flow] (traefik) -- node[lbl,above]{\scriptsize /api/*} (gw);
+  \draw[flow] (gw) -- node[lbl,above]{\scriptsize lb://} (svc);
+  \draw[flow] (svc) -- (pg);
+  \draw[flow] (svc) -- (minio);
+  \draw[flowdash] (gw) -- node[lbl,left]{\scriptsize nó ở đâu?} (eureka);
+  \draw[flowdash] (svc) -- node[lbl,right]{\scriptsize config at boot} (config);
+\end{tikzpicture}
+\caption{Đường đi của request mà cuốn sách này sẽ quay lại nhiều lần.}
+\end{figure}
+
+Mỗi chương soi sáng một mắt xích của chuỗi này. Phần~I là các hộp bên
+phải; Phần~II là các kho dữ liệu; Phần~III là đường Kafka (không vẽ ---
+nó chở sự kiện, không chở request); các Phần~IV--VI là cách tất cả những
+thứ đó được đóng gói, chạy, và giao đi.
+
+\section*{Mọi thứ nằm ở đâu trong repository}
+
+\begin{lstlisting}
+TeacherSupporter/
+  pom.xml                  parent: modules, shared plugin config (Jib!)
+  common/                  shared DTOs and events
+  config-server/           + src/main/resources/configurations/*.yml
+  discovery-server/        api-gateway/        auth-service/
+  course-service/          dictionary-service/ notification-service/
+  frontend/
+  docker-compose.yml       local dev stack
+  Jenkinsfile              the CI/CD pipeline (Chapter 23)
+  deploy/
+    jenkins/               Jenkins controller image + run script
+    k8s/
+      create-secrets.sh    secrets are made, not committed
+      jenkins-rbac.yaml    what Jenkins may touch in the cluster
+      base/                every Kubernetes manifest (Part V)
+  docs/                    design docs, runbooks, and this book
+\end{lstlisting}
+
+\section*{Cỗ máy bên dưới}
+
+Mọi thứ được triển khai lên \code{ts-server}: một chiếc laptop tận dụng
+lại chạy Ubuntu~24.04 với 2 nhân vật lý, 19.4\,GB RAM và một SSD SATA,
+truy cập được từ Windows qua Tailscale. Nó chạy k3s (Kubernetes một
+node), một Jenkins chạy trong Docker, và một image registry cục bộ. Ràng
+buộc định hình gần như mọi quyết định vận hành trong cuốn sách này là
+\emph{CPU, chứ không phải bộ nhớ}: hai nhân nghĩa là build và demo không
+được chồng lên nhau.

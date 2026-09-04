@@ -1,0 +1,188 @@
+% tsbook.sty -- style for "TeacherSupporter: The Complete Stack"
+%
+% Designed for grayscale e-ink reading (XPPen Magic Notepad, e-ink mode):
+%   - no color carries meaning; boxes differ by border style and gray fill
+%   - high-contrast serif body, true monospace listings
+%   - page sized for the device, not for A4 printers
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{tsbook}[2026/09/04 TeacherSupporter book style, Vietnamese edition]
+
+% ---------- page geometry: 6.75in x 9in, single column ----------
+\RequirePackage[paperwidth=6.75in,paperheight=9in,
+  top=0.7in,bottom=0.8in,inner=0.75in,outer=0.65in,
+  headsep=0.2in,footskip=0.35in]{geometry}
+
+% ---------- fonts: Palatino-like serif + Inconsolata mono ----------
+% Vietnamese edition: the T1-encoded Type 1 fonts of the English book have
+% no Vietnamese glyphs, so this edition uses XeTeX + fontspec with OpenType
+% fonts from the Tectonic bundle -- TeX Gyre Pagella (a Palatino clone, the
+% same design as newpx) for text and the same Inconsolata for code.
+\RequirePackage{fontspec}
+\setmainfont{texgyrepagella}[Extension=.otf,UprightFont=*-regular,
+  BoldFont=*-bold,ItalicFont=*-italic,BoldItalicFont=*-bolditalic]
+\setmonofont{Inconsolatazi4}[Extension=.otf,UprightFont=*-Regular,
+  BoldFont=*-Bold,Scale=0.94]
+\RequirePackage{unicode-math}
+\setmathfont{texgyrepagella-math.otf}
+\RequirePackage[vietnamese]{babel}   % Chương / Mục lục / Hình / Bảng / Phụ lục
+\RequirePackage{microtype}
+
+% ---------- core packages ----------
+\RequirePackage{graphicx}
+\RequirePackage{booktabs}
+\RequirePackage{array}
+\RequirePackage{enumitem}
+\setlist{noitemsep,topsep=3pt}
+\RequirePackage{xcolor}
+\RequirePackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,calc,fit}
+\RequirePackage[most]{tcolorbox}
+\RequirePackage{listings}
+\RequirePackage{fancyhdr}
+\RequirePackage{titlesec}
+\RequirePackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+% grayscale palette -- every "color" is a gray
+\definecolor{inkfaint}{gray}{0.94}
+\definecolor{inklight}{gray}{0.88}
+\definecolor{inkmid}{gray}{0.55}
+\definecolor{inkdark}{gray}{0.20}
+
+% ---------- headers / footers ----------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\small\itshape\leftmark}
+\fancyhead[RO]{\small\itshape\rightmark}
+\fancyfoot[LE,RO]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[LE,RO]{\small\thepage}%
+  \renewcommand{\headrulewidth}{0pt}}
+
+% ---------- chapter / section titles ----------
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries}
+  {\filleft\normalsize\scshape chương \thechapter}
+  {6pt}{\filright}
+\titlespacing*{\chapter}{0pt}{-10pt}{28pt}
+\titleformat{\section}{\normalfont\Large\bfseries}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries}{\thesubsection}{0.8em}{}
+
+% ---------- listings ----------
+\lstdefinelanguage{yaml}{
+  keywords={true,false,null},
+  sensitive=true,
+  comment=[l]{\#},
+  morestring=[b]',
+  morestring=[b]",
+}
+\lstdefinelanguage{dockerfile}{
+  morekeywords={FROM,RUN,COPY,ADD,CMD,ENTRYPOINT,ENV,ARG,EXPOSE,WORKDIR,USER,VOLUME,LABEL,HEALTHCHECK},
+  sensitive=true,
+  comment=[l]{\#},
+  morestring=[b]",
+}
+\lstdefinelanguage{properties}{
+  sensitive=true,
+  comment=[l]{\#},
+}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape\color{inkmid},
+  stringstyle=\ttfamily,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  breaklines=true,
+  breakatwhitespace=false,
+  postbreak=\mbox{\footnotesize$\hookrightarrow$\,},
+  frame=single,
+  rulecolor=\color{inkmid},
+  framesep=4pt,
+  xleftmargin=2pt,
+  xrightmargin=2pt,
+  aboveskip=8pt,
+  belowskip=8pt,
+  escapeinside={(*@}{@*)},
+  tabsize=2,
+}
+
+% circled callout number: works in any font, crisp on e-ink.
+% usage in text: \co{1}   inside a listing: (*@\co{1}@*)
+\newcommand{\co}[1]{%
+  \tikz[baseline=(c.base)]\node[circle,draw,line width=0.5pt,
+    inner sep=1.1pt,minimum size=9.5pt,font=\scriptsize\bfseries](c){#1};}
+
+% inline code -- long identifiers (SPRING_DATASOURCE_URL) must be able to
+% break on this narrow page: \_ is a macro, so redefine it locally to
+% permit a break after each underscore.
+% Robust: \code appears inside section titles, which are written to the
+% .toc file -- a fragile \def there breaks the second LaTeX pass.
+\DeclareRobustCommand{\code}[1]{{\def\_{\textunderscore\allowbreak}\texttt{\small #1}}}
+
+% Prefer a slightly loose line over text running off the page -- on a
+% 6.75in page with unbreakable technical tokens this is the right trade.
+\emergencystretch=2.5em
+
+% ---------- the five box environments ----------
+% All grayscale; distinguished by border style, not hue.
+
+% DECISION -- why X and not Y (double rule)
+\newtcolorbox{decision}[1][]{enhanced,breakable,
+  colback=inkfaint,colframe=inkdark,
+  boxrule=0.6pt,arc=1.5pt,
+  title={\scshape quyết định\ifblank{#1}{}{ --- #1}},
+  fonttitle=\bfseries\small,
+  coltitle=white,colbacktitle=inkdark,
+  left=6pt,right=6pt,top=4pt,bottom=4pt}
+
+% PITFALL -- symptom first, then cause (thick rule)
+\newtcolorbox{pitfall}[1][]{enhanced,breakable,
+  colback=white,colframe=inkdark,
+  boxrule=1.4pt,arc=0pt,
+  title={\scshape cạm bẫy\ifblank{#1}{}{ --- #1}},
+  fonttitle=\bfseries\small,
+  coltitle=white,colbacktitle=inkdark,
+  left=6pt,right=6pt,top=4pt,bottom=4pt}
+
+% HANDSON -- run this, expect that (dashed rule)
+\newtcolorbox{handson}[1][]{enhanced,breakable,
+  colback=white,colframe=inkdark,
+  boxrule=0.6pt,arc=1.5pt,borderline={0.6pt}{2.5pt}{inkdark},
+  title={\scshape thực hành\ifblank{#1}{}{ --- #1}},
+  fonttitle=\bfseries\small,
+  coltitle=white,colbacktitle=inkdark,
+  left=6pt,right=6pt,top=4pt,bottom=4pt}
+
+% HARDWARE -- true only on this 2-core/19GB box
+\newtcolorbox{hardware}[1][]{enhanced,breakable,
+  colback=inklight,colframe=inkmid,
+  boxrule=0.6pt,arc=1.5pt,
+  title={\scshape trên phần cứng này\ifblank{#1}{}{ --- #1}},
+  fonttitle=\bfseries\small,
+  coltitle=black,colbacktitle=inklight,
+  left=6pt,right=6pt,top=4pt,bottom=4pt}
+
+% QUIZ -- end-of-chapter self check; answers in Appendix A
+\newtcolorbox{quiz}{enhanced,breakable,
+  colback=white,colframe=inkdark,
+  boxrule=0.6pt,arc=1.5pt,
+  title={\scshape tự kiểm tra \normalfont\small(đáp án: Phụ lục A)},
+  fonttitle=\bfseries\small,
+  coltitle=white,colbacktitle=inkdark,
+  left=6pt,right=6pt,top=4pt,bottom=4pt}
+
+% ---------- tikz styles for diagrams ----------
+\tikzset{
+  box/.style={draw,line width=0.6pt,rounded corners=1.5pt,
+    minimum height=7.5mm,inner xsep=2.5mm,font=\small,align=center},
+  boxfill/.style={box,fill=inklight},
+  boxdark/.style={box,fill=inkdark,text=white},
+  flow/.style={-{Stealth[length=2.4mm]},line width=0.7pt},
+  flowdash/.style={flow,dashed},
+  lbl/.style={font=\scriptsize\itshape,text=black},
+}
+
+% ---------- hyperref last ----------
+\RequirePackage[hidelinks,bookmarksnumbered]{hyperref}

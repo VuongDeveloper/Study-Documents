@@ -1,0 +1,163 @@
+\chapter{Dữ liệu quan hệ: Postgres, JPA, Flyway}
+\label{ch:postgres}
+
+Hai trong số các service, mỗi service sở hữu một cơ sở dữ liệu
+PostgreSQL: auth-service sở hữu \code{ts\_auth}, course-service sở hữu
+\code{ts\_course}. Chương này bàn ba tầng nằm giữa một phương thức
+\code{@Service} và các byte trên đĩa --- JPA/Hibernate, connection pool,
+và Flyway --- cùng quy tắc kiến trúc giải thích vì sao lại có tới
+\emph{hai} cơ sở dữ liệu.
+
+\section{Mỗi service một cơ sở dữ liệu}
+
+\begin{decision}[hai server Postgres, không phải hai schema trong một]
+Mỗi service sở hữu dữ liệu của mình một cách độc quyền; đường duy nhất
+tới dữ liệu của service khác là qua API hoặc sự kiện của nó. Điều này
+cấm kiểu thất bại kinh điển của cơ sở dữ liệu dùng chung --- service A
+lặng lẽ join vào bảng của service B, trói schema hai bên với nhau mãi
+mãi. Dự án đi xa hơn mức cần thiết: không chỉ cơ sở dữ liệu riêng mà
+cả tiến trình server riêng, nên ngay cả kết nối chéo vô tình cũng bất
+khả, và mỗi bên có thể được tinh chỉnh, sao lưu, hay làm hỏng độc lập.
+Chi phí trên máy này: khoảng 256\,MiB cho mỗi server thêm. Trong một
+tài khoản cloud, cùng mức cô lập đó thường là hai cơ sở dữ liệu trên
+một instance RDS được quản lý --- cô lập bằng thông tin đăng nhập thay
+vì bằng tiến trình --- vì instance được quản lý tính tiền theo server.
+\end{decision}
+
+\section{JPA và Hibernate}
+
+JPA là đặc tả (các annotation như \code{@Entity},
+\code{@OneToMany}, \code{EntityManager}); Hibernate là bản cài đặt mà
+Spring Boot tự cấu hình. Spring Data JPA nằm bên trên, suy ra truy vấn
+từ tên phương thức repository (\code{findByCourseIdAndStudentId}) và
+sinh phần mã lặp.
+
+Cấu hình từ \code{configurations/course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ts_course   (*@\co{1}@*)
+    username: postgres
+    password: root                                    (*@\co{2}@*)
+  jpa:
+    hibernate:
+      ddl-auto: none                                  (*@\co{3}@*)
+    show-sql: true                                    (*@\co{4}@*)
+  flyway:
+    enabled: true                                     (*@\co{5}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Mặc định khi dev. Compose ghi đè host thành
+  \code{postgres-course}; Kubernetes ghi đè y hệt qua
+  \code{SPRING\_DATASOURCE\_URL}. Để ý Service k8s được cố ý \emph{đặt
+  tên} \code{postgres-course} để chuỗi ghi đè giống nhau ở cả hai môi
+  trường.
+  \item[\co{2}] Thông tin đăng nhập dạng văn bản thuần chỉ chấp nhận
+  được vì file này là \emph{mặc định khi dev}; trong cụm,
+  \code{SPRING\_DATASOURCE\_USERNAME}/\code{PASSWORD} tới từ một Secret
+  Kubernetes (Chương~16) và có ưu tiên cao hơn.
+  \item[\co{3}] Dòng quan trọng nhất trong khối ---
+  Mục~\ref{sec:ddlauto}.
+  \item[\co{4}] Mọi câu SQL đều được log --- một công cụ dạy học và một
+  máy dò truy vấn N+1 khi dev; tắt đi ở nơi dung lượng log tốn tiền.
+  \item[\co{5}] Quản lý schema thuộc về Flyway, không phải Hibernate.
+\end{description}
+
+\section{Vì sao \code{ddl-auto: none}}
+\label{sec:ddlauto}
+
+Hibernate có thể sinh schema từ entity (\code{ddl-auto: update}), và
+tutorial nào cũng dùng nó. Hệ thống production thì không, vì
+\code{update} là cái bánh cóc một chiều không có lịch sử: nó thêm cột
+nhưng không bao giờ xóa hay đổi tên một cách an toàn; cơ sở dữ liệu của
+hai lập trình viên lệch nhau âm thầm; không có bản ghi nào về cái gì đổi
+khi nào, và không có cách nào xem xét một thay đổi schema trước khi nó
+chạm tới production.
+
+\section{Flyway: migration dưới dạng code}
+
+Flyway coi schema là một chuỗi có thứ tự các script SQL bất biến, mỗi
+script áp dụng đúng một lần, được theo dõi trong một bảng
+(\code{flyway\_schema\_history}) ngay trong cơ sở dữ liệu đích:
+
+\begin{lstlisting}
+auth-service/src/main/resources/db/migration/
+  V1__create_users.sql
+  V2__create_refresh_tokens.sql
+  V3__add_admin_user_invitations.sql
+  V4__seed_default_admin.sql
+\end{lstlisting}
+
+Lúc khởi động, Flyway so bảng lịch sử với các script trên classpath và
+áp dụng những script còn thiếu, theo thứ tự phiên bản, trước khi
+Hibernate kịp khởi tạo. Các quy tắc làm nó hoạt động: không bao giờ sửa
+một migration đã áp dụng (mỗi dòng lưu một checksum --- sửa sẽ bị phát
+hiện và từ chối); chỉ thêm phiên bản mới; và viết migration tương thích
+với phiên bản ứng dụng \emph{trước đó} khi bạn triển khai cuốn chiếu
+(Chương~15): thêm-rồi-chuyển-rồi-xóa, không bao giờ đổi tên trong một
+bước.
+
+\begin{pitfall}[chạy tốt ở máy mình, CrashLoopBackOff trong cụm]
+Triệu chứng: service khởi động được trên máy bạn nhưng pod của nó khởi
+động lại không ngừng; log cho thấy Flyway lệch checksum hoặc một
+migration thất bại. Nguyên nhân: cơ sở dữ liệu cục bộ đã được migrate
+bằng một script cũ hơn (hoặc đã bị sửa) --- bảng lịch sử trên laptop của
+bạn và của cụm không khớp nhau. Đây cũng là lý do startup probe của
+Kubernetes (Chương~17) nhắm vào một endpoint chỉ trả lời sau khi Spring
+context đã lên: ``migration đã áp dụng'' là một phần của nghĩa
+\emph{sẵn sàng}. Sửa bằng cách thêm một migration hiệu chỉnh, không bao
+giờ bằng cách sửa lịch sử.
+\end{pitfall}
+
+\section{Connection pool}
+
+Mở một kết nối Postgres tốn một bắt tay TCP, xác thực, và một lần fork
+tiến trình server --- quá đắt cho mỗi request. HikariCP (pool mặc định
+của Spring Boot) giữ một nhóm nhỏ kết nối đang mở để request mượn rồi
+trả. Tối đa mặc định: 10.
+
+\begin{hardware}
+Truyền miệng về kích thước pool nói ``nhiều kết nối hơn, thông lượng cao
+hơn''; thực tế trên server 2 nhân thì ngược lại --- Postgres làm việc
+\emph{theo từng kết nối}, và công thức thực dụng
+(\(\approx\) số nhân $\times$ 2) cho thấy mặc định 10 đã là hào phóng
+với hai service chia nhau hai nhân. Nếu Postgres có lúc báo
+\code{too many clients}, hãy hạ pool xuống trước khi nâng
+\code{max\_connections}.
+\end{hardware}
+
+\section{Ngoài dự án}
+
+Phiên bản cloud được quản lý tương đương với thiết lập của chương này
+--- AWS RDS Postgres với cùng luồng Flyway --- chỉ thay đổi URL và mô
+hình tin cậy:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  datasource:
+    url: jdbc:postgresql://app-db.xxxxx.eu-central-1.rds.amazonaws.com:5432/ts_course
+    username: ${DB_USER}        # from AWS Secrets Manager
+    password: ${DB_PASSWORD}
+\end{lstlisting}
+
+Sao lưu, sao chép (replication) và failover thành việc của nhà cung
+cấp --- đó là lý do cảnh báo của Chương~19 về trạng thái tự host lại
+quan trọng. Biến thể công nghiệp thứ hai đáng biết: chạy Flyway như một
+bước CI riêng (\code{flyway migrate} vào đích) thay vì lúc ứng dụng khởi
+động, để thay đổi schema triển khai độc lập với code và một migration
+chậm không ăn hết ngân sách của startup probe.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Nêu hai kiểu thất bại cụ thể của \code{ddl-auto: update} trong
+  môi trường làm việc nhóm mà \code{none} + Flyway ngăn được.
+  \item Vì sao không bao giờ được sửa một migration đã áp dụng, và
+  Flyway dùng gì để phát hiện?
+  \item Bạn cần đổi tên một cột mà không có downtime dưới triển khai
+  cuốn chiếu. Phác thảo chuỗi nhiều bản phát hành.
+  \item Bảo vệ và phản bác quyết định hai server: mỗi phía một lập
+  luận, và bối cảnh nào thì phía nào thắng.
+\end{enumerate}
+\end{quiz}

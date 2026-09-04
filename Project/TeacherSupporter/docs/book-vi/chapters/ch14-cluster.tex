@@ -1,0 +1,134 @@
+\chapter{Kubernetes: Giải phẫu cụm và vòng lặp điều hòa}
+\label{ch:cluster}
+
+\section{Ý tưởng duy nhất mà mọi thứ khác treo lên}
+
+Bạn không bảo Kubernetes \emph{làm} gì; bạn bảo nó điều gì phải
+\emph{đúng}. Bạn ghi \emph{trạng thái mong muốn} (``một Deployment tên
+course-service với 1 replica của image X'') vào cơ sở dữ liệu của nó
+qua API server; các \emph{controller} chạy vòng lặp điều hòa
+(reconciliation) mãi mãi, so sánh mong muốn với thực tế và hành động
+trên phần chênh lệch. Xóa một pod: controller của nó nhận ra thực tế
+$\neq$ mong muốn và tạo cái khác. Không ai phát lại lệnh của bạn ---
+trạng thái tự hội tụ.
+
+Điều này giải thích những hành vi nếu không sẽ có vẻ lạ:
+
+\begin{itemize}
+  \item \code{kubectl apply} là một phép gộp vào trạng thái mong muốn,
+  không phải chạy script --- apply cùng một file hai lần, lần thứ hai
+  chẳng có gì xảy ra (tính lũy đẳng --- thuộc tính mà pipeline dựa vào
+  ở Chương~23).
+  \item Không có ``thứ tự khởi động.'' Mọi thứ khởi động cùng lúc;
+  service nào cần dependency chưa có sẽ crash và được khởi động lại cho
+  tới khi thế giới sẵn sàng. Crash-loop \emph{trong lúc} hội tụ là vận
+  hành bình thường, không phải lỗi.
+  \item Xóa khỏi file manifest không xóa khỏi cụm --- apply chỉ thêm và
+  cập nhật, nó không dọn (prune). Gỡ Ingress course-service cũ đã cần
+  một lệnh \code{kubectl delete} tường minh.
+\end{itemize}
+
+\section{Các bộ phận chuyển động}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 10mm]
+  \node[boxdark] (api) {API server};
+  \node[boxfill, right=of api] (etcd) {state store\\\scriptsize (etcd / sqlite)};
+  \node[box, below left=6mm and -2mm of api] (sched) {scheduler};
+  \node[box, below right=6mm and -2mm of api] (cm) {controller\\manager};
+  \node[box, below=16mm of api] (kubelet) {kubelet + containerd\\\scriptsize trên node};
+  \draw[flow] (api) -- (etcd);
+  \draw[flowdash] (sched) -- (api);
+  \draw[flowdash] (cm) -- node[lbl,right]{vòng điều hòa} (api);
+  \draw[flow] (kubelet) -- node[lbl,left]{watch \& report} (api);
+  \node[lbl, left=8mm of api] (kubectl) {kubectl};
+  \draw[flow] (kubectl) -- (api);
+\end{tikzpicture}
+\caption{Mọi thứ chỉ nói chuyện với API server.}
+\end{figure}
+
+\begin{description}
+  \item[API server] cửa trước duy nhất; \code{kubectl} là một REST
+  client của nó. Xác thực, phân quyền (RBAC của Chương~22) và kiểm tra
+  hợp lệ diễn ra ở đây.
+  \item[Kho trạng thái (state store)] cơ sở dữ liệu trạng thái mong
+  muốn (etcd trong cụm chuẩn; k3s nhúng sqlite khi chỉ có một node).
+  \item[Bộ lập lịch (scheduler)] gán pod chưa được lập lịch vào node,
+  tôn trọng \emph{requests} tài nguyên của Chương~17.
+  \item[Controller manager] các vòng lặp điều hòa: Deployment
+  $\rightarrow$ ReplicaSet $\rightarrow$ pod, endpoints, và hàng chục
+  vòng khác.
+  \item[kubelet] agent trên node: theo dõi các pod được gán cho node
+  mình, điều khiển containerd để chạy chúng, thực thi probe, báo cáo
+  trạng thái.
+\end{description}
+
+k3s đóng gói toàn bộ những thứ này vào một binary --- một Kubernetes
+được CNCF chứng nhận, trừ đi chi phí của một VM, cộng thêm pin sẵn:
+Traefik làm Ingress controller, lưu trữ local-path, containerd. Mọi
+manifest trong sách này áp dụng nguyên xi lên EKS hay OpenShift; chính
+chứng nhận đó là lý do học trên k3s chuyển giao được.
+
+\section{Object, label, namespace}
+
+Mọi object là một tài liệu YAML với cùng bộ khung --- \code{apiVersion},
+\code{kind}, \code{metadata} (tên, namespace, label), \code{spec} (mong
+muốn), \code{status} (quan sát được, do controller ghi). Hai cơ chế tổ
+chức:
+
+\begin{description}
+  \item[Namespace] phân vùng cụm; dự án này đặt mọi thứ trong
+  \code{ts}, giữ nó tách biệt với \code{kube-system} và cho phép giới
+  hạn phạm vi RBAC --- quyền của Jenkins dừng lại ở ranh giới namespace
+  (Chương~22).
+  \item[Label] cặp khóa/giá trị tùy ý; \emph{selector} truy vấn chúng.
+  Mọi mối nối trong Phần~V đều là một label selector: Service tìm pod
+  theo label, Deployment sở hữu pod theo label. Kustomization đóng dấu
+  \code{app.kubernetes.io/part-of: teacher-supporter} lên mọi thứ để
+  một selector có thể liệt kê --- hoặc xóa --- cả ứng dụng.
+\end{description}
+
+\section{Đưa kubectl tới cụm}
+
+\code{kubectl} đọc \code{\textasciitilde/.kube/config}: URL của cụm,
+chứng chỉ CA và một thông tin đăng nhập. Từ Windows, dự án này với tới
+\code{https://100.85.66.43:6443} qua Tailscale --- điều đòi hỏi cài k3s
+với \code{--tls-san 100.85.66.43}, vì chứng chỉ của API server chỉ hợp
+lệ cho những tên được nướng vào lúc cài đặt.
+
+\begin{handson}[cảm nhận vòng lặp]
+\begin{lstlisting}[language=bash]
+kubectl -n ts get pods
+kubectl -n ts delete pod -l app=course-service
+kubectl -n ts get pods -w
+\end{lstlisting}
+Xóa pod, rồi quan sát: một pod thay thế xuất hiện trong vài giây, được
+tạo không phải bởi lệnh của bạn mà bởi ReplicaSet controller nhận ra
+thiếu một replica. Bạn chưa hề ra lệnh khởi động lại --- bạn làm trạng
+thái thực tế lệch khỏi mong muốn, và vòng lặp đã khép lại khoảng cách
+đó.
+\end{handson}
+
+\begin{pitfall}[certificate is valid for\ldots{} not 100.85.66.43]
+Triệu chứng: \code{kubectl} từ Windows thất bại khi kiểm tra TLS trong
+khi chạy tốt trên server. Nguyên nhân: chứng chỉ API server thiếu địa
+chỉ tailnet trong SAN --- nó được cài mà không có \code{--tls-san}. Sửa
+lúc cài đặt chỉ là một cờ; sửa sau đó nghĩa là xóa thư mục TLS của
+server và khởi động lại k3s. Một trường hợp cụ thể của quy tắc chung:
+chứng chỉ gắn với \emph{tên}, nên hãy quyết định mọi tên mà server sẽ
+được gọi \emph{trước} khi cấp.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Giải thích ``khai báo'': bạn viết gì, ai hành động trên nó, và
+  vì sao apply cùng một manifest hai lần không thay đổi gì?
+  \item Vì sao Kubernetes cố ý không có \code{depends\_on}, và điều gì
+  thay cho thứ tự khởi động trong lúc hội tụ?
+  \item Lần theo \code{kubectl -n ts delete pod ...} qua các thành
+  phần: ai nhận, ai nhận ra, ai hành động, trên máy nào?
+  \item Vì sao gỡ Ingress cũ khỏi git không gỡ nó khỏi cụm, và hai lệnh
+  nào đều có thể gỡ được nó?
+\end{enumerate}
+\end{quiz}

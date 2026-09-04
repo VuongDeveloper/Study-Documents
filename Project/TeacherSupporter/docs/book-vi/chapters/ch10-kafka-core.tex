@@ -1,0 +1,150 @@
+\chapter{Kafka: Mô hình lõi}
+\label{ch:kafkacore}
+
+Kafka là công nghệ đáng học sâu nhất trong stack này: nó xuất hiện trong
+một phần lớn các mô tả công việc backend, và mô hình của nó thực sự khác
+với một hàng đợi thông điệp (message queue). Chương này là Kafka độc lập
+với nền tảng; Chương~11 là phía Spring.
+
+\section{Một log, không phải một hàng đợi}
+
+Trừu tượng lõi của Kafka là một \emph{log chỉ ghi nối thêm} (append-only
+log). Một \emph{topic} (ví dụ \code{ts.user.registered}) được chia thành
+các \emph{phân vùng} (partition); mỗi partition là một dãy \emph{record}
+có thứ tự và bất biến, mỗi record ở một \emph{offset} được đánh số.
+Record không bị xóa khi đọc --- chúng hết hạn theo chính sách retention
+(dự án này: 168 giờ). Đọc không phá hủy; consumer chỉ nhớ \emph{mình đã
+đọc tới đâu}.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3mm and 8mm]
+  \node[lbl] (t) at (0,1.35) {topic ts.user.registered};
+  \foreach \p/\y in {0/0.6, 1/0} {
+    \node[lbl,anchor=east] at (0.1,\y) {p\p};
+    \foreach \i in {0,...,6} {
+      \node[draw,minimum size=5mm,font=\scriptsize] at (0.65+\i*0.62,\y) {\i};
+    }
+  }
+  \draw[flow] (5.2,1.15) node[lbl,right]{producer ghi nối} -- (4.7,0.72);
+  \draw[flow] (2.55,-0.75) node[lbl,below]{offset của group: 4} -- (3.13,-0.28);
+\end{tikzpicture}
+\caption{Hai partition; producer ghi nối thêm ở đầu, consumer group nhớ
+một offset cho mỗi partition.}
+\end{figure}
+
+Các hệ quả, mà một hàng đợi không có cái nào:
+
+\begin{itemize}
+  \item \textbf{Phát lại được.} Một consumer mới có thể bắt đầu từ offset
+  0 và thấy lịch sử. Sang năm triển khai một service phân tích mới; nó
+  có thể xử lý các lượt đăng ký của tuần trước.
+  \item \textbf{Nhiều người đọc.} Notification-service và course-service
+  cùng đọc sự kiện auth một cách độc lập, theo nhịp riêng, không giành
+  của nhau --- mỗi \emph{consumer group} giữ offset riêng của mình.
+  \item \textbf{Có thứ tự trong từng partition.} Các record có cùng
+  \emph{key} băm về cùng một partition và giữ nguyên thứ tự. Đây là lý do
+  các publisher trong dự án này dùng \code{userId} làm key: mọi sự kiện
+  về một người dùng đến theo đúng trình tự. Giữa các partition thì không
+  có thứ tự --- chỉ thiết kế dựa trên thứ tự theo key.
+\end{itemize}
+
+\section{Consumer group}
+
+Một consumer group là một đội có tên chia nhau việc: mỗi partition được
+gán cho đúng một consumer \emph{trong group}. Hai consumer trong group
+\code{notification-group} trên một topic 2 partition nhận mỗi bên một
+partition; consumer thứ ba ngồi không --- \emph{partition là đơn vị của
+tính song song}. Khi một consumer tham gia hoặc chết, group
+\emph{rebalance}: partition được gán lại và các thành viên tạm dừng
+trong chốc lát. Các group khác nhau vô hình với nhau, và đó là cách cùng
+một sự kiện tỏa ra cả \code{notification-group} lẫn \code{course-group}.
+
+\section{Broker, replication, KRaft}
+
+Một cụm production chạy nhiều \emph{broker}; mỗi partition có một leader
+trên một broker và các \emph{replica} trên những broker khác
+(\code{replication-factor}, RF). Producer ghi vào leader; \code{acks=all}
+chờ cho tới khi các replica đồng bộ (ISR) đã có bản ghi. Việc điều phối
+metadata trước đây cần ZooKeeper, một hệ phân tán thứ hai; Kafka hiện
+đại thay nó bằng \emph{KRaft} --- các broker tự chạy một quorum Raft nội
+bộ. Dự án này chạy KRaft với một node đóng cả hai vai \code{broker} và
+\code{controller}, RF\,=\,1: ổn cho homelab, khả năng chịu lỗi bằng
+không --- một đĩa hỏng là mất log.
+
+\section{Mê cung advertised listener}
+
+Lỗi Kafka được Google nhiều nhất. Từ \code{docker-compose.yml}:
+
+\begin{lstlisting}[language=yaml]
+KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092 (*@\co{1}@*)
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092 (*@\co{2}@*)
+KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093                (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \emph{Listener}: các socket mà broker mở. Ba cái: một cho
+  client bên trong mạng Docker, một cho controller KRaft, một công bố ra
+  máy host.
+  \item[\co{2}] \emph{Advertised} listener: các địa chỉ mà broker
+  \emph{bảo client hãy dùng}. Đây là cái bẫy: yêu cầu đầu tiên của một
+  Kafka client là ``leader của các partition ở đâu?'', và broker trả lời
+  bằng những chuỗi này. Container phải được bảo là \code{kafka:19092}
+  (phân giải được trên mạng Docker); công cụ trên laptop của bạn phải
+  được bảo là \code{localhost:9092}. Một broker, hai đối tượng, hai địa
+  chỉ advertised.
+  \item[\co{3}] Quorum KRaft gồm một thành viên: node 1 là toàn bộ cuộc
+  bầu cử.
+\end{description}
+
+\begin{pitfall}[kết nối được, rồi timeout]
+Triệu chứng: client kết nối tới địa chỉ bootstrap thành công, rồi mọi
+send/poll đều thất bại với \code{Connection to node -1 could not be
+established} hoặc treo. Nguyên nhân: bootstrap chạy được, nhưng
+\emph{câu trả lời metadata} advertise một địa chỉ mà client không với
+tới (ví dụ laptop của bạn bị bảo là \code{kafka:19092}). Địa chỉ
+bootstrap chỉ mở đầu cuộc trò chuyện; advertised listener mang toàn bộ
+lưu lượng sau đó. Chẩn đoán bằng cách hỏi broker advertise cái gì ---
+ví dụ \code{kcat -L -b localhost:9092} --- và kiểm tra đúng những chuỗi
+đó có phân giải được từ nơi client chạy hay không.
+\end{pitfall}
+
+\section{Ngữ nghĩa chuyển giao}
+
+Mặc định của Kafka là \emph{ít nhất một lần} (at-least-once): producer
+gửi lại sau khi mất ack, hoặc consumer sập sau khi xử lý nhưng trước khi
+commit offset, cả hai đều gây trùng lặp --- chứ không mất. Hãy thiết kế
+consumer \emph{lũy đẳng} (idempotent: xử lý cùng một sự kiện hai lần là
+vô hại): notification-service gửi trùng một email là chấp nhận được; một
+service thanh toán thì sẽ phải theo dõi ID các sự kiện đã xử lý. Đúng
+một lần (exactly-once) có tồn tại (producer lũy đẳng + transaction)
+nhưng trả giá bằng độ phức tạp; hãy biết rằng ít nhất một lần + consumer
+lũy đẳng là món cơm bữa của cả ngành.
+
+\section{Ngoài phạm vi dự án}
+
+Kafka được quản lý (AWS MSK, Confluent Cloud) bỏ đi việc vận hành broker
+và bán cùng giao thức đó --- client của bạn đổi một chuỗi bootstrap và có
+thêm SASL/TLS. Những cái tên khác trong mảng này giải quyết những bài
+toán khác: RabbitMQ là một \emph{hàng đợi} định tuyến thông minh (phân
+phối công việc, ack theo từng thông điệp, không phát lại); Redpanda
+hiện thực lại giao thức Kafka mà không cần JVM. Khi Chương~25 chuyển
+broker này vào cụm dưới Strimzi, không gì trong chương này thay đổi ---
+Strimzi là \emph{vận hành} cho cùng một Kafka.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Các sự kiện đăng ký của một người dùng phải được xử lý theo thứ
+  tự, nhưng khả năng mở rộng cũng quan trọng. Bạn dùng gì làm key, bao
+  nhiêu partition, và giới hạn song song là gì?
+  \item Hai group, \code{notification-group} và \code{course-group}, cùng
+  đọc \code{ts.user.activated}. Giải thích cách cả hai nhận được mọi sự
+  kiện.
+  \item Phân biệt \code{LISTENERS} với \code{ADVERTISED\_LISTENERS}, và
+  giải thích vì sao lỗi chúng gây ra xuất hiện \emph{sau} một kết nối
+  thành công.
+  \item Vì sao chuyển giao ít nhất một lần đẩy tính lũy đẳng về phía
+  consumer, và chiến lược lũy đẳng hợp lý của notification-service sẽ là
+  gì?
+\end{enumerate}
+\end{quiz}

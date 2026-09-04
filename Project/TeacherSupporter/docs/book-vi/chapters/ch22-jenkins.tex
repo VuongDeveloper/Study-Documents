@@ -1,0 +1,168 @@
+\chapter{Jenkins: CI server}
+\label{ch:jenkins}
+
+\section{Kiến trúc}
+
+Jenkins là một ứng dụng web Java --- \emph{controller} --- lưu job,
+credential, plugin và lịch sử build trong một thư mục,
+\code{JENKINS\_HOME}, và thực thi build hoặc trên chính nó (qua các
+\emph{executor}, các khe build song song của nó) hoặc trên các
+\emph{agent} từ xa. Mẫu hình doanh nghiệp là một controller không
+build gì cả, đẩy việc ra các agent dùng xong bỏ (thường là pod, qua
+plugin Kubernetes).
+
+\begin{decision}[build trên controller, Jenkins ngoài cluster]
+Hai sự đảo ngược thực hành doanh nghiệp kiểu homelab, cả hai đều là
+phép tính CPU. Agent pod sẽ tốn chi phí lập lịch và kéo image cho mỗi
+lần build trên cùng hai nhân mà chính build cần; hai executor của
+controller dành những chu kỳ đó cho Maven thay vì thế. Và Jenkins chạy
+trong Docker trên máy chủ, không phải trong k3s: nếu bạn làm hỏng
+cluster --- và trong lúc học, bạn sẽ làm hỏng --- thứ có thể dựng lại
+cluster không được chết cùng nó. Cả hai đều đảo ngược gọn gàng ở quy
+mô doanh nghiệp: Jenkins trong cluster với pod agent là nội dung của
+Chương~27, và bản thân cuộc di dời chính là bài học.
+\end{decision}
+
+\section{Image của controller, có chú giải}
+
+Thay vì bấm chuột cài công cụ vào một Jenkins nguyên bản, dự án nướng
+toolchain vào một image --- \code{deploy/jenkins/Dockerfile}:
+
+\begin{lstlisting}[language=dockerfile]
+FROM jenkins/jenkins:lts-jdk21          (*@\co{1}@*)
+USER root
+RUN ... temurin-25-jdk ...              (*@\co{2}@*)
+RUN ... apache-maven-3.9.9 ...          (*@\co{3}@*)
+RUN wget -qO /usr/local/bin/kubectl ... (*@\co{4}@*)
+ENV JDK25_HOME=/usr/lib/jvm/temurin-25-jdk-amd64  (*@\co{5}@*)
+USER jenkins
+RUN jenkins-plugin-cli --plugins \
+      git workflow-aggregator ... credentials-binding  (*@\co{6}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Jenkins LTS chạy trên JDK\,21 --- phiên bản mà
+  \emph{chính Jenkins} chạy trên đó.
+  \item[\co{2}] Dự án nhắm tới Java\,25, nên một JDK thứ hai được cài
+  cho việc \emph{build}. Lưu ý \code{JAVA\_HOME} \emph{không} bị đổi
+  toàn cục \co{5} --- Jenkinsfile đặt nó cho từng pipeline. Runtime
+  của controller và toolchain build là hai mối quan tâm độc lập;
+  Dockerfile này giữ chúng tách bạch rõ ràng.
+  \item[\co{3}] Maven ghim ở 3.9.9 --- gói của distro thường lạc hậu.
+  \item[\co{4}] \code{kubectl}: stage deploy chỉ là binary này cộng
+  với một kubeconfig.
+  \item[\co{6}] Plugin ghim trong image, không bấm chọn trên UI: hỗ
+  trợ pipeline, git, báo cáo JUnit, và \code{credentials-binding}
+  (dùng bởi \code{withCredentials} ở Chương~23). Toàn bộ ý nghĩa:
+  \emph{bản thân CI server giờ tái tạo được} --- hủy container, build
+  lại từ Dockerfile, và chỉ \code{JENKINS\_HOME} (một volume có tên)
+  mang trạng thái.
+\end{description}
+
+Một cờ lúc chạy trong \code{run.sh} xứng đáng có đoạn riêng:
+\code{--network host}. Jib bên trong Jenkins push tới
+\code{localhost:5000} --- và bên trong một container dùng mạng bridge,
+\code{localhost} sẽ là \emph{container}. Mạng host làm Jenkins dùng
+chung namespace mạng của máy chủ, nên \code{localhost:5000} của nó
+chính là registry mà k3s kéo image từ đó (hợp đồng đặt tên của
+Chương~13). Không phải đường tắt --- mà là yêu cầu của cách đặt tên
+image.
+
+\section{Credential}
+
+Jenkins lưu secret trong một kho mã hóa, tham chiếu bằng ID; pipeline
+gắn chúng vào biến môi trường chỉ trong phạm vi một khối
+(\code{withCredentials}), và bộ che log xóa giá trị của chúng khỏi
+đầu ra console. Dự án này lưu một credential: \code{kubeconfig-ts},
+một credential dạng file chứa kubeconfig mà Jenkins dùng để triển khai
+--- và đó là phần thú vị.
+
+\section{Danh tính triển khai: một ServiceAccount, không phải admin}
+
+Con đường lười biếng là đưa cho Jenkins kubeconfig admin của k3s ---
+\code{cluster-admin}, được phép xóa mọi namespace. Thay vào đó,
+\code{deploy/k8s/jenkins-rbac.yaml} dựng một danh tính tối thiểu:
+
+\begin{lstlisting}[language=yaml]
+kind: ServiceAccount          # the identity
+metadata: { name: jenkins, namespace: ts }
+---
+kind: Role                    # namespaced permissions
+metadata: { name: jenkins-deployer, namespace: ts }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"] (*@\co{1}@*)
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]                              (*@\co{2}@*)
+  # + services, PVCs, secrets, configmaps, ingresses, pods/log ...
+  - apiGroups: ["kafka.strimzi.io"]                              (*@\co{3}@*)
+    resources: ["kafkas", "kafkanodepools", "kafkatopics"]
+    verbs: ["get", "list", "create", "patch", "update"]
+---
+kind: RoleBinding             # identity <- permissions
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Các verb được suy ra từ chính các lệnh của pipeline:
+  \code{kubectl apply} cần get+create+patch; \code{set image} cần
+  get+patch. \emph{Không có delete ở bất cứ đâu}: CI chỉ tiến tới; con
+  người mới xóa. Một pipeline bị chiếm quyền vì thế có thể làm hỏng
+  các Deployment trong \code{ts} nhưng không thể quét sạch chúng, và
+  không thể nhìn ra ngoài namespace --- Role, không phải ClusterRole,
+  là quyết định về bán kính ảnh hưởng.
+  \item[\co{2}] Phát hiện theo cách trung thực: \code{rollout status}
+  theo dõi các ReplicaSet của Deployment, nên cần quyền đọc chúng ---
+  loại quyền bạn tìm ra bằng cách chạy pipeline với Role đó và đọc
+  lỗi \code{Forbidden} đầu tiên.
+  \item[\co{3}] Thêm cùng cột mốc~6: pipeline được phép khai báo
+  cluster và topic Kafka (custom resource theo namespace), nhưng cài
+  operator và các CRD của nó --- phạm vi cluster --- vẫn là việc của
+  admin (Chương~25). RBAC lớn thêm một rule cho mỗi API group mà
+  pipeline chạm tới; file Role là nhật ký thay đổi của những gì CI đã
+  được tin cậy.
+\end{description}
+
+Kubeconfig lưu trong Jenkins đơn giản ghép địa chỉ cluster với token
+của ServiceAccount này thay vì chứng chỉ admin.
+
+\begin{pitfall}[Forbidden: cannot create resource ``namespaces'']
+Triệu chứng: stage deploy chết với lỗi Forbidden trên
+\code{namespaces} dù file RBAC trông đã đầy đủ. Nguyên nhân: namespace
+thuộc \emph{phạm vi cluster}, và một Role theo namespace không thể cấp
+quyền đó --- chính xác là lý do \code{namespace.yaml} bị loại khỏi
+kustomization (Chương~20) và namespace được admin tạo một lần. Gỡ lỗi
+RBAC nói chung:
+\code{kubectl auth can-i patch deployments -n ts --as
+system:serviceaccount:ts:jenkins} trả lời ``việc này có được phép
+không'' mà không cần chạy pipeline.
+\end{pitfall}
+
+\begin{handson}[chứng minh ranh giới tồn tại]
+\begin{lstlisting}[language=bash]
+kubectl auth can-i patch deployments -n ts \
+  --as system:serviceaccount:ts:jenkins        # yes
+kubectl auth can-i delete deployments -n ts \
+  --as system:serviceaccount:ts:jenkins        # no
+kubectl auth can-i list pods -n kube-system \
+  --as system:serviceaccount:ts:jenkins        # no
+\end{lstlisting}
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Những gì nằm trong \code{JENKINS\_HOME}, và vì sao nướng
+  plugin vào image cộng với một volume cho home làm CI server trở
+  thành thứ dùng xong bỏ được?
+  \item Vì sao controller chạy hai JDK, và mỗi JDK được chọn ở đâu?
+  \item Dựng lại danh sách verb RBAC cho một pipeline chỉ chạy
+  \code{kubectl apply -k} và \code{rollout status} --- verb nào trong
+  Role của dự án khi đó có thể bỏ đi?
+  \item Giải thích \code{--network host} trên container Jenkins theo
+  hợp đồng đặt tên image của Chương~13.
+  \item ServiceAccount, Role, RoleBinding: cái nào là danh tính, cái
+  nào là năng lực, cái nào là mối nối --- và vì sao
+  Role-chứ-không-phải-ClusterRole là tiêu đề bảo mật?
+\end{enumerate}
+\end{quiz}

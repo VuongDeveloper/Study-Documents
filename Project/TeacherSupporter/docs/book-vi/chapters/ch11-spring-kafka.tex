@@ -1,0 +1,135 @@
+\chapter{Spring Kafka: Producer, Listener, Poison Pill}
+\label{ch:springkafka}
+
+\section{Phát sự kiện}
+
+Phát một sự kiện trong dự án này gồm hai bộ phận: một
+\code{KafkaTemplate} và cấu hình chọn serializer. Từ auth-service:
+
+\begin{lstlisting}[language=Java]
+kafkaTemplate.send("ts.user.registered", event.userId(), event);
+//                  topic                key             value
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml]
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+\end{lstlisting}
+
+Key (\code{userId}) là một chuỗi; value là record sự kiện được tuần tự
+hóa thành JSON. Dùng user id làm key là quyết định về thứ tự ở Chương~10
+được cụ thể hóa. \code{send()} là bất đồng bộ --- nó trả về một future;
+thông điệp nằm trong bộ đệm phía client cho tới khi broker ack. Hai hệ
+quả vận hành: một service có thể \emph{khởi động} mà không có broker
+(các lần gửi thất bại về sau, theo từng lời gọi --- đó là lý do
+auth-service có thể triển khai lên cụm trước Kafka), và một service sập
+ngay sau khi \code{send()} trả về có thể mất thông điệp đang nằm trong
+bộ đệm --- mẫu outbox bên dưới tồn tại cho khi điều đó quan trọng.
+
+\section{Tiêu thụ}
+
+\begin{lstlisting}[language=Java]
+@KafkaListener(topics = "ts.user.registered",
+               groupId = "notification-group")
+public void on(UserRegisteredEvent event) {
+    mailService.sendActivation(event);
+}
+\end{lstlisting}
+
+Spring chạy một vòng lặp poll cho mỗi listener container, giải tuần tự
+từng record, gọi phương thức, và commit offset sau khi xử lý thành công
+--- ít nhất một lần ngay từ đầu. Nửa consumer của file YAML chứa những
+dòng liên quan tới production nhất của chương này:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  kafka:
+    consumer:
+      group-id: course-group
+      auto-offset-reset: earliest                    (*@\co{1}@*)
+      key-deserializer: ...ErrorHandlingDeserializer (*@\co{2}@*)
+      value-deserializer: ...ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: ...JsonDeserializer
+        spring.json.trusted.packages: com.ts.common.dto  (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Nơi một group \emph{hoàn toàn mới} bắt đầu khi chưa có
+  offset đã commit: \code{earliest} = từ đầu khoảng retention; mặc định
+  \code{latest} = chỉ thông điệp mới. \code{earliest} nghĩa là một
+  consumer triển khai muộn vẫn xử lý các sự kiện đã phát trước khi nó tồn
+  tại --- lựa chọn đúng khi sự kiện là những sự thật cần hành động. Không
+  còn ý nghĩa một khi group đã có offset.
+  \item[\co{2}] Lá chắn chống poison pill --- mục tiếp theo.
+  \item[\co{3}] Giải tuần tự JSON khởi tạo các lớp được nêu tên trong
+  header thông điệp; chỉ tin cậy \code{com.ts.common.dto} ngăn một
+  producer độc hại hoặc có lỗi khiến consumer khởi tạo lớp tùy ý. Một
+  ranh giới bảo mật, không phải mã lặp.
+\end{description}
+
+\section{Poison pill}
+
+Một \emph{poison pill} (viên thuốc độc) là thông điệp mãi mãi không giải
+tuần tự được --- lỗi ở producer, một trường bị đổi tên, payload hỏng.
+Không có phòng thủ, listener ném lỗi \emph{trước khi} thông điệp có thể
+bị bỏ qua, offset không bao giờ tiến lên, và container thử lại cùng một
+record không ngừng: partition bị kẹt và log đầy lên với tốc độ tối đa.
+
+\code{ErrorHandlingDeserializer} bọc deserializer thật: khi thất bại nó
+phát ra một lỗi có kiểu thay vì ném ngoại lệ bên trong vòng lặp poll, để
+error handler của Spring bỏ qua record đó (tùy chọn sau vài lần thử lại,
+tùy chọn phát nó sang một dead-letter topic). Cách ghép --- error handler
+bên ngoài, JSON delegate bên trong --- là mẫu production chuẩn, và là lý
+do cấu hình nêu tên \emph{hai} lớp deserializer cho mỗi bên.
+
+\begin{pitfall}[một thông điệp hỏng, im lặng hoàn toàn]
+Triệu chứng: email thông báo dừng hẳn; consumer ghi cùng một stack trace
+giải tuần tự hàng nghìn lần. Nguyên nhân: một poison pill trên một
+partition mà không có deserializer xử lý lỗi --- vòng lặp không xử lý
+được cũng không bỏ qua được. Lỗi này ẩn mình trong những hệ thống chưa
+bao giờ thử với một thông điệp sai định dạng. Hãy kiểm chứng lá chắn của
+bạn một lần, có chủ đích: phát rác vào một topic dev và xem nó bị bỏ
+qua.
+\end{pitfall}
+
+\section{Những góc nâng cao}
+
+\begin{description}
+  \item[Dead-letter topic.] \code{DefaultErrorHandler} +
+  \code{DeadLetterPublishingRecordRecoverer}: sau N lần thử thất bại,
+  record rơi vào \code{<topic>.DLT} để xem xét và phát lại --- xử lý lỗi
+  có dấu vết kiểm toán.
+  \item[Mẫu outbox.] ``Lưu người dùng \emph{và} phát sự kiện'' là hai hệ
+  thống và không thể nguyên tử một cách trực tiếp. Outbox: ghi sự kiện
+  vào một bảng \code{outbox} trong \emph{cùng transaction cơ sở dữ liệu}
+  với hàng người dùng; một relay (hoặc Debezium đọc WAL) phát từ bảng đó.
+  Nếu một ngày auth-service không được phép mất sự kiện đăng ký, đây là
+  câu trả lời.
+  \item[Schema registry.] Các lớp sự kiện dùng chung ở Chương~6 giải
+  quyết việc producer/consumer thống nhất với nhau bên trong một repo. Ở
+  quy mô tổ chức, hợp đồng chuyển vào một schema registry (schema
+  Avro/Protobuf, được kiểm tra tương thích lúc phát) --- cùng ý tưởng,
+  nhưng do hạ tầng áp đặt thay vì một jar dùng chung.
+\end{description}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Vì sao auth-service khởi động được khi Kafka đang sập, và đến
+  thời điểm nào thì một sự cố Kafka trở nên hữu hình với nó?
+  \item Một consumer group mới được triển khai hôm nay. Giải thích
+  \code{auto-offset-reset: earliest} khiến nó làm gì, và khi nào thiết
+  lập này không còn tác dụng với group đó.
+  \item Đi qua kịch bản poison pill khi không có
+  \code{ErrorHandlingDeserializer}, rồi khi có. Trong một hệ thống
+  production đầy đủ, record hỏng cuối cùng nằm ở đâu?
+  \item Vì sao \code{spring.json.trusted.packages} là một biện pháp kiểm
+  soát bảo mật?
+  \item Khi nào mẫu outbox là cần thiết, và nó làm cho cặp thao tác ghi
+  nào trở nên nguyên tử một cách hiệu quả?
+\end{enumerate}
+\end{quiz}

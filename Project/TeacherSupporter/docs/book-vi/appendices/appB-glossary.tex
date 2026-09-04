@@ -1,0 +1,111 @@
+\chapter{Thuật ngữ}
+\label{app:glossary}
+
+\newcommand{\gloss}[2]{\item[#1] #2}
+\begin{description}\setlength{\itemsep}{2pt}
+\gloss{Actuator}{Các endpoint vận hành của Spring Boot
+  (\code{/actuator/health}, \code{/metrics}, \code{/prometheus}); mở ra
+  và phân quyền là hai quyết định riêng (Ch.~1).}
+\gloss{Advertised listener}{Địa chỉ mà broker Kafka bảo client dùng
+  sau bước bootstrap --- nguyên nhân thường gặp của hiện tượng kết nối
+  được rồi timeout (Ch.~10).}
+\gloss{Artifact}{Bất cứ thứ gì một build sinh ra đáng giữ lại (jar,
+  image, báo cáo); phải bất biến và truy nguyên được (Ch.~21).}
+\gloss{Auto-configuration}{(tự cấu hình) Spring Boot áp dụng cấu hình
+  có điều kiện dựa trên classpath, thuộc tính và bean của người dùng
+  (Ch.~1).}
+\gloss{Bootstrap servers}{Các địa chỉ Kafka ban đầu mà client liên hệ
+  để lấy metadata; mọi lưu lượng sau đó dùng advertised listener
+  (Ch.~10).}
+\gloss{ClusterIP}{Kiểu Service mặc định: một IP ảo ổn định, chỉ tới
+  được từ bên trong cụm (Ch.~18).}
+\gloss{Consumer group}{(consumer group) Một nhóm consumer Kafka có tên,
+  chia nhau các partition của một topic; mỗi nhóm giữ offset riêng
+  (Ch.~10).}
+\gloss{Controller (k8s)}{Một vòng lặp điều hòa hội tụ trạng thái thực
+  tế về trạng thái mong muốn cho một kind object (Ch.~14).}
+\gloss{CrashLoopBackOff}{Trạng thái pod: container liên tục thoát; độ
+  trễ khởi động lại tăng gấp đôi mỗi lần (Ch.~24).}
+\gloss{CRD / Operator}{Các kind resource tùy biến cộng một controller
+  cho chúng --- cách Strimzi quản lý Kafka theo kiểu khai báo
+  (Ch.~25).}
+\gloss{Dead-letter topic}{(dead-letter topic) Nơi consumer chuyển những
+  thông điệp xử lý thất bại nhiều lần (Ch.~11).}
+\gloss{Deployment}{Controller workload cho các replica thay thế được
+  cho nhau; quản lý ReplicaSet; cho phép cập nhật cuốn chiếu và
+  rollback (Ch.~15).}
+\gloss{Digest}{Mã băm nội dung bất biến của một image
+  (\code{@sha256:...}); tag dịch chuyển, digest thì không (Ch.~13).}
+\gloss{Endpoint (k8s)}{Một pod Ready đứng sau một Service; danh sách
+  sống được duy trì theo label selector và readiness (Ch.~18).}
+\gloss{Eureka}{Service registry của Netflix/Spring Cloud: đăng ký,
+  heartbeat, cache phía client (Ch.~3).}
+\gloss{Flyway}{Các migration SQL có phiên bản, bất biến, áp dụng lúc
+  khởi động và ghi vào một bảng lịch sử (Ch.~7).}
+\gloss{GitOps}{Mô hình triển khai trong đó một agent trong cụm kéo
+  trạng thái mong muốn từ git và hội tụ cụm về đó (Ch.~26).}
+\gloss{Ingress}{Object định tuyến HTTP tầng 7 (host/đường dẫn
+  $\rightarrow$ Service), được thực thi bởi một Ingress controller như
+  Traefik (Ch.~18).}
+\gloss{Jib}{Plugin Maven build image OCI theo layer mà không cần Docker
+  daemon (Ch.~13).}
+\gloss{JWT}{Token danh tính tự chứa, có chữ ký:
+  header.payload.signature; kiểm tra được mà không cần cơ sở dữ liệu
+  (Ch.~5).}
+\gloss{KRaft}{Cơ chế đồng thuận Raft tích hợp sẵn của Kafka thay cho
+  ZooKeeper (Ch.~10).}
+\gloss{kubelet}{Agent trên mỗi node, chạy pod và thực thi probe
+  (Ch.~14).}
+\gloss{Kustomize}{Ghép manifest không dùng template: base, overlay,
+  patch; tích hợp sẵn trong kubectl (Ch.~20).}
+\gloss{Liveness probe}{``Khởi động lại tôi nếu cái này hỏng'' --- probe
+  cần dè dặt nhất (Ch.~17).}
+\gloss{Namespace}{Phân vùng của cụm; phạm vi cho tên và RBAC
+  (Ch.~14).}
+\gloss{OOMKilled}{Exit 137: kernel giết container vì vượt giới hạn bộ
+  nhớ; không có trace nào từ phía ứng dụng (Ch.~17).}
+\gloss{Outbox pattern}{Làm cho ghi DB + phát sự kiện trở nên nguyên tử
+  trên thực tế bằng cách ghi sự kiện vào một bảng trong cùng giao dịch
+  (Ch.~11).}
+\gloss{Partition}{(phân vùng) Đơn vị thứ tự và song song của Kafka;
+  một chuỗi bản ghi bất biến, có thứ tự (Ch.~10).}
+\gloss{Poison pill}{Một thông điệp giải tuần tự thất bại mãi mãi, làm
+  kẹt partition của nó trừ khi xử lý lỗi bỏ qua nó (Ch.~11).}
+\gloss{Presigned URL}{(presigned URL) Một link có chữ ký, giới hạn thời
+  gian, cho phép trình duyệt truy cập trực tiếp một object trên
+  S3/MinIO (Ch.~9).}
+\gloss{Probe (startup/readiness/liveness)}{Các kiểm tra sức khỏe của
+  kubelet, lần lượt gác việc khởi động lại, nhận lưu lượng, và thời
+  gian ân hạn lúc boot (Ch.~17).}
+\gloss{PV / PVC / StorageClass}{Lưu trữ đã cấp phát, yêu cầu của một
+  workload lên nó, và nhà máy tạo PV theo nhu cầu (Ch.~19).}
+\gloss{RBAC}{Kiểm soát truy cập theo vai trò: ServiceAccount (danh
+  tính) + Role (động từ trên resource) + RoleBinding (mối nối)
+  (Ch.~22).}
+\gloss{Reconciliation}{(điều hòa) Vòng lặp điều khiển: so sánh trạng
+  thái mong muốn và thực tế, hành động trên phần chênh lệch, mãi mãi
+  (Ch.~14).}
+\gloss{Registry}{Kho lưu image nói giao thức Docker/OCI; giao diện giữa
+  bên build và cụm (Ch.~13).}
+\gloss{Relaxed binding}{Cách Spring ánh xạ
+  \code{SPRING\_DATASOURCE\_URL} thành \code{spring.datasource.url}
+  (Ch.~1).}
+\gloss{ReplicaSet}{Bộ đếm giữ N pod của một template luôn sống; do
+  Deployment quản lý, giữ lại để rollback (Ch.~15).}
+\gloss{Rolling update}{(cập nhật cuốn chiếu) Thay pod từng phần, gác
+  bằng readiness, để service không bao giờ dừng hẳn (Ch.~15).}
+\gloss{Secret (k8s)}{Object key/value theo namespace cho thông tin xác
+  thực; mã hóa base64, được bảo vệ bởi RBAC chứ không phải mật mã học
+  (Ch.~16).}
+\gloss{Service (k8s)}{Tên ổn định + IP ảo trên một tập pod chọn theo
+  label, lọc theo readiness (Ch.~18).}
+\gloss{ServiceAccount}{Một danh tính phi con người để truy cập API ---
+  thứ Jenkins dùng để deploy (Ch.~22).}
+\gloss{StatefulSet}{Controller workload cho các replica có trạng thái:
+  tên ổn định, PVC riêng từng replica, thay thế theo thứ tự (Ch.~15).}
+\gloss{Trusted edge}{(biên tin cậy) Gateway kiểm tra JWT một lần và
+  chuyển tiếp các header danh tính; các service tin chúng --- chỉ đúng
+  khi không có đường nào đi vòng qua gateway (Ch.~5).}
+\gloss{TOTP}{Mật khẩu một lần theo thời gian: bí mật chia sẻ + đồng hồ,
+  RFC 6238 (Ch.~5).}
+\end{description}

@@ -1,0 +1,531 @@
+\chapter{Đáp án tự kiểm tra}
+\label{app:answers}
+
+\section*{Chương 1 --- Spring Boot}
+\begin{enumerate}
+  \item Biến môi trường thắng: biến môi trường đứng trên tài liệu của
+  config-server, và tài liệu đó đứng trên YAML đóng gói trong jar. Đúng
+  với container vì image phải bất biến giữa các môi trường; những gì
+  khác nhau do runtime bơm vào.
+  \item \code{@Configuration}, \code{@ComponentScan},
+  \code{@EnableAutoConfiguration}. Cái cuối cùng: auto-configuration
+  phụ thuộc vào classpath, nên gỡ một dependency sẽ âm thầm gỡ luôn các
+  bean mà nó kích hoạt.
+  \item Nó được giải thành chuỗi ký tự \code{placeholder} theo đúng
+  nghĩa đen. Vì thế service vẫn \emph{khởi động} được dù không có
+  thông tin xác thực Google --- OAuth chỉ hỏng lúc người dùng bấm, chứ
+  không hỏng lúc boot.
+  \item Việc mở (exposure) khiến endpoint tồn tại; Spring Security vẫn
+  phân quyền từng request. Nếu \code{/actuator/**} không được cho phép,
+  probe nhận 401, và kubelet tính đó là thất bại.
+\end{enumerate}
+
+\section*{Chương 2 --- Config Server}
+\begin{enumerate}
+  \item Biến môi trường $>$ config-server $>$ YAML đóng gói.
+  \item Native phục vụ file từ thư mục classpath bên trong jar; git
+  thêm khả năng kiểm toán, review, hoàn tác, và thay đổi cấu hình mà
+  không cần build lại config-server.
+  \item \code{optional:} cho phép service boot khi config-server sập
+  --- nhưng khi đó nó boot với các giá trị mặc định localhost và hỏng
+  về sau, ở rất xa nguyên nhân.
+  \item Trong \code{application.yml} của chính nó, đóng gói trong jar
+  của nó. Nguyên tắc bootstrap: nguồn cấu hình không thể tự cấu hình
+  cho mình; mọi chuỗi như vậy đều cần một gốc tự chứa.
+\end{enumerate}
+
+\section*{Chương 3 --- Eureka}
+\begin{enumerate}
+  \item course-service đăng ký (POST) lúc khởi động; discovery client
+  của gateway làm mới cache registry của nó (mặc định tối đa
+  30\,s); rồi việc định tuyến cân bằng tải từ cache. Trường hợp xấu
+  nhất để một phiên bản mới nhận được lưu lượng: khoảng đăng ký + làm
+  mới cache, tức hàng chục giây.
+  \item Compose khiến \emph{tên} service phân giải được, và hostname
+  trùng với tên đó; trong Kubernetes hostname của pod là tên pod, thứ
+  không ai phân giải được --- nên phải đăng ký IP thay vào đó.
+  \item Ưu tiên tính sẵn sàng của dữ liệu registry hơn tính chính xác.
+  Có lợi: một switch khởi động lại làm im bặt mọi heartbeat nhưng các
+  phiên bản vẫn đang chạy. Có hại: sập thật hàng loạt để lại các phiên
+  bản đã chết vẫn nằm trong registry.
+  \item Danh sách endpoint của Service thay cho registry; readiness
+  probe thay cho heartbeat; kube-proxy/DNS thay cho tra cứu phía
+  client; ReplicaSet thay cho việc phiên bản mới tự đăng ký.
+\end{enumerate}
+
+\section*{Chương 4 --- API Gateway}
+\begin{enumerate}
+  \item Trình duyệt $\rightarrow$ ts.local (file hosts) $\rightarrow$
+  Traefik (Ingress: \code{/api} $\rightarrow$ Service api-gateway)
+  $\rightarrow$ pod gateway (predicate \code{/api/auth/**},
+  StripPrefix=2, không đòi JWT với \code{/api/auth}) $\rightarrow$
+  pod auth-service do Eureka phân giải, đến nơi dưới dạng \code{/login}
+  $\rightarrow$ controller.
+  \item Google kiểm tra redirect URI từng byte một; nó đã được đăng
+  ký với đường dẫn đầy đủ \code{/login/oauth2/...}, nên phải đến nơi
+  nguyên vẹn. Các route API thì cắt tiền tố vì controller được viết
+  không có tiền tố.
+  \item Mọi request mang token do auth-service ký đều trượt bước kiểm
+  tra của gateway --- 401 đồng loạt trên các route được bảo vệ trong
+  khi bản thân việc đăng nhập có vẻ vẫn chạy.
+  \item Proxy là bài toán I/O với độ đồng thời cao --- event loop rất
+  hợp. course-service làm việc JDBC kiểu blocking; reactive sẽ làm nó
+  phức tạp mà không có lợi ích gì cho đến khi chứng minh được điều
+  ngược lại.
+\end{enumerate}
+
+\section*{Chương 5 --- Bảo mật}
+\begin{enumerate}
+  \item CSRF bám vào một thông tin xác thực có sẵn trong môi trường
+  (cookie phiên được gửi tự động). JWT trong header Authorization được
+  code gắn vào một cách tường minh; một request giả mạo xuyên site
+  không thể thêm nó vào.
+  \item Mười lăm phút (thời hạn của nó). Không gì cả --- chữ ký không
+  thể thu hồi. \code{/refresh}: refresh token được đối chiếu với cơ sở
+  dữ liệu, nơi việc thu hồi được lưu.
+  \item Bất biến: mọi đường mạng đến một service đều đi qua filter JWT
+  của gateway. Bị phá khi: một Ingress định tuyến thẳng đến service
+  (route \code{/courses} đã xóa), hoặc bất kỳ bên gọi nào trong cụm
+  giả mạo header trên mạng pod phẳng.
+  \item Client-secret không bao giờ rời khỏi server; authorization
+  code thì đi qua trình duyệt. Code chỉ dùng một lần, sống ngắn, và vô
+  giá trị nếu không có client-secret lúc đổi lấy token.
+  \item HS256: một secret dùng chung; ai kiểm tra được thì cũng ký
+  được. RS256: khóa riêng ký, khóa công khai kiểm tra --- nên một IdP
+  có thể cho hàng nghìn service kiểm tra token mà không service nào
+  trong số đó đúc được token.
+\end{enumerate}
+
+\section*{Chương 6 --- Các service và module common}
+\begin{enumerate}
+  \item (a) HTTP --- bên gọi cần dữ liệu ngay. (b) Sự kiện --- một sự
+  thật mà bên khác phản ứng theo; việc chấm điểm không được chờ mail.
+  (c) Không cái nào: kiểm tra token là phép mật mã cục bộ với secret
+  dùng chung; không cần gọi đi đâu.
+  \item auth-service chỉ \emph{sản xuất} --- từng lần gửi hỏng riêng
+  lẻ, boot vẫn thành công. notification-service chỉ \emph{tiêu thụ};
+  không có broker thì nó chỉ là chi phí đứng không, nên nó đi kèm
+  Kafka.
+  \item Thuộc về common: các record sự kiện --- hai bên phải thống nhất
+  hình dạng. Không bao giờ: logic nghiệp vụ/entity --- hành vi dùng
+  chung trói chu kỳ phát hành của các service vào nhau và che mất ranh
+  giới.
+  \item Consumer triển khai trước producer, và thay đổi chỉ được thêm
+  vào (trường mới, tùy chọn). Khi đó consumer cũ bỏ qua trường mới và
+  consumer mới chịu được sự kiện cũ.
+\end{enumerate}
+
+\section*{Chương 7 --- Postgres, JPA, Flyway}
+\begin{enumerate}
+  \item Schema của hai lập trình viên âm thầm lệch nhau (update áp
+  dụng theo từng cơ sở dữ liệu, không có lịch sử); và thay đổi phá hủy
+  là bất khả thi --- update không bao giờ drop/đổi tên, nên refactor
+  entity lặng lẽ lệch khỏi schema.
+  \item Mỗi dòng lịch sử lưu checksum của script tương ứng; script bị
+  sửa sẽ lệch checksum và Flyway từ chối khởi động --- lịch sử là dấu
+  vết kiểm toán, và việc sửa sẽ làm giả nó.
+  \item Phát hành 1: thêm cột mới, ghi cả hai (hoặc dùng trigger).
+  Migration backfill. Phát hành 2: đọc cột mới, ngừng ghi cột cũ.
+  Phát hành 3: drop cột cũ. Mỗi bước tương thích với phiên bản ngay
+  trước nó.
+  \item Ủng hộ: cô lập lỗi và phạm vi ảnh hưởng --- một server sập,
+  nâng cấp, hay cấu hình sai không thể chạm tới dữ liệu của server
+  kia. Phản đối: gấp đôi bộ nhớ và bề mặt vận hành với một homelab.
+  Cloud có quản lý thường chọn cô lập bằng thông tin xác thực trên
+  một instance vì server là đơn vị tính tiền.
+\end{enumerate}
+
+\section*{Chương 8 --- MongoDB}
+\begin{enumerate}
+  \item Mục từ điển: tự chứa, đọc/ghi như một khối, lồng nhau tự
+  nhiên, không cần nhất quán giữa các mục. Enrollment: tham chiếu hai
+  aggregate khác và đòi hỏi nhất quán giữa chúng --- join và
+  transaction chính là điểm mấu chốt.
+  \item Vào code ứng dụng (và validator của collection nếu muốn). Kỷ
+  luật: lớp document đọc ngược được (trường mới là tùy chọn), và script
+  sửa dữ liệu tường minh khi đổi hình dạng.
+  \item Postgres từ chối kết nối đến cơ sở dữ liệu không tồn tại;
+  Mongo tạo cơ sở dữ liệu ở lần ghi đầu tiên, nên tên sai cho ra kết
+  quả rỗng. Ồn ào tốt hơn --- lỗi bạn thấy lúc triển khai hơn hẳn lỗi
+  bạn thấy lúc kiểm toán.
+  \item Chỉ ClusterIP + không có Ingress nghĩa là chỉ bên gọi trong cụm
+  mới chạm tới được; sự tương đồng với compose cũng giữ ma sát khi dev
+  bằng không. Mất hiệu lực ngay khi nó bị lộ ra ngoài cụm hoặc dùng
+  chung cụm với workload không đáng tin.
+\end{enumerate}
+
+\section*{Chương 9 --- MinIO / S3}
+\begin{enumerate}
+  \item Service ký (micro giây) thay vì stream (giây); storage phục vụ
+  byte trực tiếp. Kiểu lỗi mới: URL nhúng sẵn endpoint và thời hạn ---
+  endpoint sai hay lệch đồng hồ làm hỏng tải xuống chỉ ở trình duyệt,
+  service không nhìn thấy.
+  \item Service ký chạm tới MinIO qua \code{minio:9000} (DNS của cụm);
+  trình duyệt không phân giải được tên đó. Chữ ký bao trùm cả host,
+  nên viết lại sau khi ký sẽ làm chữ ký vô hiệu --- vì thế phải ký
+  với một endpoint thứ hai, công khai.
+  \item Thời hạn (15 phút) giới hạn cửa sổ thiệt hại; URL chỉ cấp một
+  object, không phải cả bucket; và không thể ký lại nếu không có khóa.
+  \item Thay đổi: endpoint, thông tin xác thực (lý tưởng là chuyển
+  sang IAM role), bảo đảm về độ bền. Không đổi: mọi lời gọi SDK, logic
+  bucket/key/presign --- API chính là chuẩn.
+\end{enumerate}
+
+\section*{Chương 10 --- Kafka cốt lõi}
+\begin{enumerate}
+  \item Key theo userId --- thứ tự theo key chính là thứ tự theo
+  partition. Số partition $\geq$ số consumer tối đa bạn từng muốn có
+  trong group; độ song song bị chặn trên bởi số partition.
+  \item Các group độc lập nhau: mỗi group giữ offset riêng cho từng
+  partition, nên cả hai group đều duyệt hết toàn bộ log; tiêu thụ là
+  đọc không phá hủy cộng với một con trỏ theo từng group.
+  \item \code{LISTENERS} = socket được bind; \code{ADVERTISED\_LISTENERS}
+  = địa chỉ \emph{trả về cho client} trong metadata. Bootstrap dùng
+  địa chỉ bạn cung cấp; mọi kết nối sau đó dùng địa chỉ được quảng bá
+  --- nên lỗi chỉ bắt đầu sau một cái bắt tay thành công.
+  \item Retry và sập sau khi xử lý đều gây gửi lại; broker không thể
+  biết bạn đã hành động chưa. Notification: khử trùng lặp theo id sự
+  kiện (hoặc chấp nhận một mail trùng hiếm hoi --- lũy đẳng bằng cách
+  chịu đựng).
+\end{enumerate}
+
+\section*{Chương 11 --- Spring Kafka}
+\begin{enumerate}
+  \item \code{send()} đệm ở phía client và trả về một future; không
+  cần broker cho đến lúc giao. Sự cố lộ ra theo từng lần gửi: future
+  thất bại sau timeout, và sự kiện đang đệm mất trắng nếu tiến trình
+  chết.
+  \item Khi chưa có offset đã commit, \code{earliest} bắt đầu từ record
+  cũ nhất còn được giữ --- lịch sử được xử lý lại. Một khi group đã
+  commit offset, thiết lập này không bao giờ được hỏi đến nữa.
+  \item Không có: giải tuần tự ném lỗi ngay trong poll, offset không
+  bao giờ tiến, partition kẹt mãi ở một record. Có: lỗi được vật chất
+  hóa thành một thất bại có kiểu, error handler bỏ qua (hoặc retry rồi
+  chuyển tiếp) --- ở production đầy đủ, chuyển đến
+  \code{<topic>.DLT}.
+  \item Giải tuần tự JSON khởi tạo các lớp được nêu tên trong header;
+  danh sách tin cậy không giới hạn cho phép một message bắt consumer
+  dựng lên kiểu bất kỳ trên classpath --- một vector tiêm gadget.
+  \item Khi ``ghi DB + phát sự kiện'' không được phép lệch nhau. Nó
+  làm cho thay đổi trạng thái và \emph{việc ghi lại ý định phát} trở
+  thành nguyên tử --- một transaction cục bộ; một relay đảm bảo việc
+  phát cuối cùng sẽ diễn ra.
+\end{enumerate}
+
+\section*{Chương 12 --- Docker}
+\begin{enumerate}
+  \item Namespace (góc nhìn cô lập) và cgroup (giới hạn tài nguyên).
+  Không có kernel khách: khởi động tính bằng mili giây và không tốn chi
+  phí hệ điều hành cho từng instance --- nhưng đồng thời: kernel dùng
+  chung (cô lập yếu hơn VM) và JVM nhìn thấy tài nguyên của host trừ
+  khi được bảo khác đi.
+  \item Bên trong container, \code{localhost} là chính container đó.
+  Compose sửa bằng DNS theo tên service trên mạng bridge; Kubernetes
+  bằng DNS của Service --- cả hai qua biến môi trường ghi đè các giá
+  trị mặc định localhost.
+  \item Mỗi container có network namespace riêng, nên cả hai đều bind
+  cổng 5432 ``của mình''. Xung đột quay lại ở host dùng chung: cổng
+  host được publish (vì thế mới có 5433/5434) --- và với
+  \code{--network host}, nơi không hề có sự tách biệt namespace.
+  \item \code{depends\_on} thường chờ \emph{đã khởi động};
+  \code{service\_healthy} chờ healthcheck vượt qua --- ở đây là
+  config-server tự curl \code{/actuator/health} của chính nó, được mở
+  bởi cấu hình management.
+\end{enumerate}
+
+\section*{Chương 13 --- Jib và Registry}
+\begin{enumerate}
+  \item Không cần daemon trong CI, chia layer theo độ biến động (push
+  lại nhỏ), image không chạy bằng root và sẵn sàng cho OpenShift. Về
+  bảo mật: không có daemon nghĩa là không có docker socket trong CI
+  --- socket đó là root trên host.
+  \item Tên image đồng thời là địa chỉ pull cho cụm. Ở đây chúng trùng
+  nhau vì Jenkins dùng chung network namespace với host; nếu Jenkins
+  chạy trên mạng bridge, \code{localhost:5000} của nó sẽ là chính nó
+  và push hỏng trong khi pull vẫn chạy.
+  \item Mỗi lần deploy phải import trên từng node, mất hàng phút tuần
+  tự hóa, và không có lịch sử tag bất biến; lệnh \code{set image} của
+  pipeline trỏ đến tên gắn tag SHA sẽ không có gì để trỏ vào ---
+  registry chính là thứ làm cho tag có địa chỉ.
+  \item Cùng tag, nội dung mới: với \code{IfNotPresent} image đã cache
+  trên node âm thầm thắng. Cách sửa: \code{imagePullPolicy: Always}
+  (lựa chọn của manifest), hoặc deploy bằng tag/digest bất biến (lựa
+  chọn của pipeline) --- dự án này làm cả hai.
+\end{enumerate}
+
+\section*{Chương 14 --- Giải phẫu cụm}
+\begin{enumerate}
+  \item Bạn viết trạng thái mong muốn; controller điều hòa trạng thái
+  thực tế về phía đó mãi mãi. Apply lần thứ hai không tạo ra diff, nên
+  không có hành động --- lũy đẳng nhờ kiến trúc.
+  \item Thứ tự là khái niệm thủ tục; hội tụ thay thế nó: mọi thứ cùng
+  khởi động, bên phụ thuộc sập rồi thử lại với backoff cho đến khi thứ
+  nó cần tồn tại. CrashLoop trong lúc hội tụ là cơ chế, không phải
+  bug.
+  \item kubectl gửi một lệnh REST delete đến API server; kho trạng
+  thái cập nhật; vòng lặp của controller ReplicaSet thấy replica 0 $<$ 1
+  và tạo một object pod; scheduler gán nó; kubelet trên node khởi động
+  container.
+  \item Apply hợp nhất trạng thái mong muốn; nó không bao giờ xóa
+  những gì vắng mặt trong đầu vào. \code{kubectl delete ingress
+  course-service -n ts}, hoặc apply với \code{--prune} (hoặc một
+  controller GitOps) thì sẽ xóa.
+\end{enumerate}
+
+\section*{Chương 15 --- Workload}
+\begin{enumerate}
+  \item Mỗi thay đổi template sinh ra một ReplicaSet mới trong khi các
+  ReplicaSet cũ được giữ ở scale 0 --- cập nhật cuốn chiếu và rollback
+  một lệnh là hệ quả của việc tách bộ đếm khỏi template có phiên bản.
+  \item Deployment: N replica thay thế được cho nhau, cái nào chết
+  cũng được, thứ tự không quan trọng. StatefulSet: replica có tên với
+  storage theo từng danh tính và thay thế có thứ tự. Eureka: Deployment
+  (registry được dựng lại nhờ đăng ký lại). Redis cache: Deployment
+  nếu thật sự chỉ là cache. Broker Kafka: StatefulSet. Gateway:
+  Deployment.
+  \item Pod mới phải vượt qua readiness trước khi pod cũ bị kết thúc
+  --- probe của Chương~17 là cổng gác cho rollout của Chương~15.
+  \item Cập nhật Deployment chạy pod cũ và mới đồng thời; hai tiến
+  trình postgres cùng mở một thư mục dữ liệu sẽ làm hỏng nó.
+  StatefulSet thay thế từng cái một và gắn lại claim cho pod kế nhiệm,
+  không bao giờ hai cái cùng lúc.
+\end{enumerate}
+
+\section*{Chương 16 --- Cấu hình và Secret}
+\begin{enumerate}
+  \item RBAC về việc ai được đọc object Secret; tách vòng đời khỏi git;
+  mã hóa khi lưu (tùy chọn). Dự án này: RBAC có (Role của Jenkins bỏ
+  qua quyền đọc secret... nó cấp create/patch nhưng kiểm soát thực tế
+  là giới hạn theo namespace), tách khỏi git có (script), mã hóa khi
+  lưu không.
+  \item Image server đọc \code{POSTGRES\_*}; Spring đọc
+  \code{SPRING\_DATASOURCE\_*}. Tách Secret nghĩa là mỗi pod chỉ nhập
+  những tên nó hiểu --- không có biến lạ che mất lỗi gõ hay rò rỉ
+  phạm vi.
+  \item Cập nhật: \code{JWT\_SECRET=new ./create-secrets.sh}; rồi ngay
+  lập tức \code{kubectl -n ts rollout restart deployment/auth-service
+  deployment/api-gateway}. Làm nửa chừng: bên ký và bên kiểm tra giữ
+  khóa khác nhau --- mọi lần đăng nhập đều 401, hoặc tệ hơn, chỉ sau
+  lần restart không liên quan tiếp theo.
+  \item Cây \code{configurations/*.yml} của config-server, mount dưới
+  dạng file --- và cho config-server nghỉ hưu luôn.
+\end{enumerate}
+
+\section*{Chương 17 --- Probe và tài nguyên}
+\begin{enumerate}
+  \item Startup thất bại quá ngân sách: restart. Readiness thất bại: bị
+  gỡ khỏi endpoint, không restart --- có thể mạnh tay. Liveness thất
+  bại: restart --- cái này phải dè dặt.
+  \item \code{/v3/api-docs} chỉ trả lời sau khi toàn bộ context (kể cả
+  Flyway) đã lên và được permitAll; một cổng đã bind chỉ chứng minh
+  Tomcat tồn tại. \code{/actuator/health} trả 401 ở nơi security không
+  cho phép (course/auth) và trung thực ở nơi cho phép (dictionary,
+  gateway).
+  \item OOM killer của kernel đã kết thúc cgroup vì vượt giới hạn bộ
+  nhớ --- JVM không hề tham gia, nên không có exception. Kiểm tra:
+  phép tính giữa limit và \code{MaxRAMPercentage}, và xem tải hay rò
+  rỉ đã làm heap phình lên.
+  \item Scheduler đọc requests (để xếp chỗ); kernel thực thi limits. Bộ
+  nhớ không nén được --- vượt là có kẻ bị giết, nên hãy chặn nó một
+  cách dự đoán được; CPU nén được --- limit sẽ bóp nghẹt lúc khởi động
+  đúng khi JVM cần bứt tốc.
+\end{enumerate}
+
+\section*{Chương 18 --- Mạng}
+\begin{enumerate}
+  \item DNS phân giải tên Service thành một IP ảo ổn định; endpoint
+  controller giữ danh sách pod Ready luôn cập nhật; kube-proxy (hoặc
+  thứ tương đương của k3s) viết lại lưu lượng đến IP ảo sang IP của
+  một pod được chọn; readiness quyết định tư cách thành viên.
+  \item Chỉ pod Ready mới là endpoint, nên cập nhật cuốn chiếu chuyển
+  lưu lượng đúng lúc pod mới vượt probe và pod cũ kết thúc --- không
+  gián đoạn chính là tương tác giữa probe và endpoint.
+  \item Selector/label lệch nhau --- Service khớp với không pod nào.
+  Không có gì báo lỗi vì Service không có endpoint là một trạng thái
+  hợp lệ; triệu chứng chỉ nhìn thấy trong \code{get endpoints}.
+  \item \code{ts.local} không phải DNS thật; file hosts ghim nó vào IP
+  của tailnet. Thay thế: một domain thật với DNS thực + TLS bằng
+  cert-manager, hoặc một Cloudflare Tunnel công bố hostname đó.
+\end{enumerate}
+
+\section*{Chương 19 --- Lưu trữ}
+\begin{enumerate}
+  \item Pod mount PVC; PV (và StorageClass) có phạm vi toàn cụm; lớp
+  gián tiếp này cho phép cùng một claim nhận local-path ở đây và EBS
+  trên EKS --- manifest không đổi.
+  \item Postgres chạy trên một node tại một thời điểm --- RWO là đủ.
+  Upload dùng chung đẩy người ta sang RWX; lưu trữ đối tượng thường
+  mới là câu trả lời đúng.
+  \item Xóa StatefulSet không đụng đến PVC nên dữ liệu sống sót qua sai
+  lầm điều phối; xóa PVC (reclaim \code{Delete}) gỡ luôn PV và dữ liệu
+  --- dữ liệu sống ở claim, không phải ở workload.
+  \item Bền vững (persistence): sống qua restart (có). Độ bền
+  (durability): sống qua hỏng phần cứng (không --- một SSD). Sao lưu:
+  sống qua sai lầm của chính bạn (không --- chưa có, khoảng trống
+  thành thật).
+\end{enumerate}
+
+\section*{Chương 20 --- Kustomize}
+\begin{enumerate}
+  \item Một tập hợp chuẩn (không sót gì, một lệnh) và các chỉnh sửa
+  xuyên suốt (namespace, label) được đóng dấu nhất quán.
+  \item Namespace: phạm vi toàn cụm --- Role theo namespace của Jenkins
+  không thể apply nó. Secret: giá trị tuyệt đối không được tồn tại
+  trong git --- hình dạng nằm trong script, giá trị nằm trong môi
+  trường của người vận hành.
+  \item Kustomize: triển khai ứng dụng của chính bạn dưới dạng YAML dễ
+  đọc. Helm: phân phối phần mềm có tham số đến cụm của người khác. Đến
+  dưới dạng chart: Strimzi và kube-prometheus-stack.
+  \item Không gì cả --- apply không dọn; mongodb vẫn chạy, giờ không
+  còn ai quản lý. Đúng cách: \code{kubectl delete -f mongodb.yaml} (rồi
+  gỡ khỏi danh sách), hoặc cơ chế prune/GitOps điều hòa cả việc xóa.
+\end{enumerate}
+
+\section*{Chương 21 --- Khái niệm CI/CD}
+\begin{enumerate}
+  \item CI: main luôn được xác nhận là build được --- stage Build. CD:
+  mọi thay đổi đã xác nhận tự đến production không cần ai đỡ --- stage
+  Deploy cộng với cổng gác rollout của nó.
+  \item Jenkins nằm sau NAT, không có địa chỉ công khai --- GitHub không
+  gọi vào được, nên Jenkins phải poll. Cùng ràng buộc: CI bên trong
+  mạng doanh nghiệp mà git host trên cloud không chạm tới được.
+  \item Build lại là một binary khác --- phân giải dependency, timestamp,
+  toolchain khác --- nên test đã chứng nhận một thứ khác. Thứ tự ưu
+  tiên biến môi trường của Chương~1 cho phép một artifact nhận cấu
+  hình theo môi trường lúc chạy.
+  \item Test bị bỏ qua (bật lại, hoặc gác ở chỗ khác và biết rõ điều
+  đó); deploy không được xác minh (rollout status/smoke test); thành
+  công được định nghĩa bằng exit code chứ không bằng hành vi (xác minh
+  dựa trên probe, alert).
+\end{enumerate}
+
+\section*{Chương 22 --- Jenkins}
+\begin{enumerate}
+  \item Job, credential, trạng thái plugin, lịch sử build. Image =
+  binary+plugin tái tạo được; volume = trạng thái không thay thế được;
+  gộp lại, server là gia súc với một thư mục thú cưng.
+  \item Jenkins chạy trên JDK\,21 của image gốc; build export
+  \code{JAVA\_HOME=JDK25\_HOME} trong khối environment của Jenkinsfile
+  --- theo từng pipeline, không phải toàn cục.
+  \item apply -k cần get/list + create/patch/update trên mọi kind được
+  apply; rollout status cần get/list/watch trên deployment và
+  replicaset. Bỏ được nếu không có \code{set image}: không gì mới ---
+  get+patch của set image đã được bao phủ sẵn; các quy tắc đọc pods/log
+  chỉ tồn tại cho trình xử lý thất bại.
+  \item Jib push đến \code{localhost:5000}, và tên đó phải chỉ cùng
+  một máy với cả bên push lẫn bên pull; host networking khiến
+  localhost của Jenkins chính là localhost của host, đúng như tên
+  image đã hứa với k3s.
+  \item ServiceAccount = danh tính; Role = danh sách năng lực;
+  RoleBinding = mối nối. Role chứ không phải ClusterRole giới hạn một
+  pipeline bị xâm nhập trong một namespace --- phạm vi ảnh hưởng như
+  một lựa chọn về kiểu.
+\end{enumerate}
+
+\section*{Chương 23 --- Pipeline}
+\begin{enumerate}
+  \item SNAPSHOT là khả biến --- một node có thể phục vụ bất kỳ build
+  lịch sử nào dưới cùng một tên; SHA ghim đúng commit và làm cho câu
+  hỏi ``cái gì đang chạy?'' trả lời được từ \code{kubectl describe}.
+  \item Chỉ build các module được liệt kê cộng với dependency của
+  chúng. Quên một mục MODULES: service mới không bao giờ có image;
+  vòng lặp deploy sau đó thất bại (hoặc deploy một image cũ nếu có)
+  --- điểm ghép nối thủ công duy nhất của pipeline.
+  \item \code{kubectl rollout status --timeout=300s} --- nó chuyển kết
+  quả probe (Chương~17) thành exit code của pipeline.
+  \item Mọi rollout nên tiến hành đồng thời; chờ theo từng service
+  tuần tự hóa sự hội tụ mà Kubernetes sẵn sàng làm song song --- cùng
+  tổng công việc, thời gian thực dài hơn.
+  \item Thay đổi: cách kích hoạt (webhook), nơi build chạy (runner tạm
+  thời), cơ chế secret (secret của repo). Không đổi: thứ tự stage, lệnh
+  Maven, gắn tag SHA, bước xác minh rollout.
+\end{enumerate}
+
+\section*{Chương 24 --- Vận hành}
+\begin{enumerate}
+  \item get pods $\rightarrow$ describe pod $\rightarrow$ logs
+  (\code{--previous} --- thiết yếu với CrashLoop, khi container hiện
+  tại chưa có lịch sử gì) $\rightarrow$ exec vào và thăm dò từ bên
+  trong.
+  \item CrashLoop: tiến trình thoát --- tầng ứng dụng.
+  \code{Running 0/1}: tiến trình sống nhưng readiness thất bại ---
+  đích của probe (thường là một dependency) mới là tầng cần xem.
+  \item Exec vào pod và thử kết nối từ đó --- DNS, đường mạng, và biến
+  môi trường được bơm vào của pod khác với laptop của bạn; laptop chỉ
+  chứng minh Postgres còn sống, không chứng minh pod chạm tới được nó.
+  \item Lưu lượng pod/service của k3s đi qua firewall của host; chặn
+  \code{10.42.0.0/16} hoặc \code{10.43.0.0/16} làm hỏng DNS và các
+  lời gọi pod-đến-pod một cách chập chờn --- triệu chứng không phân
+  biệt được với ứng dụng thiếu ổn định.
+\end{enumerate}
+
+\section*{Chương 25 --- Kafka trong cụm}
+\begin{enumerate}
+  \item Một controller có vòng lặp điều hòa nhắm đến các kind tài
+  nguyên tùy chỉnh do CRD định nghĩa. Strimzi thêm
+  \code{Kafka}/\code{KafkaNodePool} (cụm) và \code{KafkaTopic} (các hợp
+  đồng) --- cộng thêm các kind user, connect và bridge mà dự án này
+  không dùng.
+  \item Gói operator chứa các object phạm vi toàn cụm (CRD, ClusterRole)
+  mà Role theo namespace không thể cấp; \code{kafka.yaml} chỉ chứa tài
+  nguyên tùy chỉnh theo namespace, thứ Role giờ đã cho phép. Role hay
+  ClusterRole chính là ranh giới.
+  \item Advertised listener, các voter của controller quorum, bản đồ
+  giao thức bảo mật theo từng listener (thêm cả cluster ID và Service
+  cho từng broker). Operator tính chúng từ khai báo listener và node
+  pool.
+  \item Trạng thái thực của pod broker (\code{get pods}) và các dòng
+  điều hòa trong log của operator. Condition có thể là một lần ghi cũ
+  từ một vòng điều hòa đã timeout trong lúc pull image kéo dài; vòng
+  lặp định kỳ tiếp theo sẽ sửa lại.
+  \item Số partition được review, không có cuộc đua producer/topic ngày
+  đầu, và một bảng kê các hợp đồng sự kiện dưới dạng object. Một
+  partition: thứ tự toàn phần theo topic, đủ dùng chừng nào mỗi consumer
+  group chỉ có một instance; partition có thể thêm về sau nhưng không
+  bao giờ bớt được.
+\end{enumerate}
+
+\section*{Chương 26 --- Frontend và host đơn}
+\begin{enumerate}
+  \item Giai đoạn một (Node) biên dịch và đóng gói; giai đoạn hai (nginx)
+  phục vụ. Chỉ \code{dist/} được chép bằng \code{COPY --from=build};
+  Node, \code{node\_modules} và trình biên dịch bị bỏ đi, để lại một
+  image $\sim$15\,MB với bề mặt tấn công nhỏ hơn.
+  \item Traefik so \code{/courses/7} với cả hai Ingress; \code{/} là
+  tiền tố khớp dài nhất (không có quy tắc \code{/courses} nào), nên
+  nginx nhận nó. Không có file như vậy;
+  \code{try\_files \$uri \$uri/ /index.html} rơi về
+  \code{index.html}, ứng dụng khởi động và React Router hiển thị route
+  từ URL.
+  \item Các quy tắc cho cùng một host được hợp nhất vào một bảng định
+  tuyến và tiền tố đường dẫn khớp dài nhất thắng: \code{/api/courses}
+  khớp \code{/api} (dài hơn) thay vì \code{/}; \code{/assets/x.js} chỉ
+  khớp \code{/}.
+  \item CORS chỉ áp dụng cho request xuyên origin. Trong cụm, trang và
+  API dùng chung scheme, host và cổng (\code{http://ts.local}), nên
+  trình duyệt không bao giờ gửi preflight; trên laptop trang là
+  \code{localhost:3000} còn API là \code{localhost:8080} --- cổng khác
+  là origin khác.
+  \item Socket thuộc sở hữu của group \code{docker} trên host (GID 984
+  trên ts-server); user jenkins bên trong container không thuộc group
+  nào có ID số đó, nên bị từ chối ghi. \code{--group-add} gắn GID của
+  host vào lúc chạy; tính toán nó giữ cho script đúng trên mọi host mà
+  không cần cứng hóa một con số đặc thù của máy.
+\end{enumerate}
+
+\section*{Chương 27 --- Chặng đường phía trước}
+\begin{enumerate}
+  \item Độ trễ tiêu thụ (consumer-group lag): khoảng cách giữa offset
+  mới nhất trong một partition và offset group đã commit --- lag tăng
+  nghĩa là notification-service đang tụt lại hoặc đã sập.
+  \item Đẩy: thông tin xác thực nằm ở CI (kubeconfig của Jenkins). Kéo:
+  nó không bao giờ rời khỏi cụm; CI chỉ ghi vào git. Prune giải quyết
+  cái bẫy apply-không-bao-giờ-xóa của Chương~20.
+  \item Route của gateway đổi \code{lb://name} thành
+  \code{http://name:port}; endpoint của Service thay cho đăng ký,
+  readiness probe thay cho heartbeat; xóa discovery-server (và các
+  dependency eureka client), giải phóng tài nguyên của nó.
+  \item Chúng đã chạy không bằng root với quyền của group 0, nên SCC
+  UID-tùy-ý của OpenShift chấp nhận chúng nguyên vẹn; chỉ còn
+  Ingress $\rightarrow$ Route.
+\end{enumerate}

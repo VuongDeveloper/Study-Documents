@@ -1,0 +1,201 @@
+\chapter{Pipeline, từng dòng một}
+\label{ch:pipeline}
+
+Mọi thứ trong cuốn sách này hội tụ về một file Groovy 70 dòng. Một
+Jenkinsfile dạng khai báo sống trong chính repository mà nó build ---
+pipeline dưới dạng mã, có phiên bản và được xem xét như mọi thứ khác.
+
+\section{Phần mở đầu và environment}
+
+\begin{lstlisting}
+pipeline {
+  agent any                                  (*@\co{1}@*)
+  options {
+    timestamps()
+    disableConcurrentBuilds()                (*@\co{2}@*)
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+  triggers { pollSCM('H/5 * * * *') }        (*@\co{3}@*)
+  environment {
+    JAVA_HOME = "${env.JDK25_HOME}"          (*@\co{4}@*)
+    PATH      = "${env.JDK25_HOME}/bin:${env.PATH}"
+    TAG       = "${env.GIT_COMMIT.take(7)}"  (*@\co{5}@*)
+    NS        = 'ts'
+    REGISTRY  = 'localhost:5000'
+    SERVICES  = 'config-server discovery-server course-service api-gateway auth-service dictionary-service notification-service'
+    MODULES   = 'common,config-server,discovery-server,course-service,api-gateway,auth-service,dictionary-service,notification-service'
+  }
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Bất kỳ executor nào trên controller --- thỏa hiệp
+  homelab của Chương~22 gói trong một từ.
+  \item[\co{2}] Hai build cùng lúc trên hai nhân sẽ giẫm đạp lên
+  nhau; các lần chạy xếp hàng cũng được gộp lại (một commit mới trong
+  lúc đang build thay thế những lần đang chờ).
+  \item[\co{3}] Polling vì NAT chặn webhook. Chữ \code{H} là phân bố
+  theo hash: ``một phút cố định nào đó trong mỗi 5 phút,'' để nhiều
+  job không cùng poll vào phút :00.
+  \item[\co{4}] Công tắc JDK theo từng pipeline mà image của
+  controller đã chuẩn bị: build thấy Java\,25, bản thân Jenkins vẫn ở
+  21.
+  \item[\co{5}] Tag triển khai là SHA git rút gọn --- mọi image truy
+  vết được về commit của nó, mọi lần deploy ghim vào một tag bất biến
+  (bài học tag-so-với-digest của Chương~13 được áp dụng).
+  \item[\code{SERVICES}/\code{MODULES}] sổ đăng ký của pipeline về
+  những gì tồn tại: \code{MODULES} cấp cho Maven (phân cách bằng dấu
+  phẩy, gồm cả \code{common} được build nhưng không sinh image);
+  \code{SERVICES} cấp cho kubectl (phân cách bằng dấu cách, chỉ những
+  thứ triển khai được). Thêm một service vào cluster nghĩa là mở rộng
+  cả hai --- bước thủ công duy nhất cho mỗi service mới.
+\end{description}
+
+\section{Ba stage}
+
+\begin{lstlisting}
+stage('Build') {
+  steps {
+    dir('Project/TeacherSupporter') {          (*@\co{1}@*)
+      sh 'mvn -B -DskipTests -pl ${MODULES} -am verify'  (*@\co{2}@*)
+    } } }
+stage('Push images') {
+  steps {
+    dir('Project/TeacherSupporter') {
+      sh 'mvn -B -DskipTests -pl ${MODULES} -am package jib:build -Djib.to.tags=${TAG}'  (*@\co{3}@*)
+    } } }
+stage('Deploy') {
+  steps {
+    dir('Project/TeacherSupporter') {
+      withCredentials([file(credentialsId: 'kubeconfig-ts',
+                            variable: 'KUBECONFIG')]) {   (*@\co{4}@*)
+        sh '''
+          set -eu                                         (*@\co{5}@*)
+          kubectl apply -k deploy/k8s/base                (*@\co{6}@*)
+          for s in ${SERVICES}; do
+            kubectl -n ${NS} set image deployment/${s} \
+                ${s}=${REGISTRY}/${s}:${TAG}              (*@\co{7}@*)
+          done
+          for s in ${SERVICES}; do
+            kubectl -n ${NS} rollout status \
+                deployment/${s} --timeout=300s            (*@\co{8}@*)
+          done
+        '''
+      } } } }
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Gốc repository là một monorepo học tập; dự án nằm
+  trong một thư mục con, nên mọi stage đều \code{dir()} vào đó.
+  \item[\co{2}] \code{-pl} (project list) + \code{-am} (also make
+  dependencies): chỉ build các module được liệt kê và những gì chúng
+  cần --- kinh tế học monorepo trên hai nhân. \code{-B} là chế độ
+  batch (không có đầu ra tương tác). \code{-DskipTests} là sự làm yếu
+  cổng chặn được chấp nhận có ý thức từ hộp cạm bẫy của Chương~21.
+  \item[\co{3}] Một lệnh build và push cả bảy image --- Chương~13 gói
+  trong một dòng. \code{-Djib.to.tags} thêm tag SHA bên cạnh tag
+  SNAPSHOT. Chữ \code{package} đứng trước \code{jib:build} không phải
+  để trang trí --- xem hộp cạm bẫy bên dưới; nó đã tốn hai lần build
+  thất bại trong ngày cột mốc 5 và 6 ra lò.
+  \item[\co{4}] Credential dạng file hiện hình thành một file tạm;
+  \code{KUBECONFIG} là biến môi trường mà kubectl đọc. Ngoài khối này
+  file không tồn tại; trong log nội dung của nó không bao giờ xuất
+  hiện.
+  \item[\co{5}] Thất bại khi gặp bất kỳ lỗi nào và khi gặp biến chưa
+  đặt --- thiếu nó, một lần apply thất bại sẽ bị lướt qua và
+  ``đã triển khai'' được báo cáo.
+  \item[\co{6}] Hội tụ cluster về các manifest --- lũy đẳng
+  (Chương~14), nên chạy lại an toàn ở mỗi build dù có gì thay đổi hay
+  không.
+  \item[\co{7}] Trỏ lại từng Deployment vào image tag theo SHA. Đây
+  mới là thứ thật sự kích hoạt rollout --- và lưu ý bản thân manifest
+  vẫn giữ tag SNAPSHOT, nên chỉ \emph{apply} thôi sẽ không triển khai
+  lại; việc ghim của pipeline và giá trị mặc định của manifest cùng
+  tồn tại.
+  \item[\co{8}] Cổng kiểm chứng: chặn cho đến khi mỗi rollout hoàn
+  tất; làm build thất bại nếu có pod nào không bao giờ Ready trong
+  vòng năm phút. Dòng này là thứ khiến màu xanh của pipeline có nghĩa
+  ``đang chạy,'' chứ không phải ``các lệnh đã thực thi'' --- nó ủy
+  thác sự thật cho các probe của Chương~17.
+\end{description}
+
+\begin{pitfall}[Could not find artifact com.ts:common:jar:1.0.0-SNAPSHOT]
+Triệu chứng: stage Build qua, rồi stage Push thất bại ở module đầu
+tiên phụ thuộc vào \code{common}, không phân giải được một file jar mà
+stage trước vừa build xong. Nguyên nhân: \code{mvn jib:build} là một
+\emph{goal trần} --- Maven chạy thẳng nó, không có pha vòng đời nào,
+nên không có gì trong reactor được biên dịch hay đóng gói trong phiên
+đó, và các phụ thuộc anh em quay về kho cục bộ, nơi \code{common}
+chưa bao giờ được cài (\code{verify} dừng trước \code{install}). Các
+module không có phụ thuộc anh em (config-server, discovery-server)
+qua trót lọt, khiến lỗi trông như đặc thù của từng module. Cách sửa:
+đặt một pha lên trước --- \code{package jib:build} --- để reactor
+đóng gói \code{common} trước khi Jib hỏi đến nó. Quy tắc chung: một
+goal của plugin cần artifact của module khác phải đi cùng một pha
+vòng đời, không được gọi một mình.
+\end{pitfall}
+
+Hai vòng lặp thay vì một là một điểm đúng đắn nhỏ: mọi rollout khởi
+động trước, rồi mới đợi tất cả --- nếu không, việc chờ service N sẽ
+tuần tự hóa việc khởi động service N+1, kéo dài tổng thời gian triển
+khai mà chẳng được gì.
+
+\section{Xử lý thất bại}
+
+\begin{lstlisting}
+post {
+  success { echo "Deployed ${TAG} to namespace ${NS}." }
+  failure {
+    dir('Project/TeacherSupporter') {
+      withCredentials([...]) {
+        sh 'kubectl -n ${NS} get pods || true'
+      } } } }
+\end{lstlisting}
+
+Khi thất bại, log build kết thúc bằng một danh sách pod --- lệnh đầu
+tiên mà một con người sẽ chạy, đã được chạy sẵn. Phần \code{|| true}
+giữ cho chính bước chẩn đoán không che mất trạng thái thoát thật của
+build.
+
+\section{Cùng pipeline đó, ở nơi khác}
+
+Để hiệu chỉnh, đây là hình dạng y hệt dưới dạng GitHub Actions:
+
+\begin{lstlisting}[language=yaml]
+on: { push: { branches: [main] } }        # webhook, not polling
+jobs:
+  deploy:
+    runs-on: ubuntu-latest                # disposable agent, not controller
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 25 }
+      - run: mvn -B -pl $MODULES -am verify
+      - run: mvn -B -pl $MODULES -am jib:build -Djib.to.tags=${GITHUB_SHA::7}
+      - run: kubectl apply -k deploy/k8s/base && ...
+        env: { KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }} }
+\end{lstlisting}
+
+Cùng các stage, cùng cách đánh tag, cùng ý tưởng gắn secret. Khác
+biệt nằm ở sự đánh đổi hạ tầng: runner của GitHub là các VM dùng xong
+bỏ (agent làm đúng cách, miễn phí) nhưng chúng sống trên internet ---
+nên biến thể này sẽ cần registry và cluster truy cập được từ bên
+ngoài, đúng ràng buộc đã định hình thiết kế homelab. Pipeline thì
+khả chuyển; \emph{topology mạng mới là thứ thật sự khác nhau giữa các
+nơi}.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Vì sao tag các lần deploy bằng SHA git khi tag SNAPSHOT cũng
+  tồn tại? Nêu chế độ lỗi mà deploy chỉ-SNAPSHOT mời gọi (Chương~13)
+  và khả năng truy vết mà SHA bổ sung.
+  \item Giải thích \code{-pl ... -am} và nó tiết kiệm gì trong một
+  monorepo. Điều gì hỏng nếu bạn quên mở rộng \code{MODULES} cho một
+  service mới?
+  \item Dòng đơn lẻ nào khiến thành công của pipeline này có nghĩa
+  ``các pod đã Ready,'' và nó dựa vào bộ máy của chương nào?
+  \item Vì sao dùng hai vòng lặp trong stage deploy thay vì
+  set-image-rồi-đợi cho từng service?
+  \item Liệt kê ba thứ thay đổi và ba thứ không đổi khi Jenkinsfile
+  này được chuyển sang GitHub Actions.
+\end{enumerate}
+\end{quiz}

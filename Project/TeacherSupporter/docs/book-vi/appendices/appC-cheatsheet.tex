@@ -1,0 +1,85 @@
+\chapter{Bảng tra nhanh}
+\label{app:cheatsheet}
+
+\section*{kubectl --- hằng ngày}
+\begin{lstlisting}[language=bash]
+kubectl -n ts get pods                      # the first command, always
+kubectl -n ts get pods -w                   # ...and watch it change
+kubectl -n ts describe pod <pod>            # platform's view; read Events
+kubectl -n ts logs <pod>                    # app's view
+kubectl -n ts logs <pod> --previous         # the container that just died
+kubectl -n ts exec -it <pod> -- sh          # see the world from inside
+kubectl -n ts get endpoints <svc>           # is anyone behind the Service?
+kubectl -n ts get events --sort-by=.lastTimestamp | tail
+\end{lstlisting}
+
+\section*{kubectl --- deploy và rollback}
+\begin{lstlisting}[language=bash]
+kubectl apply -k deploy/k8s/base            # converge on the manifests
+kubectl kustomize deploy/k8s/base | less    # render without applying
+kubectl -n ts set image deployment/<s> <s>=localhost:5000/<s>:<tag>
+kubectl -n ts rollout status deployment/<s> --timeout=300s
+kubectl -n ts rollout undo deployment/<s>   # back to previous ReplicaSet
+kubectl -n ts rollout restart deployment/<s>  # re-read Secrets, re-pull
+kubectl -n ts get rs -l app=<s>             # revision history, live
+\end{lstlisting}
+
+\section*{kubectl --- dung lượng và RBAC}
+\begin{lstlisting}[language=bash]
+kubectl top pods -n ts                      # actual vs requested
+kubectl -n ts get pvc; kubectl get pv       # storage and its backing
+kubectl auth can-i <verb> <resource> -n ts \
+    --as system:serviceaccount:ts:jenkins   # test permissions dry
+\end{lstlisting}
+
+\section*{docker --- các dịch vụ trên host ts-server}
+\begin{lstlisting}[language=bash]
+docker ps                                   # jenkins, registry up?
+docker logs -f jenkins
+docker restart jenkins
+curl -s localhost:5000/v2/_catalog          # what the registry holds
+curl -s localhost:5000/v2/<name>/tags/list
+docker system df; docker system prune       # disk hygiene (careful)
+\end{lstlisting}
+
+\section*{maven --- máy local và CI}
+\begin{lstlisting}[language=bash]
+mvn -B -pl <modules> -am verify             # build listed + deps
+mvn -B -pl course-service -am jib:build     # image for one service
+mvn -B jib:build -Djib.to.tags=<sha>        # extra tag, as CI does
+mvn dependency:tree -pl course-service      # who pulled that jar in
+mvn spring-boot:run -pl course-service      # run one service raw
+\end{lstlisting}
+
+\section*{compose --- stack dev}
+\begin{lstlisting}[language=bash]
+docker compose up -d postgres-course kafka minio   # infra only
+docker compose up --no-deps course-service         # one service, own terminal
+docker compose logs -f --tail=100 <svc>
+docker compose down                                # keep volumes
+docker compose down -v                             # DESTROY volumes too
+\end{lstlisting}
+
+\section*{k3s --- bản thân cụm}
+\begin{lstlisting}[language=bash]
+sudo systemctl status k3s
+sudo systemctl restart k3s          # rereads registries.yaml; pods bounce
+sudo ls /var/lib/rancher/k3s/storage/       # PVs as directories
+kubectl get nodes -o wide
+\end{lstlisting}
+
+\section*{kafka --- broker trong cụm (Ch.~25)}
+\begin{lstlisting}[language=bash]
+kubectl -n ts get kafka,kafkanodepools,kafkatopics   # operator's view
+kubectl -n ts logs ts-kafka-dual-role-0 --tail=50    # the broker itself
+# a throwaway pod with the Kafka CLI, same network position as services:
+kubectl -n ts run kcli --rm -it --restart=Never \
+  --image=quay.io/strimzi/kafka:1.2.0-kafka-4.3.1 -- sh
+  B=ts-kafka-kafka-bootstrap:9092
+  bin/kafka-topics.sh --bootstrap-server $B --list
+  bin/kafka-console-consumer.sh --bootstrap-server $B \
+      --topic ts.user.registered --from-beginning
+  bin/kafka-consumer-groups.sh --bootstrap-server $B \
+      --describe --group notification-group    # lag per partition
+kubectl -n ts port-forward svc/maildev 1080:1080     # caught mail UI
+\end{lstlisting}

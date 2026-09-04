@@ -1,0 +1,71 @@
+\chapter{Cách đọc cuốn sách này}
+
+Cuốn sách này dạy mọi công nghệ có trong dự án TeacherSupporter ---
+Spring Boot và Spring Cloud, Postgres và MongoDB, Kafka, Docker,
+Kubernetes, và pipeline Jenkins gắn kết tất cả lại với nhau --- bằng
+chính các file của dự án làm ví dụ. Không có gì được bịa ra cho trang
+sách: mọi cấu hình bạn sẽ đọc đều đang được triển khai, hoặc sắp được
+triển khai, trên một máy chủ gia đình thật hai nhân tên là
+\code{ts-server}.
+
+\section*{Những quy tắc cuốn sách tuân theo}
+
+\begin{description}
+  \item[Khái niệm trước, cấu hình sau.] Mỗi chương trước hết dạy ý tưởng
+  bằng ngôn ngữ trung lập, không gắn với nhà cung cấp nào, rồi đọc file
+  thật của dự án từng dòng một, rồi đưa một hai ví dụ từ \emph{bên ngoài}
+  dự án để bạn phân biệt được cái gì là quy luật chung, cái gì chỉ là thói
+  quen cục bộ.
+  \item[Quyết định là nội dung chính.] Ở bất cứ đâu dự án phải chọn giữa
+  các phương án (Jib thay vì \code{docker build}, Kustomize thay vì Helm,
+  một server Postgres thứ hai thay vì một cơ sở dữ liệu thứ hai), lý do
+  nằm trong hộp \textsc{decision}. Đó chính là những câu hỏi ``tại sao
+  bạn lại\ldots'' mà các buổi phỏng vấn được dựng nên từ đó.
+  \item[Lỗi được trình bày từ triệu chứng.] Các hộp \textsc{pitfall} bắt
+  đầu bằng thứ bạn thực sự nhìn thấy (\code{CrashLoopBackOff}, một lỗi
+  TLS, một 404 lặng lẽ) rồi lần ngược về nguyên nhân, vì đó là hướng mà
+  việc gỡ lỗi thật diễn ra.
+\end{description}
+
+\section*{Chú giải các hộp}
+
+\begin{decision}[ví dụ]
+Vì sao dự án chọn thiết kế này thay vì thiết kế kia, và điều gì phải thay
+đổi để lựa chọn còn lại thắng thế.
+\end{decision}
+
+\begin{pitfall}[ví dụ]
+Một triệu chứng sớm muộn bạn cũng sẽ gặp, kèm nguyên nhân và cách sửa.
+\end{pitfall}
+
+\begin{handson}[ví dụ]
+Một lệnh để chạy trên stack thật, cùng kết quả bạn nên mong đợi. Cuốn
+sách này được viết để đọc bên cạnh một terminal.
+\end{handson}
+
+\begin{hardware}[ví dụ]
+Một lựa chọn chỉ đúng trên chiếc máy này (2 nhân, 19.4\,GB RAM, SSD
+SATA, Wi-Fi). Đừng bê những thứ này vào trung tâm dữ liệu.
+\end{hardware}
+
+\begin{quiz}
+Mỗi chương kết thúc bằng vài câu hỏi trong hộp này. Đáp án ở
+Phụ lục~A. Hãy viết câu trả lời ra giấy trước khi xem đáp án --- nhận ra
+không phải là nhớ được.
+\end{quiz}
+
+\section*{Ký hiệu}
+
+Code inline và tên file trông như thế này: \code{application.yml}. Các
+listing có chú thích mang những dấu khoanh tròn --- \co{1}, \co{2} --- được
+giải thích ngay bên dưới listing. Lệnh shell được hiển thị với dấu nhắc
+\code{\$} cho server và \code{PS>} cho Windows PowerShell; đừng gõ dấu
+nhắc.
+
+\section*{Điều gì được giả định, điều gì không}
+
+Giả định: bạn đọc được Java, và đã dùng Maven và git. Không giả định:
+bất kỳ kiến thức nào trước đó về Kubernetes, Jenkins, Kafka, bên trong
+Docker, hay frontend. Ở những chỗ tài liệu của dự án đã trình bày việc cài
+đặt máy một lần (\code{docs/RUNBOOK-SERVER-SETUP.md}), cuốn sách chỉ tóm
+tắt rồi đi tiếp.

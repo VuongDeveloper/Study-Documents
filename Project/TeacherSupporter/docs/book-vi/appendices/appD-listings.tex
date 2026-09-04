@@ -1,0 +1,99 @@
+\chapter{Các file cấu hình}
+\label{app:listings}
+
+Các file đúng như chúng đang nằm trong repository tại thời điểm build
+--- được chèn thẳng từ mã nguồn, nên phụ lục này không thể trôi khỏi
+thực tế. Bình luận từng dòng nằm ở các chương; đây là bản tham chiếu để
+đọc khi không có máy.
+
+\lstset{basicstyle=\ttfamily\scriptsize}
+
+\section*{Jenkinsfile}
+\lstinputlisting{../../Jenkinsfile}
+
+\section*{deploy/jenkins/Dockerfile}
+\lstinputlisting[language=dockerfile]{../../deploy/jenkins/Dockerfile}
+
+\section*{deploy/k8s/jenkins-rbac.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/jenkins-rbac.yaml}
+
+\section*{deploy/k8s/create-secrets.sh}
+\lstinputlisting[language=bash]{../../deploy/k8s/create-secrets.sh}
+
+\section*{deploy/k8s/install-strimzi.sh}
+\lstinputlisting[language=bash]{../../deploy/k8s/install-strimzi.sh}
+
+\section*{deploy/k8s/base/kustomization.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/kustomization.yaml}
+
+\section*{deploy/k8s/base/namespace.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/namespace.yaml}
+
+\section*{deploy/k8s/base/postgres-course.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/postgres-course.yaml}
+
+\section*{deploy/k8s/base/postgres-auth.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/postgres-auth.yaml}
+
+\section*{deploy/k8s/base/mongodb.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/mongodb.yaml}
+
+\section*{deploy/k8s/base/minio.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/minio.yaml}
+
+\section*{deploy/k8s/base/kafka.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/kafka.yaml}
+
+\section*{deploy/k8s/base/kafka-topics.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/kafka-topics.yaml}
+
+\section*{deploy/k8s/base/maildev.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/maildev.yaml}
+
+\section*{deploy/k8s/base/config-server.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/config-server.yaml}
+
+\section*{deploy/k8s/base/discovery-server.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/discovery-server.yaml}
+
+\section*{deploy/k8s/base/course-service.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/course-service.yaml}
+
+\section*{deploy/k8s/base/auth-service.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/auth-service.yaml}
+
+\section*{deploy/k8s/base/dictionary-service.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/dictionary-service.yaml}
+
+\section*{deploy/k8s/base/notification-service.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/notification-service.yaml}
+
+\section*{deploy/k8s/base/api-gateway.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/api-gateway.yaml}
+
+\section*{deploy/k8s/base/frontend.yaml}
+\lstinputlisting[language=yaml]{../../deploy/k8s/base/frontend.yaml}
+
+\section*{frontend/Dockerfile}
+\lstinputlisting[language=dockerfile]{../../frontend/Dockerfile}
+
+\section*{frontend/nginx.conf}
+\lstinputlisting{../../frontend/nginx.conf}
+
+\section*{docker-compose.yml}
+\lstinputlisting[language=yaml]{../../docker-compose.yml}
+
+\section*{config-server: configurations/api-gateway.yml}
+\lstinputlisting[language=yaml]{../../config-server/src/main/resources/configurations/api-gateway.yml}
+
+\section*{config-server: configurations/auth-service.yml}
+\lstinputlisting[language=yaml]{../../config-server/src/main/resources/configurations/auth-service.yml}
+
+\section*{config-server: configurations/course-service.yml}
+\lstinputlisting[language=yaml]{../../config-server/src/main/resources/configurations/course-service.yml}
+
+\section*{config-server: configurations/dictionary-service.yml}
+\lstinputlisting[language=yaml]{../../config-server/src/main/resources/configurations/dictionary-service.yml}
+
+\section*{config-server: configurations/notification-service.yml}
+\lstinputlisting[language=yaml]{../../config-server/src/main/resources/configurations/notification-service.yml}

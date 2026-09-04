@@ -1,0 +1,157 @@
+\chapter{API Gateway}
+\label{ch:gateway}
+
+\section{Vấn đề}
+
+Không có gateway, frontend phải biết địa chỉ của sáu service, mỗi
+service phải tự cài đặt xác thực, và những mối quan tâm xuyên suốt
+(CORS, rate limit, header truy vết) bị làm sáu lần hoặc không lần nào.
+Gateway cho client bên ngoài \emph{một} địa chỉ duy nhất và gom mọi mối
+quan tâm ở biên về một chỗ; phía sau nó, các service có thể tin tưởng
+bên gọi mình.
+
+\section{Mô hình của Spring Cloud Gateway}
+
+Ba khái niệm tạo nên mọi route:
+
+\begin{description}
+  \item[Route] một URI đích cộng với các điều kiện và phép viết lại bên
+  dưới.
+  \item[Predicates] điều kiện quyết định request có khớp hay không:
+  path, method, header, host. Route khớp đầu tiên thắng.
+  \item[Filters] các phép biến đổi áp dụng trên đường đi:
+  bỏ hoặc thêm đoạn path, thêm header, rate limit, retry.
+\end{description}
+
+Gateway được xây trên stack \emph{reactive} (Project Reactor +
+Netty, \code{web-application-type: reactive} trong
+\code{application.yml} của nó) thay vì Tomcat servlet. Một proxy dành cả
+đời để chờ các server khác; mô hình event-loop giữ được hàng nghìn
+request đang bay mà không cần mỗi request một thread. Về vận hành, đây
+là lý do Deployment của gateway được cấp memory request nhỏ hơn các
+service MVC (384\,Mi so với 512\,Mi) và khởi động nhanh hơn ---
+điều Chương~17 tận dụng bằng một startup probe ngắn hơn.
+
+\section{Các route của dự án, có chú giải}
+
+Từ \code{configurations/api-gateway.yml} (rút gọn --- khối
+course-service lặp lại cho students, assignments, enrollments,
+submissions):
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: auth-service
+          uri: lb://auth-service          (*@\co{1}@*)
+          predicates:
+            - Path=/api/auth/**           (*@\co{2}@*)
+          filters:
+            - StripPrefix=2               (*@\co{3}@*)
+        - id: auth-oauth2
+          uri: lb://auth-service
+          predicates:
+            - Path=/oauth2/**             (*@\co{4}@*)
+        - id: course-service-courses
+          uri: lb://course-service
+          predicates:
+            - Path=/api/courses/**
+          filters:
+            - StripPrefix=2
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecret...}     (*@\co{5}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{lb://} = ``phân giải tên này qua discovery client
+  rồi cân bằng tải.'' Tên đó là \code{spring.application.name} của
+  đích. Đổi \code{lb://} thành \code{http://} là bạn có một proxy tĩnh,
+  không dính gì tới Eureka.
+  \item[\co{2}] Predicate theo path. \code{**} khớp mọi độ sâu.
+  \item[\co{3}] \code{StripPrefix=2} bỏ hai đoạn:
+  \code{/api/auth/login} tới auth-service dưới dạng \code{/login}.
+  Đây là lý do SecurityConfig của auth-service (Chương~5) cho phép
+  \code{/login} chứ không phải \code{/api/auth/login} --- service không
+  hề biết tiền tố công khai của mình.
+  \item[\co{4}] Không có StripPrefix ở đây: redirect URI OAuth2 của
+  Google được đăng ký với đường dẫn đầy đủ, nên nó phải tới auth-service
+  nguyên vẹn.
+  \item[\co{5}] Gateway giữ khóa \emph{xác minh} JWT. Cùng secret với
+  auth-service, bên \emph{ký} --- một secret dùng chung, hai vai trò, và
+  trên Kubernetes là một object Secret mount vào cả hai
+  (Chương~16).
+\end{description}
+
+\begin{pitfall}[service trả 404, curl trên pod trả 200]
+Triệu chứng: gọi \code{/api/courses/list} qua gateway nhận 404, nhưng
+cũng endpoint đó lại trả lời khi gọi thẳng vào service. Nguyên nhân:
+lệch tiền tố --- hoặc StripPrefix đã bỏ đoạn mà controller mong đợi,
+hoặc mapping của controller chứa tiền tố mà gateway đã bỏ rồi. Gỡ lỗi
+bằng cách log đường dẫn \emph{sau khi viết lại}: bật debug logging cho
+\code{spring.cloud.gateway} và so với \code{@RequestMapping} của
+controller.
+\end{pitfall}
+
+\section{Hai bộ định tuyến: gateway và Ingress}
+
+Trên Kubernetes dự án này có \emph{hai} bộ định tuyến L7 nối tiếp
+nhau: Traefik (Ingress controller, Chương~18) ở biên cụm, rồi tới
+gateway này. Sự phân công là có chủ ý:
+
+\begin{itemize}
+  \item Traefik sở hữu \emph{host}: TLS về sau, một cửa vào công khai,
+  tách nhánh theo tiền tố path. Nó gửi \code{/api}, \code{/oauth2},
+  \code{/login/oauth2} tới gateway và sẽ gửi \code{/} tới frontend.
+  \item Gateway sở hữu \emph{biên ứng dụng}: phân giải qua Eureka,
+  xác minh JWT, viết lại theo từng route.
+\end{itemize}
+
+\begin{decision}[không có cửa hông]
+Cột mốc~3 từng có một Ingress gửi \code{/courses} thẳng tới
+course-service --- giàn giáo hữu ích, nhưng nó đi vòng qua bước xác minh
+JWT: một lối vào không xác thực tới dữ liệu được bảo vệ. Nó bị xóa ngay
+ngày gateway được triển khai. Quy tắc rút ra: \emph{mọi} route bên
+ngoài phải đi qua thành phần thực thi xác thực, nếu không xác thực chỉ
+là đồ trang trí.
+\end{decision}
+
+\section{Những góc nâng cao}
+
+Đáng biết, nhưng chưa dùng ở đây: filter \code{RequestRateLimiter}
+(token bucket dựa trên Redis), \code{Retry} có backoff cho các GET lũy
+đẳng, filter \code{CircuitBreaker} (Resilience4j) trả về fallback khi
+một service sập, và các filter mặc định áp cho mọi route. Mỗi thứ chỉ
+vài dòng YAML --- gateway là nơi những chính sách như vậy thuộc về, vì
+đó là điểm duy nhất mọi request bên ngoài đều đi qua.
+
+\section{Ngoài dự án}
+
+Cùng ý tưởng ba khái niệm trên route đó trong một gateway thuần
+Kubernetes (không Eureka, dùng DNS của Service thay thế) --- kiểu
+annotation của nginx-ingress:
+
+\begin{lstlisting}[language=yaml]
+nginx.ingress.kubernetes.io/rewrite-target: /$2
+# path: /api/courses(/|$)(.*)  ->  service: course-service
+\end{lstlisting}
+
+Và phiên bản cloud quản lý: bảng route của AWS API Gateway hay GCP API
+Gateway làm predicate/filter dưới dạng cấu hình của nhà cung cấp, với
+việc xác minh JWT giao cho nhà cung cấp (Cognito, IAP). Khái niệm
+chuyển 1:1; chỉ cú pháp và hóa đơn là khác.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Lần theo \code{POST /api/auth/login} từ trình duyệt tới phương
+  thức controller trên Kubernetes: kể tên mọi chặng và mọi lần viết lại
+  đường dẫn.
+  \item Vì sao các route OAuth2 không được bỏ tiền tố trong khi các
+  route API thì phải?
+  \item Gateway xác minh JWT; auth-service ký chúng. Nếu hai bên có lúc
+  giữ secret khác nhau thì cái gì hỏng, với triệu chứng gì?
+  \item Vì sao stack reactive là lựa chọn đúng cho proxy nhưng không
+  đương nhiên đúng cho course-service?
+\end{enumerate}
+\end{quiz}

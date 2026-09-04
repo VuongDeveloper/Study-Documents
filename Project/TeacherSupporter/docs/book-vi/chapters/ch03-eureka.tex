@@ -1,0 +1,124 @@
+\chapter{Khám phá dịch vụ: Eureka}
+\label{ch:eureka}
+
+\section{Vấn đề}
+
+Gateway phải chuyển tiếp \code{/api/courses} tới course-service. Tới địa
+chỉ nào? Trong Compose nó có thể ghi cứng \code{course-service:8082} ---
+nhưng khi đó mỗi replica mới, mỗi service dời chỗ, mỗi môi trường đều là
+một thay đổi cấu hình. Khám phá dịch vụ (service discovery) thay địa chỉ
+bằng \emph{tên được phân giải lúc chạy}: các service tự đăng ký vào một
+registry; client hỏi registry.
+
+\section{Eureka hoạt động thế nào}
+
+Eureka (từ Netflix, tổ tiên của stack Spring Cloud) là một REST service
+giữ một registry các instance:
+
+\begin{itemize}
+  \item \textbf{Đăng ký.} Lúc khởi động mỗi client POST danh tính của
+  mình: tên ứng dụng (\code{spring.application.name}), host, cổng, URL
+  health.
+  \item \textbf{Heartbeat.} Mỗi 30\,s (mặc định) client gia hạn lease của
+  mình. Bỏ lỡ vài lần gia hạn và instance bị loại bỏ (evict).
+  \item \textbf{Cache phía client.} Bên tiêu thụ lấy registry về và cache
+  lại (mặc định làm mới mỗi 30\,s), rồi cân bằng tải \emph{cục bộ} giữa
+  các instance mà nó biết. Registry sập trong chốc lát không làm dừng
+  lưu lượng --- bên gọi tiếp tục dùng cache của mình.
+  \item \textbf{Tự bảo toàn.} Nếu quá nhiều heartbeat biến mất cùng lúc,
+  Eureka giả định đó là sự cố mạng chứ không phải chết hàng loạt và ngừng
+  loại bỏ. Ít bất ngờ hơn khi mạng chập chờn; dữ liệu cũ hơn khi sự cố
+  là thật.
+\end{itemize}
+
+Phía tiêu thụ trong dự án này là URI \code{lb://course-service} của
+gateway (Chương~4): ``tra tên này trong registry, chọn một instance.''
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 12mm]
+  \node[boxdark] (eureka) {Eureka\\\scriptsize discovery-server:8761};
+  \node[box, below left=of eureka] (a) {course-service\\\scriptsize phiên bản 1};
+  \node[box, below=of eureka] (b) {course-service\\\scriptsize phiên bản 2};
+  \node[box, below right=of eureka] (gw) {api-gateway};
+  \draw[flow] (a) -- node[lbl,left]{đăng ký + heartbeat} (eureka);
+  \draw[flow] (b) -- (eureka);
+  \draw[flowdash] (gw) -- node[lbl,right]{lấy registry} (eureka);
+  \draw[flow] (gw) -- node[lbl,below]{\scriptsize lb:// chọn một} (b);
+\end{tikzpicture}
+\caption{Đăng ký, heartbeat, và cân bằng tải phía client.}
+\end{figure}
+
+\section{Server, và thiết lập sống còn duy nhất trên k8s}
+
+Module discovery-server là Eureka với gần như không có cấu hình --- một
+annotation \code{@EnableEurekaServer} và một cổng. Cấu hình thú vị nằm
+trên mỗi \emph{client}, và một dòng trong đó xứng đáng có mục riêng vì nó
+quyết định cả hệ thống có chạy được trên Kubernetes hay không:
+
+\begin{lstlisting}[language=yaml]
+- name: EUREKA_INSTANCE_PREFER_IP_ADDRESS
+  value: "true"
+\end{lstlisting}
+
+Mặc định một client đăng ký \emph{hostname} của nó. Trên laptop của bạn
+thế là ổn. Bên trong một pod Kubernetes, hostname là \emph{tên pod} ---
+\code{course-service-7d9f6c-x2vlq} --- thứ các pod khác không phân giải
+được. Mọi đăng ký sẽ là một địa chỉ không ai gọi tới được. \emph{IP} của
+pod, ngược lại, định tuyến được trên toàn cụm. Vì thế mọi Deployment
+trong \code{deploy/k8s/base/} đều đặt cờ này: đăng ký IP, không phải tên.
+
+\begin{pitfall}[mọi thứ đều đăng ký, không gì gọi được gì]
+Triệu chứng: dashboard Eureka hiện mọi service đều UP, nhưng mọi request
+đi qua gateway đều thất bại với \code{UnknownHostException}. Nguyên
+nhân: hostname được đăng ký là tên pod (xem ở trên). Đây là lỗi
+Eureka-trên-Kubernetes phổ biến nhất, và nó vô hình cho đến lần gọi
+chéo service đầu tiên.
+\end{pitfall}
+
+\begin{decision}[vì sao vẫn dùng Eureka, khi Kubernetes đã có Service]
+Kubernetes đã cho mỗi Service một tên DNS (\code{course-service:8082})
+với cân bằng tải tích hợp sẵn --- khám phá dịch vụ là bản địa của nền
+tảng. Eureka ở đây là sự dư thừa có chủ đích vì CV: stack cổ điển vẫn
+phổ biến trong ngành, và việc di cư \emph{khỏi} nó (Chương~27: thay
+\code{lb://} bằng DNS Service thuần, xóa hai đơn vị triển khai) tự thân
+là loại công việc hiện đại hóa mà doanh nghiệp trả tiền để có. Xây cả hai
+stack là để học cuộc di cư đó.
+\end{decision}
+
+\section{Bên ngoài dự án}
+
+\emph{Consul} (HashiCorp) là lựa chọn thay thế chính ngoài JVM: dựa trên
+agent, không phụ thuộc ngôn ngữ, với health check do agent thực hiện thay
+vì heartbeat tự báo cáo, cộng một kho key-value có thể thay luôn cả
+config-server. \emph{Khám phá dịch vụ bản địa của Kubernetes} là cực còn
+lại: không có tiến trình registry nào cả --- các controller của nền tảng
+theo dõi readiness của pod và cập nhật endpoint của Service; ``đăng ký''
+đơn giản là một pod trở thành Ready (Chương~17 cho thấy bộ máy đó). Hãy
+để ý mẫu hình: nền tảng cung cấp càng nhiều, ứng dụng càng phải mang ít.
+
+\begin{hardware}
+Các giá trị mặc định bảo thủ của Eureka (heartbeat 30\,s, cache client
+30\,s, loại bỏ sau 90\,s) nghĩa là một instance đã crash vẫn có thể nhận
+lưu lượng tới một phút. Với một replica cho mỗi service thì điều đó hầu
+như không quan trọng --- bên gọi đằng nào cũng thất bại --- nhưng nó giải
+thích vì sao các đợt triển khai cuốn chiếu ở Chương~23 chờ readiness của
+Kubernetes, chứ không chờ trạng thái Eureka.
+\end{hardware}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Lần theo những gì xảy ra từ lúc course-service khởi động đến lúc
+  gateway định tuyến tới nó thành công: những lần đăng ký, lấy về, và
+  cache nào có liên quan, và độ trễ trong trường hợp xấu nhất là bao
+  nhiêu?
+  \item Vì sao \code{prefer-ip-address} quan trọng trên Kubernetes nhưng
+  không quan trọng trên Compose? (Mỗi nền tảng làm cho cái gì phân giải
+  được?)
+  \item Chế độ tự bảo toàn đánh đổi tính chất nào lấy tính chất nào? Cho
+  một kịch bản nó giúp ích và một kịch bản nó gây hại.
+  \item Nếu bỏ Eureka và trỏ gateway thẳng tới
+  \code{http://course-service:8082}, bộ máy Kubernetes nào thay thế từng
+  tính năng của Eureka?
+\end{enumerate}
+\end{quiz}

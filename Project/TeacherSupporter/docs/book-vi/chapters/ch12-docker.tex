@@ -1,0 +1,123 @@
+\chapter{Docker: Image, Container, Compose}
+\label{ch:docker}
+
+\section{Container thực chất là gì}
+
+Container không phải là một máy ảo thu nhỏ. Nó là một tiến trình Linux
+bình thường, được cô lập bởi hai tính năng của kernel: \emph{namespace}
+(góc nhìn riêng về tiến trình, mạng, các mount của hệ thống file,
+hostname) và \emph{cgroups} (giới hạn CPU và bộ nhớ). Không có hệ điều
+hành khách, không có hypervisor --- đó là lý do container khởi động
+trong vài mili giây, và cũng là lý do JVM bên trong phải được báo về
+giới hạn bộ nhớ của nó (\code{MaxRAMPercentage} của Chương~17) --- vì
+nhìn từ bên trong, nó thấy RAM của \emph{máy chủ}.
+
+\emph{Image} là hệ thống file đã đóng gói cộng với metadata (entrypoint,
+biến môi trường, cổng khai báo), được build thành một chồng các
+\emph{layer} bất biến. Layer được định danh theo nội dung và dùng chung:
+năm mươi image \code{FROM eclipse-temurin:25-jre-alpine} chỉ lưu layer
+JRE một lần. \emph{Registry} (Docker Hub, GHCR, \code{registry:2} của
+dự án) lưu trữ image; \code{docker push}/\code{pull} chỉ chuyển những
+layer mà phía bên kia còn thiếu.
+
+\section{Dockerfile của dự án, có chú giải}
+
+Service nào cũng mang đúng năm dòng này:
+
+\begin{lstlisting}[language=dockerfile]
+FROM eclipse-temurin:25-jre-alpine    (*@\co{1}@*)
+WORKDIR /app
+COPY target/*.jar app.jar             (*@\co{2}@*)
+EXPOSE 8082                           (*@\co{3}@*)
+ENTRYPOINT ["java", "-jar", "app.jar"](*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Image gốc: một JRE (không phải JDK --- lúc chạy không
+  cần trình biên dịch) trên Alpine Linux. Image gốc nhỏ hơn = bề mặt tấn
+  công nhỏ hơn và pull nhanh hơn.
+  \item[\co{2}] Sao chép fat jar do Maven build ra. Điểm tinh tế:
+  Dockerfile này đòi hỏi \code{mvn package} phải chạy \emph{trước} ---
+  việc build diễn ra bên ngoài. Hệ quả: một lệnh \code{COPY} cho jar cỡ
+  \(\sim\)60\,MB tạo ra một layer to, nên \emph{mọi} lần build đều push
+  lại toàn bộ dù chỉ sửa một dòng. Jib (Chương~13) sinh ra để sửa đúng
+  chuyện này.
+  \item[\co{3}] Chỉ là tài liệu, không phải hành động --- nó không mở gì
+  cả. Việc công bố cổng diễn ra lúc chạy.
+  \item[\co{4}] Entrypoint dạng exec: java là PID~1, nhận tín hiệu trực
+  tiếp, nên \code{docker stop} kích hoạt quá trình tắt Spring sạch sẽ.
+\end{description}
+
+\section{Mạng và Compose}
+
+Các container trên một \emph{bridge network} của Docker tìm thấy nhau
+bằng \emph{tên service} --- Docker chạy một DNS server trả lời cho
+\code{postgres-course}, \code{kafka}, \code{minio}. Còn \code{localhost},
+bên trong một container, chính là \emph{container đó} --- cái bẫy số
+một với người mới, và là lý do mọi URL mặc định cho dev trong các file
+cấu hình đều cần ghi đè theo từng môi trường. Cổng chỉ với tới được từ
+máy chủ khi đã được \emph{công bố} (\code{-p 5434:5432}).
+
+Compose biến một loạt lệnh \code{docker run} thành một file khai báo
+duy nhất --- \code{docker-compose.yml} của dự án là cả stack dev: bốn
+kho dữ liệu, Kafka, Zipkin, Maildev và bảy service, với ba thành ngữ
+đáng gọi tên:
+
+\begin{lstlisting}[language=yaml]
+  discovery-server:
+    depends_on:
+      config-server:
+        condition: service_healthy    (*@\co{1}@*)
+  config-server:
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"] (*@\co{2}@*)
+  postgres-course:
+    ports:
+      - "5434:5432"                   (*@\co{3}@*)
+    volumes:
+      - postgres-course-data:/var/lib/postgresql/data
+\end{lstlisting}
+
+\co{1}+\co{2} mã hóa thứ tự khởi động --- và không chỉ ``đã chạy'' mà
+là ``đã trả lời endpoint sức khỏe,'' điều làm cho thứ tự này có ý nghĩa
+thật. \co{3} ánh xạ hai cổng máy chủ khác nhau (5433, 5434) vào cùng
+cổng nội bộ 5432 của hai container Postgres --- tên thì riêng theo từng
+mạng, cổng máy chủ thì toàn cục. Volume có tên giữ dữ liệu qua những
+lần tạo lại container; Chương~19 là phiên bản Kubernetes của cùng nhu
+cầu này.
+
+\begin{decision}[vì sao Compose vẫn sống cạnh Kubernetes]
+Cụm (cluster) là đích triển khai, nhưng Compose vẫn là vòng lặp bên
+trong: một lệnh, chạy ngay trên laptop, cổng debug đã map sẵn (mọi
+service đều mở một cổng JDWP trong Compose --- gắn debugger của IDE vào
+5082 và bước từng dòng qua course-service). Kubernetes mua được tự phục
+hồi và triển khai cuốn chiếu bằng cái giá là nghi thức rườm rà; một lập
+trình viên đang lặp đi lặp lại trên logic nghiệp vụ không muốn trả cả
+hai. Hai môi trường, một hợp đồng image chung giữa chúng.
+\end{decision}
+
+\begin{pitfall}[chạy tốt trong Compose, chết trong Kubernetes]
+Triệu chứng: stack xanh ở máy local; cùng image đó lại crash-loop trong
+cụm. Những nghi phạm quen thuộc, đều thuộc về môi trường: một URL vẫn
+trỏ tới tên service của Compose trong khi tên Service bên k8s khác đi;
+một \code{depends\_on} mà cụm không tôn trọng (Kubernetes không có thứ
+tự khởi động --- Chương~15); hoặc giới hạn bộ nhớ có trong cụm nhưng
+không có ở local, biến một JVM béo thành OOMKill. Image là y hệt --- hãy
+so \emph{môi trường}, không phải code: \code{docker inspect} với
+\code{kubectl describe pod}.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Container và VM đều cô lập. Nêu hai cơ chế container dùng, và
+  hai hệ quả của việc không có kernel khách.
+  \item Vì sao \code{localhost:5432} hỏng bên trong container dù chạy
+  được trên laptop của bạn, và Compose với Kubernetes đưa ra hai cách
+  sửa khác nhau nào?
+  \item Cả hai container Postgres đều lắng nghe cổng 5432 nội bộ mà
+  không xung đột --- giải thích. Xung đột lại có thể xảy ra ở đâu?
+  \item Điều gì khiến \code{condition: service\_healthy} mạnh hơn
+  \code{depends\_on} thường, và file nào của dự án cung cấp tín hiệu
+  sức khỏe mà nó chờ?
+\end{enumerate}
+\end{quiz}

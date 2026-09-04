@@ -1,0 +1,138 @@
+\chapter{Image không cần daemon: Jib và registry cục bộ}
+\label{ch:jib}
+
+\section{Vì sao không cứ \code{docker build} trong CI?}
+
+Các Dockerfile vẫn chạy tốt. Ba lý do khiến pipeline build image theo
+cách khác:
+
+\begin{enumerate}
+  \item \textbf{CI không cần Docker daemon.} \code{docker build} đòi hỏi
+  một daemon đang chạy; cấp cho Jenkins một daemon nghĩa là
+  docker-in-docker hoặc mount socket Docker của máy chủ --- tức là quyền
+  root trên máy chủ, trao cho mọi build. Jib build và push image bằng
+  Java thuần: không daemon, không đặc quyền.
+  \item \textbf{Phân layer khớp với cách code thay đổi.} Dockerfile sao
+  chép một fat jar: một layer khổng lồ, push lại toàn bộ mỗi lần build.
+  Jib tách ứng dụng thành các layer theo mức độ biến động --- dependency
+  / resource / class --- nên sửa một dòng code chỉ push lại layer class
+  nhỏ. Trên hai nhân CPU và Wi-Fi, đó là khác biệt giữa vài giây và vài
+  phút cho mỗi service.
+  \item \textbf{Sẵn sàng cho OpenShift một cách tình cờ.} Image do Jib
+  tạo chạy bằng người dùng không phải root với quyền file thuộc group 0
+  --- đúng điều mô hình bảo mật UID tùy ý của OpenShift đòi hỏi. Tính
+  khả chuyển miễn phí.
+\end{enumerate}
+
+\section{Cấu hình, có chú giải}
+
+Jib được cấu hình một lần trong \code{pluginManagement} của
+\code{pom.xml} cha; mỗi module chạy được tham gia bằng một tham chiếu
+\code{<plugin>} trơn, còn \code{common} \emph{rút lui} bằng
+\code{jib.skip=true}:
+
+\begin{lstlisting}[language=xml]
+<plugin>
+  <groupId>com.google.cloud.tools</groupId>
+  <artifactId>jib-maven-plugin</artifactId>
+  <version>3.4.4</version>
+  <configuration>
+    <from><image>eclipse-temurin:25-jre-alpine</image></from>  (*@\co{1}@*)
+    <to><image>${docker.registry}/${project.artifactId}:${project.version}</image></to> (*@\co{2}@*)
+    <allowInsecureRegistries>true</allowInsecureRegistries>    (*@\co{3}@*)
+    <container>
+      <mainClass>${start-class}</mainClass>                    (*@\co{4}@*)
+      <creationTime>USE_CURRENT_TIMESTAMP</creationTime>       (*@\co{5}@*)
+    </container>
+  </configuration>
+</plugin>
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Cùng image gốc với các Dockerfile --- hành vi lúc chạy
+  không đổi, chỉ khác đường đóng gói.
+  \item[\co{2}] Phân giải thành \code{localhost:5000/course-service:1.0.0-SNAPSHOT}.
+  Tên được viết \emph{từ góc nhìn của cụm} ---
+  Mục~\ref{sec:whylocalhost}.
+  \item[\co{3}] Registry cục bộ dùng HTTP thường; Jib từ chối push không
+  an toàn trừ khi được bảo. Mọi công cụ trong chuỗi này (Jib, containerd)
+  đều chọn an-toàn-mặc-định như nhau và đều cần cùng một lời cho phép
+  tường minh.
+  \item[\co{4}] Đặt tường minh vì bộ quét bytecode đi kèm Jib chưa đọc
+  được file class của Java~25 --- một ví dụ thật về việc Java quá mới
+  làm khổ bộ công cụ.
+  \item[\co{5}] Jib mặc định dùng mốc thời gian epoch-0 để build tái lập
+  được; ở đây ta đánh đổi điều đó để \code{docker images} hiển thị thời
+  gian build thật.
+\end{description}
+
+\section{Registry, và vì sao lại là \code{localhost:5000}}
+\label{sec:whylocalhost}
+
+\begin{lstlisting}[language=bash]
+docker run -d --restart=unless-stopped --name registry \
+  -p 5000:5000 -v registry-data:/var/lib/registry registry:2
+\end{lstlisting}
+
+Sự thật không hiển nhiên buộc phải có kiến trúc này: \textbf{k3s không
+nhìn thấy image của Docker.} k3s chạy containerd riêng với kho image
+riêng; \code{docker build} trên máy chủ đặt image vào nơi k3s không bao
+giờ ngó tới. Registry là giao diện trung thực giữa bên build và cụm ---
+thứ mà pipeline đằng nào cũng cần.
+
+Tên image không chỉ là cái tên --- nó là \emph{pull từ đâu}:
+\code{localhost:5000/course-service} nghĩa là ``pull từ
+localhost:5000.'' Vì bên pull chính là node k3s, và Jenkins (bên push)
+dùng chung network namespace với máy chủ (Chương~22), cùng một chuỗi
+này hợp lệ cho cả hai --- và \code{localhost} không bao giờ trôi như IP
+LAN hay hostname có thể. Hai điểm cấu hình làm nó chạy được:
+
+\begin{lstlisting}[language=yaml]
+# /etc/rancher/k3s/registries.yaml -- containerd assumes HTTPS otherwise
+mirrors:
+  "localhost:5000":
+    endpoint: ["http://localhost:5000"]
+\end{lstlisting}
+
+\begin{pitfall}[http: server gave HTTP response to HTTPS client]
+Lỗi đặc trưng của chương này. Cả Jib (push) lẫn containerd (pull) đều
+mặc định TLS; \code{registry:2} chỉ nói HTTP thường. Nếu một pod kẹt ở
+\code{ImagePullBackOff} với dòng chữ này trong
+\code{kubectl describe pod}, thì mục trong \code{registries.yaml} đang
+thiếu --- và lưu ý containerd \emph{chỉ đọc nó lúc khởi động}:
+\code{systemctl restart k3s} sau khi sửa.
+\end{pitfall}
+
+\begin{decision}[registry cục bộ vs.\ GHCR]
+GitHub Container Registry sẽ cho phép pull image từ bất cứ đâu và thêm
+quét lỗ hổng --- với cái giá là đẩy hàng trăm megabyte lên Wi-Fi gia
+đình mỗi lần build. Registry trong LAN giữ vòng lặp build ở tốc độ ổ
+đĩa. Quyết định này đảo chiều ngay khi có máy thứ hai cần pull image;
+khi đó trong manifest không gì thay đổi ngoài tiền tố image.
+\end{decision}
+
+\section{Tag, digest, và cái bẫy SNAPSHOT}
+
+\emph{Tag} (\code{:1.0.0-SNAPSHOT}, \code{:a1b2c3d}) là con trỏ có thể
+dời; \emph{digest} (\code{@sha256:...}) là mã băm nội dung bất biến.
+Pipeline push mỗi build với hai nhãn: tag SNAPSHOT (mà manifest tham
+chiếu) và tag git-SHA (mà các lần deploy ghim vào --- Chương~23).
+Kubernetes cache image theo tag; một SNAPSHOT push lại sẽ bị node lặng
+lẽ bỏ qua --- đó là lý do mọi Deployment đều đặt
+\code{imagePullPolicy: Always}: kiểm tra lại registry mỗi lần khởi
+động; nếu digest khớp, phép kiểm tra chỉ tốn một lần tải manifest.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Nêu ba vấn đề CI mà Jib giải quyết so với build dựa trên daemon,
+  và vấn đề nào là chuyện bảo mật.
+  \item Vì sao tên image phải viết từ góc nhìn của \emph{cụm}, và điều
+  gì hỏng nếu Jenkins và k3s hiểu \code{localhost:5000} khác nhau?
+  \item Một đồng nghiệp đề xuất \code{docker save | k3s ctr images import}
+  thay cho registry. Cách đó tốn gì mỗi lần deploy, và stage nào của
+  pipeline tự nhiên ngừng hoạt động?
+  \item Giải thích cách một \code{:1.0.0-SNAPSHOT} push lại cộng với
+  pull policy mặc định tạo ra tình huống ``tôi đã deploy mà chẳng có gì
+  đổi,'' và cả hai cách sửa.
+\end{enumerate}
+\end{quiz}

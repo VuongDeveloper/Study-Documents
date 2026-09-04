@@ -1,0 +1,113 @@
+\chapter{Chặng đường phía trước}
+\label{ch:roadahead}
+
+Với frontend được phục vụ từ cụm (Chương~26), mọi thứ có thể triển
+khai của dự án đều đã được triển khai và ứng dụng dùng được trong
+trình duyệt. Các cột mốc còn lại, mỗi cái thay một thứ tự chế bằng cơ
+chế công nghiệp --- và mỗi cái đều có ý nghĩa nhất vào lúc này, khi
+bạn đã biết nó thay thế cái gì.
+
+\section{Khả năng quan sát}
+
+Bên ngoài \code{kubectl logs} là bộ ba tiêu chuẩn: \textbf{metric}
+(Prometheus cào các endpoint \code{/actuator/prometheus} mà mọi
+service đã mở sẵn; dashboard Grafana trên bộ ba RED --- rate, errors,
+duration), \textbf{trace} (dây nối Zipkin đã có trong mọi cấu hình,
+hiện lấy mẫu ở mức không trong cụm --- một biến môi trường bật nó lên
+khi có pod Zipkin), và \textbf{alert} (Alertmanager: một cú báo khi tỷ
+lệ lỗi của một service hay độ đầy của một PVC vượt ngưỡng). Việc này
+đến qua Helm chart \code{kube-prometheus-stack} --- khoảnh khắc đã hứa
+khi bạn \emph{dùng} Helm mà không tự viết chart (hộp quyết định của
+Chương~20, được giữ lời). Strimzi có thể xuất metric của broker vào
+cùng Prometheus đó với vài dòng \code{metricsConfig} trên resource
+Kafka --- độ trễ của consumer group là alert Kafka đầu tiên đáng có.
+
+\begin{hardware}
+Bộ đầy đủ tốn $\sim$1,5\,GB và không ít CPU --- ngân sách nói là vừa,
+nhưng đây là thứ đầu tiên phải cắt khi tải cao. Khả năng quan sát có
+thể bỏ đi là món xa xỉ của homelab; các đội production tính kích cỡ
+cho nó trước tiên.
+\end{hardware}
+
+\section{GitOps: Argo CD}
+
+Pipeline \emph{đẩy} các lần triển khai (Jenkins giữ một kubeconfig và
+chạy kubectl). GitOps đảo chiều mũi tên: một agent trong cụm (Argo CD)
+\emph{kéo} --- liên tục so sánh manifest của một kho git với cụm và
+hội tụ. Điều đó mua được gì, bằng vốn từ bạn đã có: thông tin xác
+thực của cụm không bao giờ rời khỏi cụm (nỗi lo RBAC của Chương~22
+tan biến --- CI chỉ push image và commit một lần nâng tag); việc xóa
+cuối cùng cũng lan truyền (cạm bẫy prune của Chương~20, được giải
+quyết từ thiết kế); trôi (drift) cấu hình trở nên hữu hình (một
+Deployment bị sửa tay hiện ``OutOfSync''); và rollback là \code{git
+revert}. Jenkins giữ CI --- build, test, push, cập nhật tag trong git
+--- Argo CD nhận CD. Stage deploy của Jenkinsfile, tức Chương~23 của
+cuốn sách này, trở thành một commit.
+
+\section{Cho stack cổ điển về hưu}
+
+Sự dư thừa có chủ đích của Chương~2 và 3 nay có thể được thanh toán,
+từng service một:
+
+\begin{itemize}
+  \item \textbf{Bỏ Eureka}: đổi các route của gateway từ
+  \code{lb://course-service} sang \code{http://course-service:8082} ---
+  DNS của Service và các endpoint gác bằng readiness làm mọi thứ
+  registry từng làm ở đây. Xóa một thứ triển khai, giải phóng
+  512\,Mi.
+  \item \textbf{Bỏ Config-server}: mount các file
+  \code{configurations/} thành một ConfigMap và trỏ
+  \code{spring.config.import} vào thư mục đã mount
+  (\code{optional:file:/config/}). Cùng file, bớt một service, và thay
+  đổi cấu hình trở thành thay đổi manifest chảy qua GitOps.
+\end{itemize}
+
+Cả hai cuộc di dời đều là điểm cộng cho CV chính vì chúng chạy
+\emph{về phía} nền tảng: biết vì sao Eureka tồn tại \emph{và} vì sao
+Kubernetes khiến nó lỗi thời là khác biệt giữa dùng một trong hai và
+hiểu cả hai.
+
+\section{Jenkins vào cụm}
+
+Phép đảo ngược kiểu homelab của Chương~22 --- build trên controller,
+Jenkins nằm ngoài k3s --- đảo lại gọn gàng một khi pipeline đã ổn
+định: plugin Kubernetes sinh một pod agent cho mỗi build, và bản thân
+Jenkins trở thành một StatefulSet với \code{JENKINS\_HOME} trên một
+PVC. Cuộc di dời chạm tới mọi khái niệm của Phần~V cùng lúc, đó là lý
+do nó được xếp cuối cùng.
+
+\section{OpenShift, nói ngắn}
+
+Các manifest được giữ khả chuyển có chủ đích: image không chạy bằng
+root của Jib (Chương~13) thỏa mãn mô hình bảo mật UID tùy ý của
+OpenShift, nên triển khai lên một sandbox OpenShift miễn phí hẳn chỉ
+cần bước dịch Ingress sang Route (Chương~18). Chạy thí nghiệm đó một
+lần sẽ kiểm chứng những tuyên bố về tính khả chuyển mà cuốn sách này
+vẫn đưa ra --- và vốn từ của OpenShift (Route, SCC, BuildConfig) ánh
+xạ một-một lên các chương bạn đã đọc.
+
+\section{Bạn đang đứng ở đâu}
+
+Bỏ tên dự án đi, bản kiểm kê đọc như một bản mô tả công việc
+platform: bộ máy phân giải thuộc tính giúp một artifact chạy ở bất cứ
+đâu; log, consumer group và ngữ nghĩa giao nhận; image, layer và
+registry; điều hòa, probe, RBAC, storage class và operator; pipeline,
+danh tính deploy giới hạn bằng RBAC, và phép đảo chiều GitOps. Những
+ràng buộc của homelab không phải là giới hạn --- chúng là giáo trình:
+mỗi hộp ``trên phần cứng này'' đều ép ra một quyết định mà tiền bạc
+thường che đi.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Bạn sẽ đặt alert trên metric nào trước tiên cho đường Kafka,
+  và nó đo cái gì theo cách nói của Chương~10?
+  \item Triển khai kiểu đẩy so với kiểu kéo: chỉ ra thông tin xác thực
+  của cụm nằm ở đâu trong mỗi kiểu, và giải thích việc dọn (prune) của
+  GitOps giải quyết cạm bẫy của chương nào.
+  \item Phác thảo việc cho Eureka về hưu: cái gì đổi trong cấu hình
+  của gateway, hai cơ chế Kubernetes nào thay cho đăng ký và liveness,
+  và cái gì có thể xóa?
+  \item Vì sao image của Jib khiến thí nghiệm OpenShift rẻ, và phép
+  dịch object nào vẫn còn lại?
+\end{enumerate}
+\end{quiz}

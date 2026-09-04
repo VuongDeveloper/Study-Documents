@@ -1,0 +1,125 @@
+\chapter{Workload: Pod, Deployment, StatefulSet}
+\label{ch:workloads}
+
+\section{Pod}
+
+Pod là đơn vị mà Kubernetes lập lịch: một hoặc nhiều container dùng
+chung network namespace (một IP, \code{localhost} giữa chúng) và volume.
+Hầu như mọi pod ở đây chỉ có một container; các mẫu nhiều container
+(sidecar làm proxy hay đẩy log) mới quan trọng khi bạn gặp service mesh.
+Pod \emph{sinh ra để chết} --- chúng không bao giờ được chữa, chỉ được
+thay, và IP của chúng chết theo. Mọi thứ còn lại trong Phần~V ---
+controller, Service, PVC --- tồn tại để xây hành vi bền vững từ những
+pod dùng xong bỏ.
+
+\section{Deployment và rollout}
+
+Bạn không bao giờ tạo pod trần. Một \emph{Deployment} khai báo ``N
+replica của mẫu pod này''; nó quản lý một \emph{ReplicaSet} (bộ đếm),
+và ReplicaSet quản lý các pod. Ba tầng gián tiếp là thứ làm cho việc
+cập nhật trở nên thanh lịch: đổi mẫu (một tag image mới), Deployment
+tạo một ReplicaSet \emph{mới}, tăng dần nó lên trong khi cái cũ giảm
+xuống:
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3.5mm and 9mm]
+  \node[box] (d) {Deployment\\\scriptsize course-service};
+  \node[box, below left=of d] (rs1) {ReplicaSet (cũ)\\\scriptsize image :a1b2c3d};
+  \node[box, below right=of d] (rs2) {ReplicaSet (mới)\\\scriptsize image :e4f5a6b};
+  \node[boxfill, below=of rs1] (p1) {pod \scriptsize(đang tắt)};
+  \node[boxfill, below=of rs2] (p2) {pod \scriptsize(khởi động)};
+  \draw[flow] (d) -- (rs1); \draw[flow] (d) -- (rs2);
+  \draw[flowdash] (rs1) -- (p1); \draw[flow] (rs2) -- (p2);
+\end{tikzpicture}
+\caption{Một rolling update đang giữa chừng: hai ReplicaSet, lưu lượng đang dịch chuyển.}
+\end{figure}
+
+Rollout chỉ tiến tới khi pod mới trở nên \emph{Ready} (probe của
+Chương~17 --- đây là nơi chúng chứng tỏ giá trị), nên một image hỏng
+làm rollout dừng lại thay vì kéo sập service; và
+\code{kubectl rollout undo} trỏ ngược về ReplicaSet trước, thứ được giữ
+lại chính là vì mục đích này. \code{kubectl rollout status} của
+pipeline (Chương~23) là CI đang chờ bộ máy này kết thúc.
+
+Với một replica --- cụm này --- rolling update vẫn nghĩa là
+khởi-động-mới-rồi-tắt-cũ, một khoảng chồng lấn hai pod ngắn ngủi tốn
+một thoáng gấp đôi bộ nhớ. \code{maxUnavailable}/\code{maxSurge} tinh
+chỉnh điệu nhảy đó ở quy mô lớn.
+
+\section{StatefulSet: khi danh tính quan trọng}
+
+Với cơ sở dữ liệu, tính hoán đổi được là hoàn toàn sai: pod nào lên
+cũng phải là \emph{đúng Postgres đó} với \emph{đúng dữ liệu đó}.
+StatefulSet cung cấp thứ mà Deployment từ chối: tên ổn định
+(\code{postgres-course-0}, không phải hậu tố ngẫu nhiên), PVC riêng cho
+từng replica qua \code{volumeClaimTemplates} (Chương~19) sống lâu hơn
+pod và gắn lại vào pod kế nhiệm, và thay thế có thứ tự, từng cái một.
+Từ \code{postgres-course.yaml}:
+
+\begin{lstlisting}[language=yaml]
+kind: StatefulSet
+spec:
+  serviceName: postgres-course
+  replicas: 1
+  volumeClaimTemplates:          # a PVC per replica, not per manifest
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 5Gi } }
+\end{lstlisting}
+
+Quy tắc quyết định: \emph{tiến trình} có giữ trạng thái mà tiến trình
+kế tiếp phải thừa kế không? Cơ sở dữ liệu thì có; Spring service thì
+không --- trạng thái của chúng nằm trong các cơ sở dữ liệu kia, điều
+làm chúng thành Deployment, và điều khiến chúng mở rộng và rollout được.
+(Tính phi trạng thái của JWT ở Chương~5 chính là thuộc tính này ở tầng
+trên.)
+
+\begin{pitfall}[mất dữ liệu kiểu cơ-sở-dữ-liệu-trong-Deployment]
+Triệu chứng: ai đó chạy cơ sở dữ liệu như một Deployment với volume
+thường; chạy tốt hàng tháng; rồi một sự cố node tạo ra replica
+\emph{thứ hai} trỏ vào cùng bộ file, và cơ sở dữ liệu hỏng. Nguyên
+nhân: hợp đồng của Deployment là ``các replica hoán đổi được'' và
+rolling update của nó chạy cũ và mới \emph{đồng thời} trong chốc lát
+--- chí mạng khi cả hai cùng mở một thư mục dữ liệu. Thứ tự của
+StatefulSet + claim riêng từng replica tồn tại để điều này bất khả. Bài
+học khái quát: chọn controller theo \emph{hợp đồng} của nó, không phải
+theo file YAML nào bạn thấy trước.
+\end{pitfall}
+
+\section{Các loại workload khác}
+
+Cho đầy đủ, các controller còn lại, chưa cái nào được dùng ở đây:
+\textbf{DaemonSet} (một pod mỗi node --- bộ gom log, metric của node),
+\textbf{Job} (chạy tới khi xong --- Flyway-như-bước-CI của Chương~7 sẽ
+là một Job), \textbf{CronJob} (Job theo lịch --- sao lưu, mảnh ghép còn
+thiếu của Chương~19).
+
+\begin{handson}[xem một rollout diễn ra]
+\begin{lstlisting}[language=bash]
+kubectl -n ts get rs -l app=course-service          # one ReplicaSet
+kubectl -n ts set image deployment/course-service \
+    course-service=localhost:5000/course-service:1.0.0-SNAPSHOT
+kubectl -n ts rollout status deployment/course-service
+kubectl -n ts get rs -l app=course-service          # two -- old kept at 0
+kubectl -n ts rollout undo deployment/course-service
+\end{lstlisting}
+Lệnh \code{get rs} thứ hai là điểm mấu chốt: ReplicaSet cũ vẫn tồn tại,
+scale về không --- đích của undo, mặc định được giữ cho mười bản sửa
+đổi gần nhất.
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Vì sao Deployment quản lý ReplicaSet thay vì quản lý pod trực
+  tiếp? Tính năng nào rơi ra từ tầng gián tiếp đó?
+  \item Phát biểu khác biệt về hợp đồng giữa Deployment và StatefulSet,
+  mỗi cái một câu, rồi phân loại: Eureka server, một cache Redis, một
+  Kafka broker, api-gateway.
+  \item Trong rolling update, điều kiện nào quyết định việc tắt pod cũ,
+  và bộ máy của chương nào cung cấp điều kiện đó?
+  \item Giải thích chính xác cơ chế khiến chạy Postgres dưới Deployment
+  rước lấy hỏng dữ liệu trong khi StatefulSet thì không.
+\end{enumerate}
+\end{quiz}

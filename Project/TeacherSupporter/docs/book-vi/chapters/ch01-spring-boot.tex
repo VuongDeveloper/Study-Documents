@@ -1,0 +1,229 @@
+\chapter{Spring Boot: Cỗ máy bên dưới mọi service}
+\label{ch:springboot}
+
+Bảy trong tám đơn vị triển khai của dự án này là ứng dụng Spring Boot.
+Trước khi bất kỳ file YAML nào có thể có nghĩa, bạn cần ba ý tưởng: một
+\emph{starter} kéo theo những gì, \emph{auto-configuration} quyết định
+những gì thay cho bạn, và --- quan trọng nhất cho mọi thứ trong Phần~V và
+VI --- chính xác \emph{Spring phân giải một thuộc tính cấu hình như thế
+nào} khi cùng một key được định nghĩa ở nhiều nơi cùng lúc.
+
+\section{Vấn đề Spring Boot giải quyết}
+
+Spring cổ điển bắt bạn nối dây mọi thứ: một servlet container để triển
+khai vào, cấu hình XML hoặc Java khai báo từng bean, và một danh sách dài
+các dependency tương thích phiên bản với nhau. Spring Boot đảo ngược điều
+đó. Một ứng dụng chỉ là một phương thức \code{main()} bình thường:
+
+\begin{lstlisting}[language=Java]
+@SpringBootApplication
+public class CourseServiceApplication {
+  public static void main(String[] args) {
+    SpringApplication.run(CourseServiceApplication.class, args);
+  }
+}
+\end{lstlisting}
+
+\code{@SpringBootApplication} là ba annotation núp chung trong một chiếc
+áo choàng: \code{@Configuration} (lớp này có thể định nghĩa bean),
+\code{@ComponentScan} (tìm \code{@Service}, \code{@RestController},
+\ldots{} trong package này và bên dưới), và \code{@EnableAutoConfiguration}
+--- cái thú vị nhất.
+
+\subsection{Starter}
+
+Một starter như \code{spring-boot-starter-web} là một jar rỗng mà công
+việc duy nhất là mang một danh sách dependency được tuyển chọn: Spring
+MVC, Jackson, và một Tomcat \emph{nhúng}. ``Nhúng'' quan trọng về mặt vận
+hành: server nằm bên trong jar, nên \code{java -jar course-service.jar}
+là một web server hoàn chỉnh. Riêng sự thật đó là điều khiến các
+container image ở Chương~13 đơn giản đến vậy --- không có Tomcat nào để
+cài, chỉ cần cung cấp một JVM.
+
+\subsection{Auto-configuration}
+
+Lúc khởi động, Spring Boot duyệt qua một danh sách các cấu hình ứng viên
+và áp dụng từng cái mà điều kiện của nó thỏa mãn. Các điều kiện đọc lên
+kiểu như:
+
+\begin{itemize}
+  \item \emph{lớp này có trên classpath không?} (\code{@ConditionalOnClass}
+  --- bạn đã thêm driver Postgres, nên một \code{DataSource} được cấu hình)
+  \item \emph{người dùng đã tự định nghĩa bean này chưa?}
+  (\code{@ConditionalOnMissingBean} --- bean tường minh của bạn luôn thắng)
+  \item \emph{một thuộc tính có được đặt không?} (\code{@ConditionalOnProperty})
+\end{itemize}
+
+Auto-configuration là lý do \code{course-service} không chứa dòng code nào
+tạo connection pool, Kafka producer, hay nối dây S3 client --- thêm
+dependency cộng vài thuộc tính \emph{chính là} cấu hình. Khi hành vi
+dường như xuất hiện từ hư không, hãy chạy ứng dụng với \code{--debug} một
+lần: ``condition evaluation report'' liệt kê mọi auto-configuration được
+áp dụng và bị bỏ qua, kèm lý do.
+
+\section{Cấu hình ngoài: thứ tự phân giải thuộc tính}
+\label{sec:property-order}
+
+Đây là cơ chế chịu lực nhiều nhất trong cả cuốn sách. Mọi mẹo mà các
+manifest Kubernetes ở Phần~V giở ra đều hoạt động nhờ nó.
+
+Một thuộc tính Spring như \code{spring.datasource.url} có thể được định
+nghĩa trong nhiều \emph{property source} (nguồn thuộc tính). Spring gộp
+tất cả vào một \code{Environment}, và khi hai nguồn định nghĩa cùng một
+key, nguồn cụ thể hơn thắng. Rút gọn về những nguồn dự án này thực sự
+dùng, từ yếu nhất đến mạnh nhất:
+
+\begin{enumerate}
+  \item giá trị mặc định trong \code{application.yml} đóng gói trong jar
+  \item cấu hình lấy từ config-server (Chương~2)
+  \item biến môi trường của hệ điều hành
+  \item tham số dòng lệnh
+\end{enumerate}
+
+\begin{decision}[vì sao cụm ghi đè bằng biến môi trường]
+Cùng một image phải chạy không đổi trên laptop (Compose) lẫn trong k3s.
+Nướng sự khác biệt giữa các môi trường vào jar nghĩa là mỗi môi trường
+một image --- đúng thứ container sinh ra để tránh. Biến môi trường đứng
+trên cả YAML đóng gói lẫn config-server, nên Deployment của Kubernetes có
+thể trỏ lại một service sang \code{postgres-course:5432} mà không đụng
+đến một file nào thuộc về lập trình viên. Một artifact, nhiều môi trường,
+khác biệt được tiêm vào ở biên.
+\end{decision}
+
+\subsection{Ràng buộc nới lỏng (relaxed binding)}
+
+Tên biến môi trường không thể chứa dấu chấm. Vì vậy Spring ánh xạ
+\code{SPRING\_DATASOURCE\_URL} $\rightarrow$ \code{spring.datasource.url}:
+viết hoa, dấu chấm thành gạch dưới. Đọc bất kỳ Deployment nào trong
+\code{deploy/k8s/base/} và giờ bạn có thể giải mã mọi mục \code{env:}
+thành ``cái này ghi đè key YAML kia.'' Ví dụ
+\code{SPRING\_DATA\_MONGODB\_URI} trong \code{dictionary-service.yaml}
+ghi đè \code{spring.data.mongodb.uri} từ config-server.
+
+\subsection{Placeholder với giá trị mặc định}
+
+Các file cấu hình của dự án dùng thêm một thành ngữ nữa:
+
+\begin{lstlisting}[language=yaml]
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecretKeyThatIs...}
+\end{lstlisting}
+
+\code{\$\{NAME:default\}} nghĩa là ``dùng biến môi trường nếu có, không
+thì dùng giá trị mặc định.'' Đây là lý do một lập trình viên có thể chạy
+auth-service mà không cần cài đặt gì, trong khi production tiêm secret
+thật --- và là lý do ở Chương~16 Secret của Kubernetes chỉ cần cung cấp
+\code{JWT\_SECRET} là nắm quyền kiểm soát giá trị này.
+
+\section{File của dự án, có chú thích}
+
+Mỗi service chỉ mang một \code{application.yml} tí hon; phần cấu hình thú
+vị nằm trên config-server. Đây là file của course-service, đầy đủ:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  application:
+    name: course-service            (*@\co{1}@*)
+  config:
+    import: optional:configserver:http://localhost:8888   (*@\co{2}@*)
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/          (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Danh tính của service. Config-server dùng nó để chọn file
+  cần phục vụ (\code{configurations/course-service.yml}); Eureka dùng nó
+  làm tên đăng ký; gateway định tuyến tới nó bằng
+  \code{lb://course-service}. Một chuỗi ký tự buộc cả ba hệ thống lại
+  với nhau.
+  \item[\co{2}] Import cấu hình từ xa lúc bootstrap.
+  \code{optional:} nghĩa là ``cứ khởi động dù config-server có sập'' ---
+  dễ chịu khi dev, và đáng bàn ở production (một service khởi động với
+  nửa cấu hình có thể hỏng theo những cách lạ lùng hơn một service từ
+  chối khởi động). Giá trị mặc định \code{localhost:8888} được ghi đè bởi
+  \code{SPRING\_CONFIG\_IMPORT} trong cả Compose lẫn Kubernetes.
+  \item[\co{3}] Eureka ở đâu --- lại một giá trị mặc định localhost, lại
+  được ghi đè theo từng môi trường bằng
+  \code{EUREKA\_CLIENT\_SERVICEURL\_DEFAULTZONE}.
+\end{description}
+
+\section{Profile}
+
+Một \emph{profile} Spring là một biến thể cấu hình có tên.
+\code{spring.profiles.active=native} trên config-server (Chương~2) là
+chỗ dùng profile duy nhất của dự án cho đến giờ, nhưng cơ chế này tổng
+quát hơn: \code{application-prod.yml} được nạp đè lên
+\code{application.yml} khi profile \code{prod} đang kích hoạt, cho phép
+một jar mang nhiều tính cách. Kubernetes làm giảm nhu cầu đó --- thay vào
+đó môi trường tiêm sự khác biệt vào --- đó là lý do dự án này dựa vào
+biến môi trường, không phải file profile, cho thay đổi theo môi trường.
+
+\section{Actuator}
+
+\code{spring-boot-starter-actuator} thêm các endpoint vận hành dưới
+\code{/actuator}: \code{/health} (readiness tổng hợp của DB, đĩa, các
+kiểm tra tùy chỉnh), \code{/info}, \code{/metrics}, \code{/prometheus}.
+Hai sự thật quan trọng lúc này:
+
+\begin{itemize}
+  \item Starter phải có trên classpath. Cấu hình exposure mà không có
+  \code{spring-boot-starter-actuator} thì vô tác dụng --- dự án đã mắc
+  đúng lỗi đó ở bốn service và phát hiện ra qua một probe Kubernetes thất
+  bại (Chương~17).
+  \item Endpoint phải được \emph{expose}
+  (\code{management.endpoints.web.exposure.include}) --- dự án expose
+  \code{health,info,metrics,prometheus}.
+  \item Expose không phải là \emph{phân quyền}: nếu Spring Security bảo vệ
+  \code{/actuator/**}, endpoint tồn tại nhưng trả lời 401. Chính tương
+  tác này quyết định service nào dùng được probe Kubernetes nào ở
+  Chương~17 --- dictionary-service cho phép actuator và được probe qua
+  \code{/actuator/health}; auth-service thì không, và phải được probe qua
+  \code{/v3/api-docs} thay thế.
+\end{itemize}
+
+\section{Bên ngoài dự án}
+
+Hai ví dụ tương phản của cùng một bộ máy thuộc tính:
+
+\emph{Một ứng dụng twelve-factor kiểu Heroku} cấu hình mọi thứ bằng biến
+môi trường --- \code{DATABASE\_URL}, \code{PORT} --- và mang một
+\code{application.yml} chỉ toàn placeholder \code{\$\{...\}}. Thứ tự phân
+giải của Spring khiến phong cách đó trở thành bản địa.
+
+\emph{Một ngân hàng chạy một artifact qua năm môi trường}
+(dev/test/uat/preprod/prod) thường ghép một config-server dựa trên git
+repository với profile cho từng môi trường:
+\code{course-service-uat.yml} nằm trong một repo được kiểm toán, và việc
+thăng cấp là một lần merge git. Config-server classpath native của dự án
+(Chương~2) là phiên bản một-lập-trình-viên của cùng hình dạng đó.
+
+\begin{pitfall}[giá trị ghi đè của tôi bị bỏ qua]
+Triệu chứng: bạn đặt một biến môi trường nhưng service vẫn dùng giá trị
+cũ. Các nguyên nhân thường gặp, theo thứ tự tần suất: tên biến không ánh
+xạ tới key bạn nghĩ (kiểm tra cách viết theo relaxed binding ---
+\code{SERVICEURL} trong key Eureka là một từ, một cái tên bất quy tắc
+phải chép chính xác); giá trị cũng được đặt bởi một nguồn \emph{mạnh
+hơn} (một tham số dòng lệnh); hoặc service đọc key lúc build thay vì từ
+Environment. Chẩn đoán bằng endpoint actuator \code{/actuator/env} (khi
+được expose), nó liệt kê mọi property source và nguồn nào đã thắng.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Một key được định nghĩa trong \code{application.yml} của jar,
+  trong file của config-server cho service đó, và dưới dạng biến môi
+  trường trong Deployment. Giá trị nào thắng, và vì sao thứ tự đó là đúng
+  cho container?
+  \item \code{@SpringBootApplication} gộp ba annotation nào, và annotation
+  nào trong số đó giải thích vì sao xóa một dependency không dùng đến có
+  thể làm thay đổi hành vi lúc chạy?
+  \item \code{\$\{GOOGLE\_CLIENT\_ID:placeholder\}} --- biểu thức này phân
+  giải thành gì khi biến chưa được đặt, và điều đó cho auth-service tính
+  chất vận hành nào lúc khởi động?
+  \item Vì sao expose một endpoint actuator không đảm bảo rằng một probe
+  Kubernetes dùng được nó?
+\end{enumerate}
+\end{quiz}

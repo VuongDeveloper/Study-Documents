@@ -1,0 +1,143 @@
+\chapter{Mạng: Service, DNS, Ingress}
+\label{ch:networking}
+
+\section{Vấn đề mà pod tạo ra}
+
+Pod có IP định tuyến được trong cụm --- và mất nó mỗi lần bị thay thế.
+Chương~15 đã biến pod thành thứ dùng xong bỏ; phải có gì đó ổn định đứng
+phía trước. Thứ đó là \emph{Service}: một IP ảo và tên DNS cố định, phía
+sau là danh sách sống các endpoint pod được chọn theo label:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: v1
+kind: Service
+metadata: { name: course-service }
+spec:
+  selector: { app: course-service }     (*@\co{1}@*)
+  ports:
+    - { port: 8082, targetPort: 8082 }  (*@\co{2}@*)
+\end{lstlisting}
+
+\co{1}~Endpoint controller liên tục liệt kê các pod \emph{Ready} khớp
+selector này --- readiness (Chương~17) là bài kiểm tra tư cách thành
+viên. \co{2}~Traffic tới port của Service được chuyển tiếp tới targetPort
+của một endpoint được chọn.
+
+DNS của cụm cho mỗi Service một cái tên: \code{course-service} trong
+namespace, \code{course-service.ts.svc.cluster.local} từ bất cứ đâu.
+Đây là lý do các override biến môi trường trên Kubernetes trông giống
+hệt bên Compose --- cả hai nền tảng đều phân giải tên service trên một
+mạng riêng; dự án cố tình đặt tên Service k8s theo tên service Compose
+để các override khớp nhau.
+
+Kiểu Service mặc định, \code{ClusterIP}, chỉ với tới được \emph{từ bên
+trong} cụm --- một thuộc tính bảo mật mà Phần~II đã dựa vào cho Mongo
+không mật khẩu. \code{NodePort} và \code{LoadBalancer} tồn tại để expose
+Service trực tiếp; dự án này thay vào đó dồn mọi thứ qua một Ingress.
+
+\section{Ingress và Traefik}
+
+Một Service expose một thứ; \emph{Ingress} là cửa trước ở tầng L7: định
+tuyến HTTP theo host và path, sau này là kết thúc TLS, được khai báo
+dưới dạng dữ liệu và thực thi bởi một \emph{Ingress controller} ---
+trong k3s là Traefik đi kèm, theo dõi các object Ingress. Từ
+\code{api-gateway.yaml}:
+
+\begin{lstlisting}[language=yaml]
+kind: Ingress
+spec:
+  rules:
+    - host: ts.local                    (*@\co{1}@*)
+      http:
+        paths:
+          - path: /api                  (*@\co{2}@*)
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port: { number: 8080 }
+          # /oauth2 and /login/oauth2 likewise -> api-gateway
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Quy tắc theo host: áp dụng cho request có header
+  \code{Host} là \code{ts.local} --- một cái tên chỉ tồn tại trong file
+  hosts của Windows, trỏ tới IP tailnet của server. Nhiều host có thể
+  dùng chung cặp cổng 80/443 duy nhất của cụm.
+  \item[\co{2}] Tỏa theo path. Chỉ ba prefix được vào, tất cả tới
+  gateway; \code{/} để trống cho Ingress riêng của frontend
+  (Chương~26), mà Traefik gộp vào bảng định tuyến của cùng host.
+\end{description}
+
+\section{Đường đi trọn vẹn của một request}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3.5mm and 5.5mm]
+  \node[boxdark] (b) {Browser};
+  \node[box, right=of b] (t) {Traefik};
+  \node[box, right=of t] (gws) {Service\\\scriptsize api-gateway};
+  \node[box, right=of gws] (gw) {pod gateway};
+  \node[box, below=of gw] (cs) {Service\\\scriptsize course-service};
+  \node[box, left=of cs] (csp) {pod course};
+  \draw[flow] (b) -- node[lbl,above]{\scriptsize Host: ts.local} (t);
+  \draw[flow] (t) -- node[lbl,above]{\scriptsize /api} (gws);
+  \draw[flow] (gws) -- (gw);
+  \draw[flow] (gw) -- node[lbl,right]{\scriptsize lb:// qua Eureka}(cs);
+  \draw[flow] (cs) -- (csp);
+\end{tikzpicture}
+\caption{Hai bộ định tuyến, hai hệ thống khám phá, một request.}
+\end{figure}
+
+Đáng dừng lại một chút: tra cứu Eureka của gateway trả về \emph{IP pod}
+(prefer-ip-address của Chương~3), nên chặng thứ tư về kỹ thuật đi vòng
+qua Service course-service. Hai hệ thống khám phá chạy song song ---
+Eureka cho gateway-tới-service, DNS của Service cho mọi thứ còn lại
+(config-server, cơ sở dữ liệu, Kafka). Bước đơn giản hóa ở Chương~27
+gộp chúng thành một.
+
+\begin{pitfall}[Service không chọn được gì]
+Triệu chứng: \code{curl} tới tên Service bị timeout; pod đang Running và
+khỏe mạnh. Nguyên nhân \#1: lệch label --- selector của Service và label
+trong pod template khác nhau bởi một lỗi gõ; danh sách endpoint rỗng và
+không ai kêu ca. Kiểm tra: \code{kubectl -n ts get endpoints
+course-service} --- cột ENDPOINTS trống chính là lỗi này. Nguyên nhân
+\#2: endpoint có nhưng pod chưa Ready --- cùng lệnh đó hiện chúng dưới
+\code{NotReadyAddresses}. Lớp trừu tượng Service thất bại
+\emph{trong im lặng}; object endpoints là nơi nó lộ ra.
+\end{pitfall}
+
+\begin{decision}[một host Ingress + file hosts, không dùng NodePort]
+NodePort (mỗi service một cổng lạ lẫm) sẽ chạy được qua Tailscale mà
+không cần trò DNS nào --- và tạo ra URL kiểu
+\code{100.85.66.43:30082} vừa lộ topology, vừa né gateway, vừa không
+làm TLS tử tế được. Một host Ingress nghĩa là một địa chỉ cần bảo vệ và
+trải nghiệm trình duyệt giống hệt production; dòng \code{ts.local}
+trong file hosts là chi phí duy nhất phía client. Đường nâng cấp ---
+một domain thật cộng cert-manager, hoặc Cloudflare Tunnel --- chỉ đổi
+host của Ingress và không gì khác.
+\end{decision}
+
+\section{Ngoài phạm vi dự án}
+
+Trên EKS, cùng object Ingress đó, thêm annotation cho controller của
+AWS, sẽ cấp phát một ALB thật; trên OpenShift nó trở thành
+\code{Route} --- cùng ý tưởng, khác danh từ. Mảnh ghép cụm này bỏ qua:
+\textbf{NetworkPolicy} --- quy tắc tường lửa cho traffic pod-tới-pod
+(``chỉ gateway được chạm tới course-service:8082''), tức là sự thực thi
+trong cụm mà mẫu biên-tin-cậy của Chương~5 gọi là điểm mềm còn lại của
+nó. Tin cậy mạng phẳng là bình thường với homelab và là cẩu thả với một
+ngân hàng.
+
+\begin{quiz}
+\begin{enumerate}
+  \item IP pod đổi mỗi lần thay thế, vậy mà \code{course-service:8082}
+  luôn chạy. Kể tên từng cơ chế nằm giữa cái tên và socket của pod.
+  \item Readiness tương tác với endpoints của Service ra sao, và điều
+  đó nghĩa là gì trong một rolling update?
+  \item Chẩn đoán: Service tồn tại, pod Ready, \code{get endpoints}
+  hiện danh sách rỗng. Sai ở đâu, và vì sao không có gì báo lỗi?
+  \item Vì sao \code{ts.local} cần một dòng trong file hosts, và thứ gì
+  thay thế dòng đó trong hai đường nâng cấp lên production?
+\end{enumerate}
+\end{quiz}

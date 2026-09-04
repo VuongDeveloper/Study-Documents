@@ -1,0 +1,135 @@
+\chapter{Các service nghiệp vụ và module common}
+\label{ch:services}
+
+Các chương trước bàn về những service hạ tầng. Chương này vẽ bản đồ ba
+service làm việc thật, cộng với module \code{common} dùng chung --- và
+qua chúng, hai cách microservice nói chuyện với nhau.
+
+\section{course-service: con ngựa thồ}
+
+Khóa học, học viên, bài tập, ghi danh, bài nộp --- CRUD kinh điển trên
+Postgres (Chương~7), cộng thêm file đính kèm lưu trong MinIO
+(Chương~9). Nó \emph{phát} sự kiện \code{ts.assignment.created} và
+\emph{lắng nghe} \code{ts.user.activated} --- mẫu đáng để ý là nó phản
+ứng với sự kiện nghiệp vụ của service khác mà không bao giờ gọi service
+đó.
+
+\section{auth-service: danh tính}
+
+Mọi thứ Chương~5 đã mô tả: đăng ký kèm kích hoạt qua e-mail, đăng nhập
+bằng mật khẩu và Google, 2FA TOTP, phát hành JWT, refresh token. Nó phát
+ba sự kiện: \code{ts.user.registered}, \code{ts.user.activated},
+\code{ts.user.admin-provisioned}.
+
+\section{dictionary-service: anh nhỏ}
+
+Tra cứu từ vựng trên MongoDB (Chương~8). Đơn giản có chủ ý --- nó tồn
+tại một phần để chứng minh kiến trúc chứa được một document store, một
+phần làm service ít rủi ro để thử mọi thứ trước.
+
+\section{notification-service: consumer thuần túy}
+
+Không có REST API đáng kể, không cơ sở dữ liệu. Nó đăng ký ba topic và
+biến sự kiện thành e-mail (Maildev khi dev, một SMTP relay thật về sau):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Topic & Producer & Mail gửi đi \\
+\midrule
+\code{ts.user.registered} & auth-service & link kích hoạt \\
+\code{ts.user.admin-provisioned} & auth-service & thông báo tài khoản \\
+\code{ts.assignment.created} & course-service & thông báo bài tập mới \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Vì đầu vào \emph{duy nhất} của nó là Kafka, đây là service duy nhất
+không thể chạy hữu ích trước khi có broker --- đó là lý do manifest
+Kubernetes của nó đi cùng cột mốc Kafka (Chương~25) chứ không cùng các
+service khác.
+
+\section{Đồng bộ và bất đồng bộ, trong codebase này}
+
+Dự án dùng cả hai kiểu tương tác, mỗi kiểu đúng chỗ của nó:
+
+\begin{description}
+  \item[Đồng bộ (HTTP qua gateway)] khi bên gọi cần câu trả lời để đi
+  tiếp: frontend lấy danh sách khóa học. Ràng buộc về thời gian --- cả
+  hai bên phải đang chạy.
+  \item[Bất đồng bộ (sự kiện qua Kafka)] khi bên gọi chỉ cần ghi nhận
+  một sự thật: một đăng ký vừa xảy ra; ai quan tâm thì hành động.
+  auth-service không biết notification-service tồn tại. Tách rời về thời
+  gian --- nếu consumer sập, mail đi muộn chứ không mất.
+\end{description}
+
+Quy tắc ngón tay cái codebase tuân theo: \emph{lệnh} (command) cần câu
+trả lời thì dùng HTTP; \emph{sự thật} mà người khác có thể phản ứng thì
+là sự kiện, đặt tên ở thì quá khứ (\code{UserRegistered},
+\code{AssignmentCreated}).
+
+\section{Module common}
+
+\begin{lstlisting}
+com/ts/common/
+  dto/        CourseDto, StudentDto, UserDto, ...
+              UserRegisteredEvent, UserActivatedEvent,
+              AssignmentCreatedEvent, AdminProvisionedUserEvent
+  exception/  ApiException, ErrorResponse
+  security/   JwtConstants     <- header names, claim names
+\end{lstlisting}
+
+Ba kiểu chia sẻ, với ba hồ sơ rủi ro khác nhau:
+
+\begin{itemize}
+  \item \textbf{Các record sự kiện} là \emph{hợp đồng} giữa producer và
+  consumer. Chia sẻ class bảo đảm hai bên nhất trí --- với cái giá là
+  phải triển khai đồng bộ khi hình dạng thay đổi. (Lựa chọn thay thế
+  trong công nghiệp --- schema registry --- xuất hiện ở Chương~11.)
+  \item \textbf{\code{JwtConstants}} chia sẻ \emph{tên} header và claim
+  giữa gateway và các service. Một tên header gõ sai sẽ hỏng âm thầm
+  --- request đơn giản là tới nơi dưới dạng vô danh --- nên gom về một
+  chỗ là khoản bảo hiểm rẻ.
+  \item \textbf{DTO và exception} là chia sẻ cho tiện: dễ chịu trong
+  monorepo, và là thứ đầu tiên nên nhân-bản-thay-vì-chia-sẻ nếu các
+  service có ngày tách ra thành các repository riêng, vì các class tiện
+  ích dùng chung chính là cách những service ``độc lập'' rốt cuộc lại
+  phải phát hành cùng nhau.
+\end{itemize}
+
+\begin{decision}[có nên có module dùng chung không?]
+Những người theo chủ nghĩa thuần túy microservice cấm chia sẻ code
+giữa các service. Lựa chọn thuần túy --- mỗi service tự định nghĩa bản
+sao của mọi sự kiện --- lại cho phép trôi lệch đúng ở chỗ sự nhất trí là
+bắt buộc. Dự án này vạch ranh giới ở: chia sẻ \emph{hợp đồng} (sự kiện,
+tên header), nghĩ kỹ trước khi chia sẻ bất cứ thứ gì có hành vi.
+\code{jib.skip=true} trong POM của common đánh dấu nó là module duy
+nhất là thư viện, không phải thứ để triển khai.
+\end{decision}
+
+\begin{pitfall}[bẫy triển khai đồng bộ (lockstep)]
+Triệu chứng: sau khi thêm một trường vào \code{UserRegisteredEvent} và
+chỉ triển khai auth-service, notification-service bắt đầu ném lỗi giải
+tuần tự trên mọi thông điệp --- và vì nó dùng chung consumer group, nó
+cứ thử lại mãi cùng một thông điệp hỏng. Nguyên nhân: hợp đồng thay đổi
+chỉ ở một phía, và topic giờ chứa sự kiện ở hai hình dạng. Các quy tắc
+ngăn chuyện đó: chỉ \emph{thêm} trường tùy chọn, không bao giờ đổi tên
+hay xóa; triển khai consumer trước producer; và cấu hình xử lý lỗi cho
+consumer (Chương~11) để một thông điệp độc không làm nghẽn cả topic.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Với mỗi trường hợp, nói HTTP hay sự kiện là phù hợp và vì sao:
+  (a) frontend cần danh sách học viên; (b) một bài nộp vừa được chấm và
+  học viên cần được báo; (c) course-service phải xác minh một JWT.
+  \item Vì sao notification-service là service duy nhất có manifest
+  Kubernetes phải chờ cột mốc Kafka, trong khi auth-service cũng dùng
+  Kafka?
+  \item Nêu một thứ thuộc về \code{common} và một thứ không bao giờ nên
+  ở đó, kèm lập luận.
+  \item Quy tắc thứ tự triển khai nào làm cho thay đổi schema sự kiện
+  an toàn, và bản thân thay đổi đó phải có tính chất gì?
+\end{enumerate}
+\end{quiz}

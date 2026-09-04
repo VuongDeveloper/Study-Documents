@@ -1,0 +1,113 @@
+\chapter{CI/CD: Các khái niệm}
+\label{ch:cicd}
+
+\section{Hai thực hành, một pipeline}
+
+\begin{description}
+  \item[Continuous Integration] mọi thay đổi được merge vào branch
+  chung thường xuyên và được \emph{kiểm chứng tự động} --- biên dịch,
+  test, đóng gói. Sản phẩm của CI là sự tự tin: branch chính luôn ở
+  trạng thái được biết là tốt, và một hỏng hóc bị bắt vài phút sau
+  commit gây ra nó, khi tác giả vẫn còn nhớ ngữ cảnh.
+  \item[Continuous Delivery/Deployment] mọi thay đổi đã kiểm chứng
+  được tự động chuẩn bị để phát hành (Delivery) hoặc thật sự được
+  phát hành (Deployment --- không có cổng chặn bởi con người). Dự án
+  này thực hành dạng mạnh hơn: một lần push lên \code{main} kết thúc
+  bằng các pod đang chạy, không ai bấm nút.
+\end{description}
+
+Pipeline là cỗ máy cưỡng chế cả hai:
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=3.5mm and 5mm]
+  \node[boxdark] (git) {git push};
+  \node[box, right=of git] (trig) {trigger};
+  \node[box, right=of trig] (build) {build\\\scriptsize + test};
+  \node[box, right=of build] (pkg) {package\\\scriptsize image + tag};
+  \node[box, right=of pkg] (reg) {registry};
+  \node[box, right=of reg] (dep) {deploy\\\scriptsize + verify};
+  \draw[flow] (git) -- (trig);
+  \draw[flow] (trig) -- (build);
+  \draw[flow] (build) -- (pkg);
+  \draw[flow] (pkg) -- (reg);
+  \draw[flow] (reg) -- (dep);
+\end{tikzpicture}
+\caption{Hình dạng pipeline phổ quát. Tên công cụ thay đổi; các stage thì không.}
+\end{figure}
+
+Dù là Jenkins+Jib+k3s (dự án này), GitHub Actions+Docker+EKS, hay
+GitLab CI+Kaniko+OpenShift --- mã nguồn đi vào, artifact đã test đi
+vào registry, bộ điều phối được bảo hội tụ về nó, rồi kiểm chứng rằng
+nó đã làm vậy. Học hình dạng này một lần và pipeline của mọi nhà tuyển
+dụng chỉ còn là bài tập đổi tên.
+
+\section{Từ vựng}
+
+\begin{description}
+  \item[Trigger] thứ khởi động một lần chạy. \emph{Webhook}: máy chủ
+  git gọi CI server khi có push --- tức thì, nhưng đòi hỏi CI server
+  phải truy cập được từ internet. \emph{Polling}: CI hỏi repo ``có gì
+  mới không?'' theo lịch --- không cần ai truy cập được, đổi lại là độ
+  trễ. Dự án này dùng polling (\code{H/5 * * * *}: khoảng năm phút một
+  lần) chính vì Jenkins nằm sau NAT ở nhà, không có địa chỉ công khai
+  --- topology quyết định trigger, một mẫu hình bạn sẽ gặp ở mọi mạng
+  doanh nghiệp bị khóa chặt.
+  \item[Stage / step] các đơn vị của pipeline: stage là các pha có
+  tên (hiện trên UI, chặn tiến trình); step là các lệnh bên trong.
+  \item[Artifact] bất cứ thứ gì build sinh ra mà đáng giữ lại: file
+  jar, image, báo cáo test. Artifact phải \emph{bất biến và truy vết
+  được} --- vì thế image được tag bằng SHA của git, để một pod đang
+  chạy có thể truy ngược về đúng commit mà nó đang chạy.
+  \item[Test gate] tính chất rằng các stage sau chỉ chạy nếu các stage
+  trước đã qua. Một pipeline triển khai dù test thất bại chỉ là một
+  script triển khai với vài bước thừa.
+  \item[Environment promotion] cùng một artifact đi từ dev
+  $\rightarrow$ staging $\rightarrow$ prod. Quy tắc sắt: \emph{thăng
+  cấp artifact, không bao giờ build lại} --- một lần build lại ``cho
+  prod'' là một binary khác với cái bạn đã test. Bộ máy biến môi
+  trường của Chương~1 tồn tại chính xác để một image vừa với mọi môi
+  trường.
+  \item[Rollback] lối thoát hiểm. Vì registry giữ các image tag theo
+  SHA và Kubernetes giữ các ReplicaSet cũ (Chương~15), rollback là trỏ
+  lại một artifact trước đó --- vài giây, không phải một lần build
+  lại.
+\end{description}
+
+\begin{decision}[triển khai ở mọi lần push lên main --- cho một lập trình viên]
+Continuous Deployment không cần phê duyệt là lựa chọn đúng ở đây: một
+lập trình viên, bán kính ảnh hưởng cỡ homelab, và vòng phản hồi nhanh
+nhất có thể. Cùng lựa chọn đó ở một ngân hàng sẽ sai, không phải vì tự
+động hóa rủi ro mà vì các thay đổi \emph{chịu quản lý} cần bằng chứng
+đã được xem xét. Con đường lên cấp giữ nguyên pipeline và thêm cổng:
+một stage phê duyệt thủ công trước prod, hoặc --- Chương~27 --- GitOps,
+nơi ``deploy'' trở thành một pull request có thể xem xét vào repo cấu
+hình. Hình dạng pipeline sống sót; chỉ chính sách cổng chặn thay đổi.
+\end{decision}
+
+\begin{pitfall}[pipeline xanh mà nói dối]
+Triệu chứng: lần chạy nào cũng xanh; production vẫn hỏng. Các nguyên
+nhân kinh điển: test bị bỏ qua trong lệnh build (\code{-DskipTests}
+--- điều mà pipeline \emph{này} làm ở stage build, chấp nhận một cách
+có ý thức vì \code{mvn verify} chạy trong CI trên GitHub Actions ---
+hãy biết rõ các cổng của chính mình); stage deploy không kiểm chứng
+rollout (pipeline này có --- \code{rollout status} làm build thất bại
+nếu pod không bao giờ Ready); hoặc thành công được đo bằng ``các lệnh
+thoát với mã 0'' thay vì ``service trả lời request.'' Một pipeline
+xanh là một lời khẳng định; hãy biết chính xác nó khẳng định điều gì.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item CI và CD đưa ra những lời hứa khác nhau. Nêu mỗi lời hứa
+  trong một câu, và chỉ ra stage nào trong pipeline của dự án này
+  thực hiện lời hứa nào.
+  \item Webhook so với polling: nêu ràng buộc quyết định trong dự án
+  này, và một bối cảnh doanh nghiệp có cùng ràng buộc đó.
+  \item Vì sao một artifact được thăng cấp không bao giờ được build
+  lại cho từng môi trường, và cơ chế nào từ Chương~1 làm cho việc
+  thăng cấp một-artifact trở nên khả thi?
+  \item Pipeline của bạn xanh và prod sập. Liệt kê ba cách khác nhau
+  mà một pipeline có thể nói dối, và cách sửa cho mỗi cách.
+\end{enumerate}
+\end{quiz}

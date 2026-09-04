@@ -1,0 +1,179 @@
+\chapter{Probe sức khỏe và quản lý tài nguyên}
+\label{ch:probes}
+
+Chương này là trái tim vận hành của Phần~V: kubelet quyết định một pod
+còn sống và sẵn sàng như thế nào, và bộ lập lịch cùng kernel chia hai
+nhân CPU cho một tá JVM ra sao. Gần như mỗi dòng ở đây đều học được từ
+việc nhìn một pod thật cư xử sai.
+
+\section{Ba loại probe}
+
+\begin{description}
+  \item[startupProbe] ``vẫn đang boot --- kiên nhẫn.'' Khi nó còn thất
+  bại, các probe khác bị tạm hoãn. Cạn ngân sách thì container bị khởi
+  động lại.
+  \item[readinessProbe] ``có thể nhận traffic \emph{ngay bây giờ}
+  không?'' Thất bại thì pod bị rút khỏi endpoints của Service --- không
+  restart, không kịch tính, chỉ là không nhận request mới cho tới khi
+  qua lại.
+  \item[livenessProbe] ``tiến trình đã hết cứu được chưa?'' Thất bại
+  thì container bị \emph{khởi động lại}. Cái nguy hiểm.
+\end{description}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 12mm]
+  \node[box] (boot) {khởi động\\\scriptsize startup probe lỗi};
+  \node[boxfill, right=of boot] (ready) {Ready\\\scriptsize có trong endpoints};
+  \node[box, right=of ready] (notready) {chưa Ready\\\scriptsize bị loại khỏi endpoints};
+  \draw[flow] (boot) -- node[lbl,above]{startup đạt} (ready);
+  \draw[flow, bend left=18] (ready) to node[lbl,above]{readiness lỗi} (notready);
+  \draw[flow, bend left=18] (notready) to node[lbl,below]{readiness đạt} (ready);
+  \draw[flow, bend right=25] (boot.south) to node[lbl,below]{hết ngân sách: restart} ++(0,-0.75);
+\end{tikzpicture}
+\caption{Vòng đời của pod dưới con mắt kubelet.}
+\end{figure}
+
+Từ \code{course-service.yaml}:
+
+\begin{lstlisting}[language=yaml]
+startupProbe:
+  httpGet: { path: /v3/api-docs, port: http }   (*@\co{1}@*)
+  periodSeconds: 10
+  failureThreshold: 12                          (*@\co{2}@*)
+readinessProbe:
+  httpGet: { path: /v3/api-docs, port: http }
+  periodSeconds: 5
+  failureThreshold: 3
+# no livenessProbe                              (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Quyết định về đường dẫn probe. \code{/actuator/health}
+  là endpoint sinh ra cho việc này --- nhưng course-service và
+  auth-service không cho nó qua Spring Security, nên nó trả 401 và
+  kubelet tính là thất bại. Đường dẫn không cần xác thực duy nhất chỉ
+  trả 200 \emph{sau khi toàn bộ context đã lên} --- Flyway đã migrate,
+  bean đã dựng --- là \code{/v3/api-docs} của springdoc.
+  Dictionary-service và gateway \emph{có} cho phép actuator và probe nó
+  đúng cách; còn notification-service không có Spring Security nào cả,
+  nên endpoint health của nó mặc định mở --- ba service, ba câu trả lời
+  cho cùng một câu hỏi. Quy tắc:
+  đường dẫn probe phải không cần xác thực \emph{và} là tín hiệu
+  readiness thật; một kiểm tra \code{tcpSocket} qua ngay khi Tomcat
+  bind cổng thì chẳng đạt điều nào.
+  \item[\co{2}] $12 \times 10$\,s = hai phút ân hạn khởi động --- đo
+  cho một JVM khởi động nguội trên hai nhân bị tranh chấp.
+  \item[\co{3}] Cố tình vắng mặt. Liveness giết; thứ duy nhất nó bắt
+  được thêm so với readiness là một JVM treo cứng thật sự --- hiếm ---
+  trong khi một đợt dừng GC dài trên máy 2 nhân đang tải nặng có thể làm
+  probe thất bại và giết một pod \emph{khỏe mạnh}. Hãy thêm liveness khi
+  bạn đã quan sát được cái treo mà nó sinh ra để bắt.
+\end{description}
+
+\begin{pitfall}[Startup probe failed: statuscode 404 --- hoặc 403]
+Triệu chứng (milestone~6, build \#6): log của notification-service cho
+thấy Kafka đã gán partition và ứng dụng khởi động hoàn toàn, vậy mà pod
+không bao giờ Ready; probe báo \code{404}. dictionary-service cũng vậy,
+nhưng \code{403}. Nguyên nhân: các file config-server \emph{expose}
+\code{health,info,metrics,prometheus} cho mọi service --- nhưng chỉ
+config-server, discovery-server và api-gateway có
+\code{spring-boot-starter-actuator} trên classpath. Cấu hình expose cho
+một thư viện không tồn tại thì lặng lẽ vô hiệu; URL đơn giản là 404.
+Biến thể 403 là đóng góp của Spring Security: 404 forward sang
+\code{/error}, \code{/error} không nằm trong danh sách permitAll, và
+một chuỗi filter stateless không có entry point thì trả 403 --- nên
+triệu chứng chỉ về phân quyền trong khi nguyên nhân là thiếu jar.
+Sửa: thêm starter vào cả bốn POM của service. Bài học: đường dẫn probe
+phải được kiểm chứng bằng \code{curl} từ trong pod \emph{trước khi} tin
+nó trong manifest --- khẳng định trước đó của sách rằng
+dictionary-service ``probe health đúng cách'' được viết từ
+SecurityConfig của nó, không phải từ một request thật.
+\end{pitfall}
+
+\begin{pitfall}[vòng lặp restart tự sinh ra chính nó]
+Triệu chứng: một service khởi động lại vài phút một lần khi tải nặng,
+mỗi lần restart làm tải nặng thêm. Nguyên nhân: một liveness probe quá
+gắt bị timeout trong lúc GC dừng hoặc gọi downstream chậm --- probe
+\emph{gây ra} chính sự cố nó sinh ra để phát hiện. Kiểu lỗi này là lý do
+``không có liveness probe'' là mặc định có thể biện hộ, và là lý do
+liveness, khi được thêm, chỉ nên kiểm tra ``event loop có còn phản hồi
+không,'' không bao giờ kiểm tra phụ thuộc downstream.
+\end{pitfall}
+
+\section{Requests, limits và JVM}
+
+\begin{lstlisting}[language=yaml]
+resources:
+  requests: { memory: 512Mi, cpu: 200m }   (*@\co{1}@*)
+  limits: { memory: 768Mi }                (*@\co{2}@*)
+env:
+  - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" } (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \emph{Requests} là sổ sách của bộ lập lịch: pod chỉ
+  được đặt vào nơi còn 512\,Mi và 0,2 CPU chưa ai nhận. Requests
+  \emph{giữ chỗ}, không giới hạn.
+  \item[\co{2}] \emph{Limits} là trần do kernel thực thi. Vượt limit bộ
+  nhớ là tiến trình bị OOM-kill --- trạng thái \code{OOMKilled}, exit
+  code 137, không Java exception, không dòng log. Để ý sự bất đối xứng:
+  có limit bộ nhớ, nhưng \emph{không có limit CPU} --- xem hộp quyết
+  định tiếp theo.
+  \item[\co{3}] JVM nhận biết container định cỡ heap theo tỷ lệ của
+  limit bộ nhớ \emph{của container}: 75\% của 768\,Mi cho heap, phần
+  còn lại cho metaspace, thread và off-heap. Không có dòng này, giá trị
+  mặc định để lại hoặc lãng phí, hoặc biên an toàn OOM-kill bằng không.
+\end{description}
+
+\begin{decision}[vì sao không có limit CPU]
+Limit CPU bóp nghẹt (throttle): container vượt hạn mức bị tạm dừng tới
+chu kỳ lập lịch tiếp theo --- và JVM đang khởi động chính là lúc service
+muốn từng chu kỳ CPU (nạp class, JIT). Khởi động bị bóp biến 60 giây
+thành 200 và làm startup probe thất bại: chính limit chế tạo ra thất
+bại. Khác bộ nhớ, CPU là tài nguyên nén được --- tranh chấp làm mọi thứ
+chậm lại thay vì giết --- nên mẫu dùng ở đây là lời khuyên chuẩn:
+\textbf{luôn request CPU, hiếm khi limit}. Bộ nhớ có limit vì kiểu lỗi
+của bộ nhớ không giới hạn là kernel giết \emph{một ai đó}, và bạn muốn
+ranh giới ấy đoán trước được.
+\end{decision}
+
+\begin{hardware}
+Tổng requests của mọi service xấp xỉ phần còn lại của 19\,GB sau khi
+trừ Jenkins, k3s và các datastore --- một cách có chủ đích. Requests là
+lời hứa với bộ lập lịch; hứa quá tay trên một node duy nhất nghĩa là pod
+không bao giờ được lập lịch (\code{Pending} mãi mãi), hứa thiếu nghĩa là
+chơi roulette OOM. Trên một node, bạn đang hoạch định dung lượng bằng
+tay; autoscaler trên cloud biến cùng phép tính đó thành định cỡ node
+pool.
+\end{hardware}
+
+\begin{handson}[xem một lần khởi động qua con mắt của probe]
+\begin{lstlisting}[language=bash]
+kubectl -n ts delete pod -l app=course-service
+kubectl -n ts get pods -w
+# Running 0/1  <- startup probe still failing; no traffic yet
+# Running 1/1  <- /v3/api-docs answered; endpoints updated
+kubectl -n ts describe pod -l app=course-service | tail -n 12
+\end{lstlisting}
+Khoảng cách giữa \code{0/1} và \code{1/1} là Flyway cộng khởi động
+context --- cửa sổ mà, nếu không có probe, request sẽ đập vào một
+service mới lên được một nửa.
+\end{handson}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Với từng probe: thất bại thì chuyện gì xảy ra, và probe nào an
+  toàn để đặt gắt?
+  \item Vì sao \code{/v3/api-docs} là tín hiệu readiness trung thực cho
+  course-service còn \code{tcpSocket: 8082} là lời nói dối? Điều gì
+  khiến \code{/actuator/health} không dùng được ở đó, mà dùng được trên
+  dictionary-service?
+  \item Một pod hiện \code{OOMKilled}, exit 137, log sạch. Giải thích
+  cơ chế và vì sao không có Java exception nào. Hai thứ đầu tiên cần
+  kiểm tra?
+  \item Requests và limits: bộ lập lịch đọc cái nào, kernel thực thi
+  cái nào, và vì sao dự án này giới hạn bộ nhớ mà không giới hạn
+  CPU?
+\end{enumerate}
+\end{quiz}

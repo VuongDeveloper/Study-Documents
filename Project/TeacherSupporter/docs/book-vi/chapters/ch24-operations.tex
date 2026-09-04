@@ -1,0 +1,142 @@
+\chapter{Vận hành stack: Cẩm nang gỡ lỗi thực địa}
+\label{ch:operations}
+
+Đây là chương để đọc lại khi có một cluster hỏng trước mặt bạn. Nó
+tập hợp quy trình gỡ lỗi mà các chương trước đã tích lũy, sắp xếp
+theo cách sự cố thật diễn ra.
+
+\section{Bốn câu hỏi}
+
+Gần như mọi sự cố Kubernetes đều được định vị bằng cách hỏi, theo thứ
+tự:
+
+\begin{enumerate}
+  \item \textbf{Pod có đang chạy không?} \code{kubectl -n ts get pods}
+  --- đọc cột STATUS và RESTARTS; bảng phân loại bên dưới.
+  \item \textbf{Nền tảng nói gì về nó?}
+  \code{kubectl -n ts describe pod <pod>} --- mục Events ở cuối là
+  kubelet và scheduler kể lại các quyết định của chúng: kéo image,
+  probe thất bại, OOM kill, từ chối lập lịch.
+  \item \textbf{Ứng dụng nói gì?} \code{kubectl -n ts logs
+  <pod>} (thêm \code{--previous} cho container vừa chết --- cờ hay bị
+  quên nhất trong ứng phó sự cố).
+  \item \textbf{Tôi có tái hiện được góc nhìn của nó về thế giới
+  không?} \code{kubectl -n ts exec -it <pod> -- sh} rồi thử kết nối
+  mà ứng dụng khẳng định là đang thất bại.
+\end{enumerate}
+
+\section{Bảng phân loại trạng thái}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lp{6.6cm}@{}}
+\toprule
+Trạng thái & Ý nghĩa và bước đi đầu tiên \\
+\midrule
+\code{Pending} & không lập lịch được: requests vượt quá tài nguyên
+còn trống, hoặc PVC chưa được gắn. \code{describe} cho biết là gì. \\
+\code{ImagePullBackOff} & registry không truy cập được, gõ sai tên,
+hoặc bẫy HTTPS-so-với-HTTP của Chương~13. \\
+\code{CrashLoopBackOff} & tiến trình thoát ngay sau khi khởi động;
+thời gian chờ nhân đôi giữa các lần thử. \code{logs --previous}. \\
+\code{OOMKilled} (exit 137) & chạm giới hạn bộ nhớ; không có trace
+Java nào --- cú kill từ kernel của Chương~17. Tăng limit hoặc thu nhỏ
+heap. \\
+\code{Running 0/1} & còn sống nhưng readiness thất bại: bình thường
+khi khởi động; là vấn đề khi kéo dài --- thử chính URL của probe. \\
+\code{Completed}/\code{Error} & cho Job; với pod service,
+\code{Error} nghĩa là tiến trình đã thoát với mã khác 0 một lần. \\
+\bottomrule
+\end{tabular}
+\caption{Cột STATUS đang cố nói với bạn điều gì.}
+\end{table}
+
+\begin{handson}[cố ý làm hỏng --- ba bài diễn tập]
+Phá hoại có chủ đích, vào một ngày yên tĩnh, dạy nhiều hơn bất kỳ sự
+cố nào:
+\begin{lstlisting}[language=bash]
+# 1. wrong image tag -> watch ImagePullBackOff, then roll back
+kubectl -n ts set image deployment/course-service \
+    course-service=localhost:5000/course-service:nope
+kubectl -n ts rollout undo deployment/course-service
+
+# 2. scale the database down -> watch dependents degrade honestly
+kubectl -n ts scale statefulset/postgres-course --replicas=0
+kubectl -n ts get pods -w     # course-service readiness reacts
+kubectl -n ts scale statefulset/postgres-course --replicas=1
+
+# 3. kill Eureka -> verify existing routes survive on client caches
+kubectl -n ts delete pod -l app=discovery-server
+\end{lstlisting}
+Mỗi bài diễn tập ghép lý thuyết của một chương với hành vi quan sát
+được của nó: 13 (đặt tên), 17--18 (probe và endpoint), 3 (cache phía
+client).
+\end{handson}
+
+\section{Đọc thế giới của một service từ bên trong}
+
+Khi log khẳng định kết nối thất bại, hãy kiểm chứng lời khẳng định đó
+từ chính vị trí mạng của pod --- DNS và khả năng truy cập khác nhau
+giữa máy bạn và pod:
+
+\begin{lstlisting}[language=bash]
+kubectl -n ts exec -it deploy/course-service -- sh
+wget -qO- http://config-server:8888/actuator/health   # DNS + service up?
+nc -zv postgres-course 5432                           # TCP reachable?
+env | grep SPRING                                     # what was injected?
+\end{lstlisting}
+
+Lệnh cuối cùng đó dàn xếp tranh cãi rất nhanh: nó in ra cấu hình mà
+pod \emph{thật sự} nhận được, hơn hẳn việc đọc lại manifest.
+
+\section{Thói quen giữ cho cuối tuần được rảnh}
+
+\begin{description}
+  \item[Sau mỗi lần deploy] pipeline đã kiểm chứng rollout rồi; dù
+  vậy vẫn liếc qua \code{kubectl -n ts get pods} --- RESTARTS nhích
+  dần lên là sự cố ngày mai đang tự báo trước.
+  \item[Hằng tuần] \code{kubectl top pods -n ts} (cần metrics-server,
+  đi kèm trong k3s): so sánh mức dùng thực tế với requests của
+  Chương~17 và sửa lại phần hư cấu. Kiểm tra đĩa: \code{df -h} trên
+  máy chủ --- registry và file log lớn dần; \code{registry:2} thỉnh
+  thoảng cần dọn rác.
+  \item[Trước buổi demo] \emph{đừng build} --- hộp phần cứng của
+  Chương~5: hai nhân nghĩa là một lần build Maven và buổi demo tranh
+  nhau đúng phần CPU đang giữ cho readiness probe trả lời.
+\end{description}
+
+\begin{hardware}
+ufw trên máy chủ phải miễn trừ các CIDR của pod và service
+(\code{10.42.0.0/16}, \code{10.43.0.0/16}) --- chặn tường lửa chúng
+sẽ phá DNS và lưu lượng pod-tới-pod theo những cách giả dạng lỗi ứng
+dụng: timeout chập chờn, tên lúc phân giải được lúc không. Khi mạng
+trên k3s xảy ra chuyện \emph{kỳ lạ}, hãy nghi ngờ tường lửa máy chủ
+trước ứng dụng. Và k3s chỉ đọc \code{registries.yaml} lúc khởi động
+--- sau khi sửa, \code{systemctl restart k3s}, lệnh này khởi động lại
+mọi pod trong chốc lát: đừng làm giữa buổi demo.
+\end{hardware}
+
+\begin{pitfall}[gỡ lỗi sai tầng]
+Thói quen đắt giá nhất khi gỡ lỗi Kubernetes là bắt đầu từ nơi triệu
+chứng xuất hiện thay vì nơi nguyên nhân sống. Một lỗi 502 trên trình
+duyệt có thể là Traefik (không có endpoint), gateway (Eureka lạc
+hậu), service (readiness thất bại), cơ sở dữ liệu (pod bị đuổi), hay
+đĩa (đầy). Bốn câu hỏi tồn tại để đi qua các tầng theo thứ tự; hãy
+cưỡng lại cám dỗ mở log ứng dụng trước chỉ vì đó là tầng quen thuộc
+nhất. \code{describe} trước \code{logs} --- nền tảng thường đã biết
+rồi.
+\end{pitfall}
+
+\begin{quiz}
+\begin{enumerate}
+  \item Sắp xếp bốn câu hỏi và nêu lệnh cho mỗi câu. Câu nào dùng một
+  cờ mà mọi người hay quên, và khi nào cờ đó quan trọng?
+  \item \code{CrashLoopBackOff} so với \code{Running 0/1}: các tầng
+  khác nhau đang thất bại --- khái niệm probe nào phân biệt chúng?
+  \item Một service khẳng định không tới được Postgres; từ laptop
+  của bạn Postgres trả lời. Bước chẩn đoán tiếp theo là gì và vì sao
+  thành công trên laptop của bạn không liên quan?
+  \item Vì sao một thay đổi tường lửa máy chủ có thể giả dạng lỗi ứng
+  dụng trên k3s, và hai CIDR nào phải luôn được miễn trừ?
+\end{enumerate}
+\end{quiz}

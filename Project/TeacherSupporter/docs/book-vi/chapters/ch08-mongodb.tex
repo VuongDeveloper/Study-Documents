@@ -1,0 +1,128 @@
+\chapter{Dữ liệu dạng document: MongoDB}
+\label{ch:mongodb}
+
+\section{Mô hình}
+
+MongoDB lưu các \emph{document} --- cấu trúc giống JSON (BSON) --- trong
+các \emph{collection}, không có schema cố định. Ở chỗ Postgres chuẩn hóa
+một mục từ điển thành các hàng rải trên các bảng \code{words},
+\code{definitions}, \code{examples} nối với nhau bằng khóa, Mongo lưu cả
+mục đó thành một document lồng nhau:
+
+\begin{lstlisting}
+{ "word": "ubiquitous",
+  "phonetic": "yoo-BIK-wi-tuhs",
+  "meanings": [
+    { "partOfSpeech": "adjective",
+      "definitions": [
+        { "definition": "present everywhere",
+          "example": "smartphones are ubiquitous" } ] } ] }
+\end{lstlisting}
+
+\begin{decision}[vì sao từ điển là service dùng Mongo]
+Một mục từ điển được đọc như một khối, ghi như một khối, và lồng nhau
+một cách tự nhiên --- trường hợp đẹp nhất của mô hình document. Không có
+transaction xuyên mục, không có join nào để mất. Ngược lại, khóa học và
+ghi danh thực sự có tính quan hệ (một bài nộp tham chiếu một học viên
+\emph{và} một bài tập; tính nhất quán giữa chúng là quan trọng), nên
+chúng ở lại Postgres. ``Polyglot persistence'' chính là thế này: chọn
+theo từng service, theo hình dạng dữ liệu --- không phải một cơ sở dữ
+liệu được sủng ái cho mọi thứ, cũng không phải chạy theo cái mới cho vui.
+\end{decision}
+
+\section{Spring Data MongoDB}
+
+Mô hình lập trình giống JPA đủ gần để dictionary-service làm một phiến đá
+Rosetta tốt: \code{@Document} thay cho \code{@Entity},
+\code{MongoRepository} thay cho \code{JpaRepository}, các phương thức
+truy vấn suy diễn giống hệt về tinh thần. Những gì biến mất: Flyway và
+DDL schema (collection tự xuất hiện ở lần ghi đầu tiên), dialect, và
+việc tinh chỉnh pool (driver tự quản lý pool kết nối của nó). Những gì
+xuất hiện: một URI kết nối duy nhất.
+
+\section{Cấu hình --- toàn bộ}
+
+Toàn bộ cấu hình dữ liệu của dictionary-service là một dòng, cộng với
+bản ghi đè cho cụm:
+
+\begin{lstlisting}[language=yaml]
+# configurations/dictionary-service.yml  (dev default)
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/ts_dictionary
+
+# deploy/k8s/base/dictionary-service.yaml  (the override)
+- name: SPRING_DATA_MONGODB_URI
+  value: "mongodb://mongodb:27017/ts_dictionary"
+\end{lstlisting}
+
+URI mang host, cổng, tên database, và (khi bật) thông tin đăng nhập cùng
+các tùy chọn --- một chuỗi duy nhất để ghi đè cho mỗi môi trường, đúng
+việc mà cơ chế relaxed binding ở Chương~1 sinh ra để làm.
+
+\section{Không schema là con dao hai lưỡi}
+
+Không có migration không có nghĩa là không có schema --- nghĩa là schema
+sống \emph{ngầm trong code}. Hai document do hai phiên bản ứng dụng ghi
+ra có thể có hình dạng khác nhau trong cùng một collection, và không gì
+ngoài code đọc của bạn nhận ra điều đó. Các kỷ luật thay thế Flyway: giữ
+các lớp document đọc ngược tương thích (trường mới là tùy chọn), viết
+script sửa dữ liệu khi hình dạng thật sự thay đổi, và kiểm tra hợp lệ ở
+biên. Mongo cũng có thể áp JSON Schema cho từng collection --- tùy chọn
+bật thêm, và không dùng ở đây.
+
+\begin{pitfall}[collection chưa bao giờ được tạo]
+Triệu chứng: service khởi động, truy vấn chạy, mọi thứ trả về rỗng ---
+không có lỗi ở đâu cả. Nguyên nhân: URI trỏ vào một database mới tinh
+(gõ nhầm, hoặc một PVC mới trong cụm); Mongo lặng lẽ tạo một
+\code{ts\_dictionary} rỗng ở lần chạm đầu tiên. Postgres sẽ thất bại ầm ĩ
+(\code{database does not exist}); cơ chế tạo-khi-ghi của Mongo biến một
+địa chỉ sai thành kết quả rỗng. Khi một service dùng Mongo ``mất'' dữ
+liệu, hãy kiểm tra \emph{nó đang nói chuyện với database nào} trước mọi
+thứ khác: \code{kubectl exec} vào node của pod và chạy
+\code{mongosh --eval 'show dbs'}.
+\end{pitfall}
+
+\section{Vận hành trong cụm này}
+
+Manifest (\code{deploy/k8s/base/mongodb.yaml}) theo cùng mẫu StatefulSet
+như Postgres (Chương~15 giải thích loại object này; Chương~19 nói về lưu
+trữ), với hai lưu ý riêng của Mongo, cả hai đều lấy từ comment trong
+file: readiness probe exec \code{mongosh --eval "db.adminCommand('ping')"}
+--- ``đang nhận lệnh,'' chứ không chỉ ``cổng đã mở'' --- và nó chạy
+không có xác thực, chấp nhận được chỉ vì đây là một Service ClusterIP
+không có Ingress: không thể chạm tới từ ngoài cụm. Khoảnh khắc giả định
+đó thay đổi (một NodePort lộ ra ngoài, nhiều tenant), xác thực phải là
+việc đầu tiên.
+
+\section{Ngoài phạm vi dự án}
+
+Phiên bản được quản lý là MongoDB Atlas; URI có thêm thông tin đăng nhập
+và TLS, ngoài ra không gì thay đổi:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  data:
+    mongodb:
+      uri: mongodb+srv://app:${MONGO_PWD}@cluster0.abc.mongodb.net/ts_dictionary?retryWrites=true
+\end{lstlisting}
+
+Để đối chiếu, DynamoDB là một kho document với triết lý ngược lại: không
+schema như Mongo, nhưng các mẫu truy cập phải được thiết kế sẵn vào bảng
+(partition key, không có truy vấn tùy hứng) --- một lời nhắc rằng
+``NoSQL'' là một họ các đánh đổi, không phải một thứ duy nhất.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Những tính chất nào của dữ liệu từ điển khiến nó hợp với mô hình
+  document, và những tính chất nào của dữ liệu ghi danh khiến nó không
+  hợp?
+  \item ``Không schema'' chuyển việc áp đặt schema từ database sang đâu?
+  Nêu hai kỷ luật thay thế cho migration.
+  \item Vì sao tên database sai thất bại ầm ĩ trong Postgres nhưng lặng
+  lẽ trong Mongo, và bạn thích kiểu thất bại nào hơn ở production?
+  \item Pod Mongo không có mật khẩu trong khi Postgres có, trong cùng một
+  cụm. Dựng lại lập luận và nêu điều kiện làm lập luận đó mất hiệu lực.
+\end{enumerate}
+\end{quiz}

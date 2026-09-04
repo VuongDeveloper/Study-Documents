@@ -1,0 +1,151 @@
+\chapter{Cấu hình tập trung: Config Server}
+\label{ch:configserver}
+
+\section{Vấn đề}
+
+Bảy service, mỗi cái đều cần URL database, địa chỉ Kafka, thiết lập JWT,
+host mail. Chép những thứ đó vào bảy file \code{application.yml} và mỗi
+thay đổi trở thành bảy lần sửa, bảy lần build lại, cùng lời đảm bảo rằng
+sớm muộn hai bản sao sẽ lệch nhau. Câu trả lời của Spring Cloud cổ điển:
+một HTTP service nhỏ mà công việc duy nhất là trao cho từng ứng dụng cấu
+hình của nó lúc khởi động.
+
+\section{Spring Cloud Config hoạt động thế nào}
+
+Server expose cấu hình qua một hợp đồng HTTP đơn giản:
+
+\begin{lstlisting}
+GET /{application}/{profile}
+GET /course-service/default      -> the config for course-service
+\end{lstlisting}
+
+Phía client là dòng \code{spring.config.import:} \code{configserver:...}
+bạn đã thấy ở Chương~1. Trong lúc khởi động --- \emph{trước} khi hầu hết
+bean được tạo --- client lấy tài liệu của mình về và gộp vào Environment
+như một property source đứng trên YAML đóng gói nhưng thua biến môi
+trường. Thứ tự phân giải ở Mục~\ref{sec:property-order} làm toàn bộ công
+việc; config-server chỉ là thêm một nguồn nữa trong chồng.
+
+\section{Server của dự án, có chú thích}
+
+\begin{lstlisting}[language=yaml]
+server:
+  port: 8888                       (*@\co{1}@*)
+spring:
+  application:
+    name: config-server
+  profiles:
+    active: native                 (*@\co{2}@*)
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: classpath:/configurations   (*@\co{3}@*)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health            (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] 8888 là cổng config-server theo quy ước, cũng như 8761 là
+  của Eureka. Quy ước tiết kiệm tài liệu.
+  \item[\co{2}] Profile \code{native} nghĩa là ``phục vụ file từ một vị
+  trí trên filesystem/classpath'' thay vì backend git mặc định.
+  \item[\co{3}] Các file được phục vụ nằm \emph{ngay trong jar của chính
+  config-server}: \code{configurations/course-service.yml},
+  \code{auth-service.yml}, v.v. --- được chọn bằng cách khớp tên file với
+  \code{spring.application.name} của service gửi yêu cầu.
+  \item[\co{4}] Chỉ \code{health} được expose --- và đây là endpoint mà
+  healthcheck của Compose và các probe của Kubernetes dựa vào.
+\end{description}
+
+\begin{decision}[classpath native vs.\ backend git]
+Backend chuẩn doanh nghiệp là một git repository: thay đổi cấu hình là
+các commit --- được kiểm toán, được review, hoàn tác được mà không cần
+build lại gì cả. Cái giá là một repository thứ hai và việc quản lý thông
+tin đăng nhập. Với một dự án một-lập-trình-viên mà thay đổi cấu hình dù
+sao cũng đi cùng thay đổi code, classpath native giữ mọi thứ trong một
+repo và một pipeline. Thứ bị đánh đổi: thay một giá trị giờ đòi hỏi build
+lại image config-server. Hãy biết nhà tuyển dụng của bạn đứng ở phía nào
+của sự đánh đổi đó.
+\end{decision}
+
+\begin{pitfall}[service khởi động với giá trị mặc định rồi hỏng một cách kỳ lạ]
+Triệu chứng: auth-service khởi động được nhưng mọi request đều thất bại
+với lỗi kết nối tới \code{localhost:5432}. Nguyên nhân: config-server
+không liên lạc được lúc khởi động, và \code{optional:configserver:} để
+service khởi động từ giá trị mặc định đóng gói sẵn --- vốn trỏ về
+localhost. Vì thất bại xuất hiện vài phút sau và cách xa nguyên nhân, nó
+trông như một vấn đề database. Kiểm tra: log khởi động in ra cấu hình từ
+xa có được lấy về hay không. File Compose ngăn vấn đề thứ tự này bằng
+\code{depends\_on: condition: service\_healthy}; Kubernetes không có thứ
+tự khởi động (Chương~15), nên các service phải chịu được một
+config-server đến muộn bằng cách crash rồi khởi động lại cho đến khi nó
+xuất hiện.
+\end{pitfall}
+
+\section{Thứ tự khởi động và điệu nhảy bootstrap}
+
+Config-server tạo ra một ràng buộc trình tự ngầm trên toàn hệ thống: mọi
+service khác đều muốn nó lên trước. Bạn sẽ gặp hệ quả của điều này ba lần
+trong cuốn sách:
+
+\begin{itemize}
+  \item Compose mã hóa thứ tự một cách tường minh bằng \code{depends\_on}
+  và một healthcheck dựa trên \code{curl} (Chương~12).
+  \item Kubernetes từ chối mã hóa thứ tự khởi động; hệ thống hội tụ bằng
+  retry (Chương~15).
+  \item Pipeline Jenkins triển khai mọi manifest trong một lệnh
+  \code{kubectl apply -k} và để các rollout tự ổn định đồng thời
+  (Chương~23).
+\end{itemize}
+
+\section{Làm mới cấu hình mà không khởi động lại}
+
+Mặc định, một client đọc cấu hình của nó một lần lúc khởi động. Spring
+Cloud cung cấp \code{/actuator/refresh} (lấy lại theo yêu cầu, từng
+instance, áp dụng cho các bean \code{@RefreshScope}) và Spring Cloud Bus
+(phát tán lệnh refresh qua một message broker). Dự án này không dùng cả
+hai: trên Kubernetes một thay đổi cấu hình được giao đi dưới dạng image
+mới hoặc thay đổi env, và rolling update của Deployment (Chương~15) dù
+sao cũng khởi động lại các pod. Đó là câu trả lời hiện đại cho câu hỏi mà
+config-server ban đầu được thiết kế để giải quyết.
+
+\section{Bên ngoài dự án}
+
+Một thiết lập doanh nghiệp điển hình dựa trên git, để đối chiếu:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://git.company.com/platform/config-repo
+          default-label: main
+          search-paths: '{application}'
+\end{lstlisting}
+
+Cấu hình nằm theo từng service trong các thư mục của một repo riêng;
+label là một branch, nên \code{default-label: release-42} ghim một môi
+trường vào một bản phát hành. Mẫu phổ biến thứ hai bỏ hẳn config-server:
+ConfigMap và Secret của Kubernetes được gắn vào dưới dạng biến môi trường
+--- chính là hướng dự án này đang đi tới (Chương~16 và 26); config-server
+tồn tại ở đây chủ yếu như một ví dụ sống của stack cổ điển.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Các nguồn này thắng theo thứ tự nào cho
+  \code{spring.datasource.url}: YAML đóng gói, tài liệu config-server,
+  biến môi trường của Deployment?
+  \item \code{profiles.active: native} thay đổi gì về nơi server tìm tài
+  liệu, và backend git mua được gì mà native không thể?
+  \item Vì sao \code{optional:} trong \code{spring.config.import} là con
+  dao hai lưỡi? Mô tả kiểu thất bại mà nó cho phép.
+  \item Cấu hình của chính config-server không thể đến từ một
+  config-server. Nó phải nằm ở đâu, và đó là nguyên lý bootstrap tổng
+  quát nào?
+\end{enumerate}
+\end{quiz}

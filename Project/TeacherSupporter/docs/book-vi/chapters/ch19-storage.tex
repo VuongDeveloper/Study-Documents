@@ -1,0 +1,120 @@
+\chapter{Lưu trữ: Volume, Claim và trạng thái trên một node}
+\label{ch:storage}
+
+\section{Chồng trừu tượng}
+
+Hệ thống file của container chết cùng nó. Kubernetes tách \emph{yêu
+cầu} lưu trữ khỏi việc \emph{cung cấp} nó qua ba object:
+
+\begin{description}
+  \item[PersistentVolume (PV)] một mẩu lưu trữ thật --- một thư mục,
+  một volume EBS, một export NFS.
+  \item[PersistentVolumeClaim (PVC)] yêu cầu của workload: ``5\,Gi,
+  ReadWriteOnce.'' Claim là thứ pod mount; nó gắn (bind) vào một PV.
+  \item[StorageClass] nhà máy: cách tạo PV theo nhu cầu khi một claim
+  xuất hiện (\emph{cấp phát động}).
+\end{description}
+
+Sự gián tiếp này là tính khả chuyển: \code{postgres-course.yaml} chỉ
+nói ``tôi cần 5\,Gi''; còn \emph{làm thế nào} nó thành đĩa là việc của
+cụm. Cùng manifest đó nhận một thư mục cục bộ trên k3s và một volume
+EBS trên EKS.
+
+\section{local-path trên k3s}
+
+k3s đi kèm StorageClass \code{local-path}: một PVC trở thành một thư mục
+dưới \code{/var/lib/rancher/k3s/storage/} trên SSD của node. Đơn giản,
+nhanh, và thẳng thắn về giới hạn --- dữ liệu nằm trên \emph{đĩa của node
+đó}. Trên cụm nhiều node, điều đó ghim pod vào node; trên cụm một node
+này, nó chỉ có nghĩa đúng như nó nói.
+
+\begin{hardware}
+local-path cung cấp \emph{bền vững} (persistence: dữ liệu sống sót qua
+khởi động lại pod và node), không phải \emph{bền chắc} (durability: một
+SSD hỏng là mất tất cả) và không phải \emph{sao lưu} (một lệnh
+\code{DELETE} sai lầm không có bản sao nào để quay về).
+Mảnh còn thiếu, nói thẳng, là một CronJob chạy \code{pg\_dump} lên MinIO
+hoặc ra ngoài máy. Quy tắc ngón tay cái đáng ghi nhớ: cơ sở dữ liệu
+không có khôi phục đã kiểm chứng chỉ là một cái cache.
+\end{hardware}
+
+\section{Hai kiểu claim trong manifest}
+
+MinIO (một Deployment với một replica) dùng PVC độc lập; các cơ sở dữ
+liệu dùng \code{volumeClaimTemplates} bên trong StatefulSet --- một PVC
+\emph{đúc riêng cho từng replica} và, quan trọng nhất, \emph{gắn lại vào
+pod thay thế} chứ không phải vào một pod sống thứ hai. Sự phân biệt đó
+là nửa lưu trữ của cạm bẫy hỏng dữ liệu ở Chương~15.
+
+\begin{lstlisting}[language=yaml]
+volumeClaimTemplates:
+  - metadata: { name: data }
+    spec:
+      accessModes: [ReadWriteOnce]     (*@\co{1}@*)
+      resources: { requests: { storage: 5Gi } }
+# in the pod template:
+volumeMounts:
+  - { name: data, mountPath: /var/lib/postgresql/data }
+env:
+  - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }  (*@\co{2}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{ReadWriteOnce} = mount đọc-ghi bởi một
+  \emph{node} tại một thời điểm --- vừa khít cho cơ sở dữ liệu.
+  (\code{RWX} --- nhiều node --- cần lưu trữ kiểu NFS và là chế độ
+  người ta muốn cho upload dùng chung, trước khi phát hiện lưu trữ đối
+  tượng, Chương~9, là câu trả lời tốt hơn.)
+  \item[\co{2}] Mẹo PGDATA, một kinh điển thực thụ: image Postgres từ
+  chối khởi tạo vào thư mục không rỗng, mà volume ext4 sinh ra đã có
+  \code{lost+found}. Trỏ PGDATA sâu thêm một thư mục là né được. Bạn sẽ
+  gặp đúng mẫu này trong hàng năm trời StackOverflow về
+  Postgres-trên-Kubernetes.
+\end{description}
+
+\begin{pitfall}[xóa StatefulSet, dữ liệu vẫn còn --- hoặc mất]
+Hai bất ngờ trong một. Thứ nhất: xóa StatefulSet \emph{không} xóa PVC
+của nó --- theo thiết kế, dữ liệu sống lâu hơn sai lầm điều phối; tạo
+lại StatefulSet là nó gắn lại. Thứ hai, bẫy ngược: xóa PVC khi đang thử
+nghiệm \emph{có} xóa PV và thư mục của nó (reclaimPolicy
+\code{Delete}, mặc định của cấp phát động). Sự bất đối xứng này đáng
+thuộc lòng trước khi bạn dọn một namespace: object workload là thứ dùng
+xong bỏ; claim mới là nơi dữ liệu nằm.
+\end{pitfall}
+
+\begin{handson}[nhìn xuyên qua lớp trừu tượng]
+\begin{lstlisting}[language=bash]
+kubectl -n ts get pvc                       # claims and their PVs
+kubectl get pv                              # cluster-scoped, note the paths
+ssh ts-server 'sudo ls /var/lib/rancher/k3s/storage/'
+# pvc-...  one directory per PV -- your databases, as plain files
+\end{lstlisting}
+Giải ảo chính là mục đích: một PVC trên cụm này là một thư mục. Trên
+EKS, cùng hai lệnh kubectl đó sẽ hiện ID volume EBS --- cùng object,
+khác nhà máy.
+\end{handson}
+
+\section{Ngoài phạm vi dự án}
+
+Trên Kubernetes có quản lý, StorageClass ánh xạ sang đĩa cloud
+(EBS/gp3 trên EKS, Persistent Disk trên GKE) với snapshot, mã hóa và
+đổi cỡ --- object \code{VolumeSnapshot} đưa sao lưu vào cùng mô hình
+khai báo. Nhưng mẫu công nghiệp mà chương này hướng tới lại là phép
+trừ: các đội ngày càng giữ \emph{cơ sở dữ liệu ngoài cụm} (RDS, Cloud
+SQL) và để Kubernetes chỉ chạy những thứ phi trạng thái --- đổi sự chăm
+chút StatefulSet ở Chương~15 lấy một hóa đơn dịch vụ có quản lý. Giờ
+bạn đã thấy cả hai mặt của cuộc đánh đổi đó.
+
+\begin{quiz}
+\begin{enumerate}
+  \item PV, PVC, StorageClass: pod mount cái nào, cái nào thuộc phạm vi
+  cụm, và sự gián tiếp mua được gì cho manifest của dự án trên một EKS
+  tương lai?
+  \item Vì sao \code{ReadWriteOnce} là đủ cho Postgres, và loại
+  workload nào đẩy người ta về phía RWX --- thường là sai?
+  \item Giải thích cả hai chiều của sự bất đối xứng khi xóa: StatefulSet
+  mất/PVC còn, PVC mất/dữ liệu mất.
+  \item Bền vững, bền chắc và sao lưu mỗi thứ nghĩa là gì, và local-path
+  cung cấp thứ nào?
+\end{enumerate}
+\end{quiz}

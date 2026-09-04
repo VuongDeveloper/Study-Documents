@@ -1,0 +1,92 @@
+% TeacherSupporter: The Complete Stack -- ban tieng Viet
+% Build:  tectonic main.tex   (from this directory)
+% Structure mirrors ../book/main.tex one-to-one; see TRANSLATION-GUIDE.md.
+\documentclass[11pt,twoside,openany]{book}
+\usepackage{tsbook}
+
+\title{TeacherSupporter: Trọn bộ công nghệ}
+\author{Vuong Dang}
+\date{Tháng 9 năm 2026}
+
+\begin{document}
+
+% ================= front matter =================
+\frontmatter
+
+% ---- title page ----
+\begin{titlepage}
+  \centering
+  \vspace*{1.6in}
+  {\Huge\bfseries TeacherSupporter\par}
+  \vspace{0.15in}
+  {\LARGE Trọn bộ công nghệ\par}
+  \vspace{0.1in}
+  {\large\itshape Hướng dẫn tự học\par}
+  \vspace{0.35in}
+  {\large Từ Spring Boot đến Kubernetes và CI/CD ---\par
+   cẩm nang trọn vẹn, dạy từ một dự án thật\par}
+  \vspace{1.2in}
+  {\large Vuong Dang\par}
+  \vspace{0.1in}
+  {\normalsize viết cùng Claude\par}
+  \vfill
+  {\small Bản tiếng Việt --- tháng 9 năm 2026 \par}
+\end{titlepage}
+
+\include{frontmatter/howtoread}
+\include{frontmatter/projectmap}
+
+\tableofcontents
+
+% ================= main matter =================
+\mainmatter
+
+\part{Ứng dụng}
+\include{chapters/ch01-spring-boot}
+\include{chapters/ch02-config-server}
+\include{chapters/ch03-eureka}
+\include{chapters/ch04-gateway}
+\include{chapters/ch05-security}
+\include{chapters/ch06-services}
+
+\part{Dữ liệu}
+\include{chapters/ch07-postgres}
+\include{chapters/ch08-mongodb}
+\include{chapters/ch09-minio}
+
+\part{Truyền thông điệp}
+\include{chapters/ch10-kafka-core}
+\include{chapters/ch11-spring-kafka}
+
+\part{Container}
+\include{chapters/ch12-docker}
+\include{chapters/ch13-jib-registry}
+
+\part{Kubernetes}
+\include{chapters/ch14-cluster}
+\include{chapters/ch15-workloads}
+\include{chapters/ch16-config-secrets}
+\include{chapters/ch17-health-resources}
+\include{chapters/ch18-networking}
+\include{chapters/ch19-storage}
+\include{chapters/ch20-kustomize}
+
+\part{CI/CD}
+\include{chapters/ch21-cicd-concepts}
+\include{chapters/ch22-jenkins}
+\include{chapters/ch23-pipeline}
+
+\part{Vận hành và chặng đường phía trước}
+\include{chapters/ch24-operations}
+\include{chapters/ch25-kafka-cluster}
+\include{chapters/ch26-frontend-host}
+\include{chapters/ch27-road-ahead}
+
+% ================= appendices =================
+\appendix
+\include{appendices/appA-quiz-answers}
+\include{appendices/appB-glossary}
+\include{appendices/appC-cheatsheet}
+\include{appendices/appD-listings}
+
+\end{document}

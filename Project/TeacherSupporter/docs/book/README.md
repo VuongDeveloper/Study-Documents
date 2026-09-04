@@ -26,3 +26,8 @@ the repository — and it automatically stays in sync with the manifests.
 - `tsbook.sty` — page geometry, fonts, the box environments
   (decision / pitfall / hands-on / hardware / quiz), listing setup
 - `frontmatter/`, `chapters/ch01..ch27`, `appendices/appA..appD`
+
+## Bản tiếng Việt
+
+A Vietnamese edition lives in `docs/book-vi/` (same structure, XeTeX fonts, translation
+rules in `docs/book-vi/TRANSLATION-GUIDE.md`); tracked PDF: `Self Study Guidance (Tieng Viet).pdf`.

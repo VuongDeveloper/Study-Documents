@@ -1,0 +1,99 @@
+\chapter{Lưu trữ đối tượng: MinIO và mô hình S3}
+\label{ch:minio}
+
+\section{Bài toán}
+
+Bài nộp của học viên là file --- PDF, ảnh, file nén. File trong cơ sở dữ
+liệu quan hệ làm phình bản sao lưu và stream rất tệ; file trên đĩa cục bộ
+của pod biến mất cùng pod. Câu trả lời của ngành là \emph{lưu trữ đối
+tượng} (object storage): một dịch vụ HTTP lưu các blob bất biến trong các
+\emph{bucket} có tên, dưới các \emph{key} dạng chuỗi, kèm metadata,
+không có thư mục (dấu \code{/} trong key là quy ước đặt tên, không phải
+cấu trúc). Amazon S3 định nghĩa API; MinIO là một server tự host nói
+cùng API đó --- nên course-service dùng AWS SDK chuẩn và không phân
+biệt được sự khác nhau.
+
+\section{Cấu hình, có chú giải}
+
+Từ \code{configurations/course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+app:
+  s3:
+    endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}         (*@\co{1}@*)
+    public-endpoint: ${APP_S3_PUBLIC_ENDPOINT:http://localhost:9000} (*@\co{2}@*)
+    access-key: ${APP_S3_ACCESS_KEY:minioadmin}                (*@\co{3}@*)
+    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+    bucket: ${APP_S3_BUCKET:ts-submissions}
+    presigned-url-expiry-minutes: ${APP_S3_PRESIGNED_EXPIRY_MIN:15} (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Nơi \emph{service} nói chuyện với MinIO. Trong cụm:
+  \code{http://minio:9000}.
+  \item[\co{2}] Nơi \emph{trình duyệt} nói chuyện với MinIO --- chủ đề
+  của cái bẫy bên dưới.
+  \item[\co{3}] Thông tin đăng nhập với giá trị mặc định cho dev; cụm bơm
+  giá trị thật từ Secret \code{minio-app}. \code{app.s3.*} là cấu hình
+  tùy biến (\code{@ConfigurationProperties}), không do Spring quản lý ---
+  cơ chế ghi đè vẫn áp dụng như nhau.
+  \item[\co{4}] Một link presigned còn hiệu lực trong bao lâu.
+\end{description}
+
+\section{Presigned URL: mẫu đáng để biết}
+
+Cách tải file ngây thơ là dẫn byte \emph{xuyên qua} service: trình duyệt
+$\rightarrow$ service $\rightarrow$ MinIO và ngược lại, chiếm một thread
+ứng dụng cho mỗi lượt truyền. Cách làm chuẩn của S3: service dùng thông
+tin đăng nhập của mình để \emph{ký một URL} --- bucket, key, hạn hiệu
+lực, chữ ký HMAC --- rồi đưa URL đó cho trình duyệt, và trình duyệt tải
+\emph{trực tiếp} từ kho lưu trữ. Service tốn vài micro giây; kho lưu trữ
+làm việc stream; link tự hết hạn. Thủ thuật này cũng dùng được cho
+upload.
+
+\begin{pitfall}[bài toán hai endpoint]
+Triệu chứng: upload chạy tốt, nhưng bấm vào link tải thì hỏng với
+\code{ERR\_NAME\_NOT\_RESOLVED} trên \code{minio:9000}. Nguyên nhân: một
+presigned URL nhúng sẵn endpoint \emph{mà nó được ký với}. Service ký
+với \code{minio:9000} --- một cái tên chỉ phân giải được bên trong mạng
+của cụm --- còn trình duyệt sống bên ngoài. Vì thế mới có hai endpoint
+cấu hình: ký link tải với \code{public-endpoint}, nói chuyện với kho lưu
+trữ qua \code{endpoint}. Mọi hệ thống S3 đóng container đều gặp lỗi này
+một lần; một số gặp lại lần nữa với chính chữ ký, vì chữ ký bao trùm cả
+host --- bạn không thể ký với host này rồi sau đó viết lại URL sang host
+khác.
+\end{pitfall}
+
+\begin{hardware}
+MinIO ở đây là một container đơn với một PVC đơn --- ổn cho bài nộp
+trong một homelab, chẳng giống gì MinIO production (nhiều node, erasure
+coding) hay độ bền mười một số chín của S3. Điểm thú vị là course-service
+không phân biệt được: cùng những lời gọi SDK đó sẽ chạm tới S3 thật chỉ
+với endpoint và thông tin đăng nhập thay đổi. Đó chính là ý nghĩa của
+việc nói một API chuẩn.
+\end{hardware}
+
+\section{Ngoài phạm vi dự án}
+
+Cùng service này trên AWS thật: đặt \code{endpoint} và
+\code{public-endpoint} thành URL S3 thật (hoặc để mặc định của SDK), thay
+key tĩnh bằng một IAM role mà pod đảm nhận (IRSA trên EKS --- hoàn toàn
+không có thông tin đăng nhập sống lâu), và bật versioning cho bucket cùng
+các quy tắc vòng đời (tự động chuyển bài nộp cũ sang tầng lưu trữ rẻ
+hơn). Các khái niệm --- bucket, key, ký trước, danh tính thực hiện ký ---
+chuyển sang nguyên vẹn; thứ thay đổi là ai quản lý độ bền và danh tính
+được chứng minh ra sao.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Vì sao presigned URL mở rộng tốt hơn việc proxy tải file qua
+  service, và chúng đưa vào kiểu lỗi mới nào?
+  \item Giải thích vì sao \code{endpoint} và \code{public-endpoint} phải
+  khác nhau bên trong cụm, và vì sao viết lại URL sau khi ký không phải
+  là cách sửa.
+  \item Một presigned URL bị lộ trong log chat. Điều gì giới hạn thiệt
+  hại, theo thiết kế?
+  \item Điều gì thay đổi --- và điều gì không --- khi code này chuyển từ
+  MinIO sang S3 thật?
+\end{enumerate}
+\end{quiz}

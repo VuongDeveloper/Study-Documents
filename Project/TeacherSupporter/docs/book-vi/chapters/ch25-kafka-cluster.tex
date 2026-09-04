@@ -1,0 +1,267 @@
+\chapter{Kafka trong cụm: Strimzi và luồng gửi mail}
+\label{ch:strimzi}
+
+Cột mốc~6 chuyển broker của Chương~10 từ Compose vào k3s và triển khai
+service cuối cùng --- notification-service --- để luồng \emph{sự kiện}
+đầu tiên chạy trọn vẹn trong cụm: đăng ký một người dùng, nhận một lá
+mail. Đây cũng là chương mà ý tưởng điều hòa (reconciliation) của
+Chương~14 mọc thêm phần mở rộng quan trọng nhất của nó: \emph{operator}.
+
+\section{Operator và custom resource}
+
+Kubernetes có sẵn controller cho các kind dựng sẵn --- Deployment,
+Service. Một \emph{operator} là controller cho những kind bạn tự thêm:
+một \emph{CustomResourceDefinition} (CRD) dạy API server một danh từ
+mới (\code{Kafka}, \code{KafkaTopic}), và vòng lặp điều hòa của
+operator biến các thể hiện của nó thành những object bình thường ---
+pod, Service, ConfigMap --- rồi giữ chúng hội tụ. Kiến thức vận hành
+trước đây nằm trong runbook (cách roll một broker an toàn, cách tính
+advertised listener, cách thêm partition) nay được mã hóa trong code
+của operator. Strimzi là operator cho Kafka; mẫu hình này là phổ quát
+(operator cho Postgres, Prometheus operator, cert-manager).
+
+\section{Cài operator: một việc của admin}
+
+\begin{lstlisting}[language=bash]
+# deploy/k8s/install-strimzi.sh (abridged)
+kubectl apply --server-side --force-conflicts \
+  -f "https://strimzi.io/install/latest?namespace=${NS}" -n "$NS"   (*@\co{1}@*)
+kubectl -n "$NS" rollout status deployment/strimzi-cluster-operator
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Gói này chứa các CRD, Deployment của operator và RBAC
+  của nó --- phần lớn ở \emph{phạm vi cụm} (cluster-scoped). Hai hệ
+  quả: nó do admin apply chứ không phải Jenkins (Role của Jenkins,
+  Chương~22, dừng ở namespace), và nó được apply \emph{server-side}
+  vì các tài liệu CRD quá lớn cho annotation last-applied phía client.
+  Lũy đẳng, nên cũng chính là lệnh nâng cấp. Tham số \code{?namespace=}
+  giới hạn operator chỉ theo dõi \code{ts}.
+\end{description}
+
+Kustomization (Chương~20) liệt kê \code{kafka.yaml}, nhưng file đó
+không thể apply cho đến khi script này đã chạy một lần --- thành viên
+thứ ba của bộ ``điều kiện tiên quyết do admin làm'', sau namespace và
+các secret.
+
+\begin{pitfall}[no matches for kind ``Kafka'' in version v1beta2]
+Triệu chứng: apply một manifest Kafka chép từ bất kỳ tutorial nào cũng
+thất bại với lỗi này dù operator đã cài và khỏe mạnh. Nguyên nhân:
+Strimzi~1.x chỉ phục vụ \code{kafka.strimzi.io/v1}; phiên bản
+\code{v1beta2} mà cả thập kỷ bài blog dùng đã biến mất. Hãy kiểm tra
+CRD thật sự phục vụ phiên bản nào trước khi tin một ví dụ:
+\code{kubectl get crd kafkas.kafka.strimzi.io -o jsonpath=\{.spec.versions[*].name\}}.
+Dự án này dính lỗi đó ngay ngày cài đặt.
+\end{pitfall}
+
+\section{Cụm, được khai báo}
+
+\begin{lstlisting}[language=yaml]
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool                        (*@\co{1}@*)
+metadata:
+  name: dual-role
+  labels: { strimzi.io/cluster: ts-kafka } (*@\co{2}@*)
+spec:
+  replicas: 1
+  roles: [controller, broker]
+  storage: { type: persistent-claim, size: 5Gi, deleteClaim: false } (*@\co{3}@*)
+  resources:
+    requests: { memory: 768Mi, cpu: 200m }
+    limits: { memory: 1Gi }
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: ts-kafka
+spec:
+  kafka:
+    listeners:
+      - { name: plain, port: 9092, type: internal, tls: false }  (*@\co{4}@*)
+    config:
+      offsets.topic.replication.factor: 1  (*@\co{5}@*)
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      log.retention.hours: 168
+    jvmOptions: { -Xms: 256m, -Xmx: 512m } (*@\co{6}@*)
+  entityOperator:
+    topicOperator: {}                      (*@\co{7}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Hai object: \emph{pool} nói Kafka chạy ở đâu (replica,
+  vai trò, lưu trữ, tài nguyên); resource \code{Kafka} nói nó hành xử
+  thế nào. Một node KRaft hai vai trò là cách Kubernetes viết
+  \code{process.roles=broker,controller} của Compose.
+  \item[\co{2}] Label này nối pool với cụm; operator khớp theo nó. Sai
+  label thì im lặng --- pool đơn giản là không bao giờ thành hình.
+  \item[\co{3}] Một PVC qua local-path, y hệt các cơ sở dữ liệu
+  (Chương~19). \code{deleteClaim: false}: xóa resource Kafka vẫn giữ
+  lại log --- cùng sự bất đối xứng mà StatefulSet có theo mặc định.
+  \item[\co{4}] So với khối ba listener, hai advertised address trong
+  \code{docker-compose.yml}: biến mất. Bạn khai báo \emph{một listener
+  nội bộ}; operator tính ra Service bootstrap và Service cho từng
+  broker, các advertised address, và listener của KRaft controller.
+  Mê cung của Chương~10 là kiến thức vận hành; giờ nó nằm trong
+  operator.
+  \item[\co{5}] Một broker duy nhất nghĩa là mọi replication factor
+  phải bằng 1, nếu không lần tạo topic đầu tiên sẽ thất bại vì đòi
+  những broker không tồn tại.
+  \item[\co{6}] Heap mặc định của Kafka giả định một máy chủ; nửa GiB
+  đủ cho lưu lượng nhỏ giọt của homelab và để dành bộ nhớ cho các
+  service JVM.
+  \item[\co{7}] Nửa topic của entity operator theo dõi các object
+  \code{KafkaTopic} và điều hòa chúng thành topic thật. Nửa user bị
+  bỏ qua: không xác thực, không có user nào để quản lý.
+\end{description}
+
+Strimzi đặt tên Service bootstrap là \code{<cluster>-kafka-bootstrap};
+vì thế mọi producer và consumer nhận
+\code{SPRING\_KAFKA\_BOOTSTRAP\_SERVERS=ts-kafka-kafka-bootstrap:9092}
+trong Deployment của nó --- mặc định \code{localhost:9092} trong cấu
+hình của Phần~III bị ghi đè theo đúng cách mọi địa chỉ khác đã bị ghi
+đè.
+
+\begin{decision}[operator, không phải StatefulSet viết tay]
+Một StatefulSet KRaft thuần (một pod, một PVC, khối env của compose
+chép vào) sẽ tốn ít bộ nhớ hơn --- không operator, không entity
+operator --- và đó là phương án dự phòng thẳng thắn nếu tranh chấp
+CPU có lúc gây khó. Operator thắng vì đó là thứ các công ty dùng
+Kubernetes chạy (Red Hat bán nó dưới tên AMQ Streams), vì topic trở
+thành object khai báo, và vì nâng cấp broker cùng khởi động lại cuốn
+chiếu trở thành code đã được người khác kiểm thử. Học nó chính là
+mục đích; phương án dự phòng vẫn được ghi lại trong
+\code{STACK-K3S-JENKINS.md}.
+\end{decision}
+
+\section{Topic dưới dạng object}
+
+\begin{lstlisting}[language=yaml]
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: ts.user.registered
+  labels: { strimzi.io/cluster: ts-kafka }
+spec: { partitions: 1, replicas: 1 }
+\end{lstlisting}
+
+Kafka sẽ tự tạo các topic này ở lần dùng đầu tiên; khai báo chúng
+biến số partition thành một quyết định được review, loại bỏ cuộc đua
+ngày đầu giữa producer và topic, và biến \code{kubectl get kafkatopics}
+thành bản kiểm kê mọi hợp đồng sự kiện trong hệ thống (bốn, khớp với
+bảng của Chương~6). Mỗi topic một partition: thứ tự toàn cục, nên
+đương nhiên giữ được thứ tự theo từng người dùng mà các publisher
+đặt key cho. Partition có thể thêm về sau, không bao giờ bớt được.
+
+\section{Service cuối cùng, và hộp thư của nó}
+
+Manifest của notification-service là Deployment tiêu chuẩn của
+Chương~15 với ba điểm riêng: địa chỉ bootstrap ở trên;
+\code{SPRING\_MAIL\_HOST=maildev} / \code{PORT=1025} ghi đè mặc định
+\code{\$\{MAIL\_HOST:localhost\}} của cấu hình qua relaxed binding;
+và các probe trên \code{/actuator/health} --- service này hoàn toàn
+không có Spring Security, nên endpoint mở theo mặc định (câu trả lời
+thứ ba cho câu hỏi về probe của Chương~17). Maildev là một Deployment
+nhỏ xíu kèm Service (cổng 1025 SMTP, 1080 web); nó không gửi đi đâu
+cả và hiển thị mọi thứ nó bắt được. Không có Ingress: đây là công cụ
+của người vận hành, truy cập qua \code{port-forward}. Nó cũng cung
+cấp bài học thực chiến thứ hai của cột mốc này: được apply bằng tay
+trước khi pipeline chạy, selector của nó thiếu label mà Kustomize
+tiêm vào, và lần deploy đầu tiên của pipeline chết với ``field is
+immutable'' --- cạm bẫy của Chương~20, học theo cách đắt giá.
+
+\begin{pitfall}[NotReady --- FatalProblem, trong khi pod đang Running]
+Triệu chứng: vài phút sau khi apply, \code{kubectl get kafka} cho thấy
+\code{READY} trống và một condition ghi ``Pod is unschedulable or is
+not starting'' --- thế nhưng \code{get pods} cho thấy broker
+\code{1/1 Running}. Nguyên nhân: vòng điều hòa của operator hết
+timeout trong lúc image Kafka 600\,MB vẫn đang tải qua Wi-Fi, và ghi
+lại một trạng thái thất bại; vòng lặp định kỳ \emph{tiếp theo} (mỗi
+hai phút) quan sát thấy pod đang chạy và chuyển nó sang Ready. Trạng
+thái của operator chỉ trung thực về cuối cùng. Trước khi phản ứng với
+một condition đỏ, hãy kiểm tra pod mà nó đang mô tả --- và kiểm tra
+log của operator, nơi các dòng ``reconciled'' cho thấy vòng lặp vẫn
+đang quay.
+\end{pitfall}
+
+\begin{hardware}
+Operator $+$ broker $+$ entity operator tốn khoảng 1,5\,GB ở đây, với
+heap của broker giới hạn 512\,MiB. Lần kéo image đầu tiên là phần đắt
+nhất --- hãy chuẩn bị tinh thần mười phút trên Wi-Fi gia đình, và cạm
+bẫy trạng thái cũ ở trên. Mọi thứ sau đó đều nhanh: image đã được
+cache trên node, điều mà bài kiểm tra khói bên dưới tận dụng.
+\end{hardware}
+
+\begin{handson}[chứng minh broker, rồi chứng minh luồng]
+Một pod dùng xong vứt với Kafka CLI, ở cùng vị trí mạng với các
+service, dùng image node đã có sẵn:
+\begin{lstlisting}[language=bash]
+kubectl -n ts run kafka-smoke --rm -i --restart=Never \
+  --image=quay.io/strimzi/kafka:1.2.0-kafka-4.3.1 -- sh -c '
+  B=ts-kafka-kafka-bootstrap:9092
+  bin/kafka-topics.sh --bootstrap-server $B --create --topic smoke \
+      --partitions 1 --replication-factor 1
+  echo hello | bin/kafka-console-producer.sh --bootstrap-server $B --topic smoke
+  bin/kafka-console-consumer.sh --bootstrap-server $B --topic smoke \
+      --from-beginning --max-messages 1 --timeout-ms 20000
+  bin/kafka-topics.sh --bootstrap-server $B --delete --topic smoke'
+\end{lstlisting}
+Dùng một topic nháp, không phải topic thật: một chuỗi ``hello'' thuần
+văn bản trên \code{ts.user.registered} là poison pill cho consumer
+JSON (Chương~11) --- được bỏ qua êm thấm nhờ
+\code{ErrorHandlingDeserializer}, nhưng việc gì phải phát hiện ra
+trong production. Rồi đến luồng thật, khi pipeline đã triển khai xong
+các service:
+\begin{lstlisting}[language=bash]
+curl -X POST http://ts.local/api/auth/register -H 'Content-Type: application/json' \
+  -d '{"email":"t@example.com","password":"Passw0rd!","firstName":"Test",
+       "lastName":"User","role":"TEACHER","activationMethod":"EMAIL"}'
+# -> 201 {"message":"Registration successful. Check your email ..."}
+kubectl -n ts logs deploy/notification-service | grep -i registered
+# maildev's REST API, from inside the cluster (or port-forward 1080 for the UI):
+kubectl -n ts run mailcheck --rm -i --restart=Never \
+  --image=curlimages/curl:8.10.1 -- -s http://maildev:1080/email
+# -> [{"subject":"Activate your TeacherSupporter account","to":"t@example.com",...
+\end{lstlisting}
+Request đó đi qua mọi phần của cuốn sách này: Ingress $\rightarrow$
+gateway $\rightarrow$ auth-service $\rightarrow$ Postgres $\rightarrow$
+Kafka $\rightarrow$ notification-service $\rightarrow$ SMTP. Nó chạy
+lần đầu ngày 2026-08-25, pipeline build~\#7 --- sau khi các build
+\#3--\#6 mỗi lần dạy một cạm bẫy của chương này và của các Chương~17,
+20 và 23. Một đầu mối còn lỏng mà nó phơi ra: link kích hoạt trong
+mail vẫn ghi \code{localhost:8080}, mặc định dev của URL gốc cho link
+--- một ghi đè env dành cho cột mốc~7, khi frontend cho cụm một địa
+chỉ công khai thật sự.
+\end{handson}
+
+\section{Ngoài dự án}
+
+Kafka được quản lý --- AWS MSK, Confluent Cloud, endpoint Kafka của
+Azure Event Hubs --- là operator của operator: cùng một khai báo hình
+dạng \code{Kafka} nhưng thực hiện trong console của cloud, với những
+broker bạn không bao giờ thấy. Chuyển từ đây sang đó là một chuỗi
+bootstrap cộng SASL/TLS trên listener; các object \code{KafkaTopic}
+sẽ nhường chỗ cho resource Terraform nói đúng điều tương tự. Bài học
+còn lại để mang theo: mẫu hình operator là cách Kubernetes lưu trú
+\emph{mọi} thành phần nền tảng có trạng thái --- Postgres
+(CloudNativePG), Redis, Elasticsearch --- và khi đã cài, đã dùng sai
+phiên bản, đã debug trạng thái của một cái, bạn biết hình dạng của
+tất cả chúng.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Định nghĩa operator theo cách nói về controller của Chương~14,
+  và nêu hai kind object mà Strimzi đã thêm vào cụm này.
+  \item Vì sao \code{install-strimzi.sh} là bước của admin trong khi
+  \code{kafka.yaml} do Jenkins apply? Khái niệm RBAC nào vạch ra ranh
+  giới đó?
+  \item Liệt kê ba thứ mà khối Kafka của Compose cấu hình bằng tay
+  nhưng resource \code{Kafka} không hề nhắc tới, và nói ai tính chúng
+  bây giờ.
+  \item Bạn thấy \code{NotReady / FatalProblem} trên resource Kafka.
+  Hai thứ bạn kiểm tra trước khi hành động là gì, và vì sao trạng thái
+  đó có thể sai?
+  \item Vì sao khai báo topic dưới dạng object khi Kafka tự tạo được
+  chúng, và vì sao mỗi topic chỉ một partition?
+\end{enumerate}
+\end{quiz}

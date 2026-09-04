@@ -1,0 +1,383 @@
+\chapter{Frontend và một host duy nhất}
+\label{ch:frontend}
+
+Cột mốc~7 đưa thứ có thể triển khai cuối cùng --- frontend React ---
+vào cụm và giành lấy đường dẫn \code{/} trên \code{ts.local} mà
+Ingress của Chương~18 đã cố ý để trống. Đây là một cột mốc ngắn tính
+theo số dòng YAML và dài tính theo khái niệm: đó là image duy nhất mà
+pipeline build từ Dockerfile, pod duy nhất không phải JVM, và là thay
+đổi biến ``các service gọi được bằng \code{curl}'' thành ``một ứng
+dụng dùng được trong trình duyệt''.
+
+\section{Frontend là gì, dưới mắt người vận hành}
+
+Một ứng dụng React đã build không phải là một server. \code{npm run
+build} (kiểm tra TypeScript, rồi đóng gói bằng Vite) sinh ra một thư
+mục file tĩnh: một \code{index.html}, một bundle JavaScript có mã băm
+nội dung trong tên (\code{index-CqZING8N.js}), một file CSS, một
+favicon. Không có gì trong đó chạy trên server; từng dòng của nó chạy
+trong trình duyệt của khách, rồi trình duyệt gọi \code{/api/...} qua
+HTTP như bất kỳ client nào khác. Vậy ``triển khai frontend'' nghĩa là
+triển khai một \emph{file server} có chứa những file đó --- ở đây là
+nginx --- và bảo router biên biết request nào là file, request nào là
+API.
+
+Cách nhìn đó quyết định mọi thứ còn lại trong chương này. Không config
+server (ứng dụng không có thuộc tính nào để import), không Eureka
+(không ai gọi nó theo tên), không secret (trình duyệt đọc được mọi
+thứ frontend nắm giữ, nên không được có gì bí mật ở đó), và một dấu
+chân tài nguyên nhỏ hơn cả chi phí nạp class của JVM nhỏ nhất.
+
+\section{Hai giai đoạn, một Dockerfile}
+
+Jib (Chương~13) build image JVM từ \code{target/classes}; nó không
+chạy được \code{npm}. Vì thế frontend dùng Dockerfile nhiều giai đoạn
+(multi-stage) kinh điển --- và lý do nó có hai giai đoạn cũng chính là
+lý do các image JVM dùng image gốc JRE thay vì JDK:
+
+\begin{lstlisting}[language=dockerfile]
+FROM node:24-alpine AS build            (*@\co{1}@*)
+WORKDIR /app
+COPY package.json package-lock.json ./  (*@\co{2}@*)
+RUN npm ci --no-audit --no-fund
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine                  (*@\co{3}@*)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html   (*@\co{4}@*)
+EXPOSE 80
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Giai đoạn build có Node, trình biên dịch TypeScript, và
+  sau \code{npm ci} là chừng 300\,MB \code{node\_modules}. Không thứ
+  nào trong đó cần cho việc \emph{phục vụ} kết quả.
+  \item[\co{2}] Lockfile trước, mã nguồn sau --- quy tắc cache theo
+  layer của Chương~12. \code{npm ci} cài đúng các phiên bản đã ghim
+  trong \code{package-lock.json} và từ chối sửa nó; một chỉnh sửa mã
+  nguồn chỉ làm mất hiệu lực các layer từ \code{COPY . .} trở xuống,
+  nên việc tải dependency được bỏ qua ở mọi lần rebuild không đụng
+  tới \code{package.json}.
+  \item[\co{3}] Một image gốc mới tinh. Image cuối cùng là nginx cộng
+  file tĩnh: khoảng 15\,MB, không Node, không trình biên dịch, không
+  trình quản lý gói --- bề mặt tấn công nhỏ hơn và kéo nhanh hơn, miễn
+  phí.
+  \item[\co{4}] \code{--from=build} là phép sao chép multi-stage: chỉ
+  \code{dist/} băng từ giai đoạn một sang giai đoạn hai. Mọi thứ khác
+  ở giai đoạn một bị vứt bỏ khi build kết thúc.
+\end{description}
+
+\begin{decision}[Sao không thêm Node vào image Jenkins rồi dùng Jib?]
+Jib có thể gói bất kỳ thư mục nào thành image, nên con đường ``Node
+trong Jenkins, Jib để đóng gói'' là có. Nó bị loại vì che giấu kỹ
+thuật build image phổ biến nhất sau kỹ thuật ít phổ biến nhất. Mọi
+đội ngũ phát hành frontend đều có Dockerfile này; đọc và viết được nó
+tự thân đã là một kỹ năng thị trường tuyển dụng cần, và có một image
+không-Jib trong pipeline cũng chứng minh pipeline không âm thầm mang
+hình dáng của Jib. Cái giá là một Docker CLI trong image Jenkins và
+một socket daemon được mount --- Mục~\ref{sec:dockersock}.
+\end{decision}
+
+\section{nginx: fallback giúp SPA hoạt động}
+
+\begin{lstlisting}[language=bash]
+server {
+    listen 80;
+    root  /usr/share/nginx/html;
+    location / {
+        try_files $uri $uri/ /index.html;          (*@\co{1}@*)
+    }
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable"; (*@\co{2}@*)
+    }
+    location = /healthz { return 200 "ok\n"; }      (*@\co{3}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Dòng mà mọi ứng dụng một trang (SPA) đều cần và mọi lần
+  triển khai đầu tiên đều quên. React Router (\code{BrowserRouter}
+  trong \code{main.tsx}) sở hữu những URL như \code{/courses/42} hoàn
+  toàn trong trình duyệt: bấm một link không bao giờ hỏi server. Nhưng
+  một lần refresh, một bookmark hay một link dán vào \emph{có} hỏi
+  server về \code{/courses/42}, file đó không tồn tại, và một file
+  server thuần trả 404. \code{try\_files} thử đường dẫn nguyên văn, rồi
+  thư mục, rồi rơi về \code{index.html} --- ứng dụng khởi động và
+  router của nó đọc URL. OAuth callback (\code{/oauth/callback}) cũng
+  dựa vào điều này: redirect của Google là một request lạnh tới một
+  route chỉ tồn tại trong JavaScript.
+  \item[\co{2}] Vite ghi mã băm nội dung vào tên mọi asset, nên file
+  đổi thì luôn có tên mới. Điều đó khiến ``cache vĩnh viễn'' an toàn
+  cho \code{/assets/} --- và \emph{không an toàn} cho \code{index.html},
+  thứ phải được tải lại để biết các tên mới sau mỗi lần deploy. Cache
+  file HTML là cách người dùng rơi vào cảnh ứng dụng cũ đi đòi những
+  bundle mà server không còn nữa.
+  \item[\co{3}] Một đích cho probe không tốn gì và không bao giờ chạm
+  đĩa (các probe của Chương~17 cần thứ gì đó để gọi).
+\end{description}
+
+Hãy để ý điều file này \emph{không} làm: proxy \code{/api}. Trên
+laptop, \code{vite.config.ts} proxy \code{/api} tới gateway ở
+\code{localhost:8080} để dev server và API trông như một origin. Trong
+cụm, việc đó thuộc về Traefik --- nginx không bao giờ thấy một request
+API nào cả.
+
+\section{Giành lấy \code{/}: một origin}
+
+\begin{lstlisting}[language=yaml]
+kind: Ingress
+metadata: { name: frontend }
+spec:
+  rules:
+    - host: ts.local
+      http:
+        paths:
+          - path: /                     (*@\co{1}@*)
+            pathType: Prefix
+            backend: { service: { name: frontend, port: { number: 80 } } }
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một quy tắc bắt-tất-cả, trong một object Ingress
+  \emph{thứ hai} đặt cạnh Ingress của gateway. Traefik gộp mọi quy
+  tắc Ingress của một host và định tuyến theo \emph{tiền tố khớp dài
+  nhất}: \code{/api/courses} khớp cả \code{/} lẫn \code{/api}, và
+  \code{/api} thắng. Ba tiền tố của gateway vì thế tiếp tục hoạt động
+  không đổi, còn mọi thứ khác --- \code{/}, \code{/login},
+  \code{/courses/42}, \code{/assets/...} --- rơi xuống nginx. Hai
+  object, một bảng định tuyến gộp; quy tắc ``apply không bao giờ xóa''
+  của Chương~20 vẫn áp dụng cho từng cái.
+\end{description}
+
+Hệ quả chính là lý do cột mốc này tồn tại: \textbf{một origin}. Trình
+duyệt tải trang từ \code{http://ts.local} và gọi
+\code{http://ts.local/api/...} --- cùng scheme, host và cổng. So với
+Compose, nơi trang đến từ \code{localhost:3000} còn API từ
+\code{localhost:8080}: khác cổng là khác origin, nên mọi lời gọi API
+đều có một CORS preflight đi trước và \code{CorsConfig} của gateway
+phải liệt kê rõ \code{localhost:3000}. Trong cụm, \code{CorsConfig}
+đơn giản là không bao giờ được hỏi tới --- chẳng có request
+cross-origin nào để kiểm soát. Cookie, redirect của OAuth, và bất kỳ
+chính sách \code{SameSite} nào về sau đều đơn giản đi vì cùng lý do.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 8mm]
+  \node[boxdark] (b) {Trình duyệt};
+  \node[box, right=22mm of b] (t) {Traefik};
+  \node[box, right=34mm of t, yshift=9mm] (fe) {frontend\\\scriptsize nginx};
+  \node[box, right=34mm of t, yshift=-9mm] (gw) {api-gateway};
+  \draw[flow] (b) -- node[lbl,above]{\scriptsize Host: ts.local} (t);
+  \draw[flow] (t.east) -- node[lbl,above,sloped,pos=0.5]{\scriptsize /} (fe.west);
+  \draw[flow] (t.east) -- node[lbl,below,sloped,pos=0.5]{\scriptsize /api, /oauth2, /login/oauth2} (gw.west);
+\end{tikzpicture}
+\caption{Tiền tố dài nhất thắng: một host, hai backend.}
+\end{figure}
+
+Một thuộc tính đi theo việc đổi host. \code{OAuth2LoginSuccessHandler}
+kết thúc đăng nhập Google bằng cách chuyển hướng trình duyệt tới
+\code{app.oauth2.success-redirect-uri}, mà \code{auth-service.yml}
+của config-server đặt là \code{localhost:3000/oauth/callback} --- đúng
+trên laptop, sai trong cụm. \code{auth-service.yaml} ghi đè nó bằng
+biến môi trường
+\code{APP\_OAUTH2\_SUCCESS\_REDIRECT\_URI=http://ts.local/oauth/callback}
+--- quy tắc ưu tiên của Chương~16 (biến môi trường thắng config
+server) làm đúng việc nó đã làm cho URL datasource.
+
+\section{Manifest}
+
+Deployment mang hình dáng của Chương~15 với gần như mọi thứ bị lược
+bỏ: không \code{envFrom}, không biến \code{SPRING\_*}, không
+\code{startupProbe} (nginx lên trong vài mili giây), và
+\code{requests: \{ memory: 32Mi, cpu: 10m \}} --- một phần mười hai
+của JVM nhỏ nhất. \code{imagePullPolicy: Always} với tag
+\code{:latest} làm mặc định của manifest, được pipeline ghi đè bằng
+tag commit y hệt các service JVM.
+
+\section{Pipeline mọc thêm một stage}
+\label{sec:dockersock}
+
+\begin{lstlisting}
+stage('Frontend image') {
+  steps {
+    dir('Project/TeacherSupporter') {
+      sh '''
+        docker build -t ${REGISTRY}/frontend:${TAG} \
+                     -t ${REGISTRY}/frontend:latest frontend   (*@\co{1}@*)
+        docker push ${REGISTRY}/frontend:${TAG}
+        docker push ${REGISTRY}/frontend:latest
+      '''
+    }
+  }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Build context là \code{frontend/}, được cắt gọn bởi
+  một \code{.dockerignore} loại trừ \code{node\_modules} và
+  \code{dist}: các module native của laptop Windows không được gửi
+  lên daemon, và image tự build lấy của mình. \code{frontend} gia nhập
+  \code{SERVICES} (danh sách của kubectl) nhưng không vào
+  \code{MODULES} (của Maven) --- các vòng lặp \code{set image} /
+  \code{rollout status} của stage Deploy xử lý nó mà không cần đổi gì.
+\end{description}
+
+Để \code{docker build} chạy được bên trong container Jenkins, hai thứ
+thay đổi trong thiết lập của Chương~22. Image có thêm Docker
+\emph{CLI} (\code{docker-ce-cli} --- chỉ phần client), và
+\code{run.sh} mount \code{/var/run/docker.sock} của host vào
+container. CLI nói chuyện qua socket đó với daemon \emph{của host};
+không có daemon nào bên trong Jenkins và không có Docker-in-Docker.
+Image tạo ra nằm trong kho image của host, và \code{docker push
+localhost:5000/...} tới được registry qua mạng host mà container vốn
+đã dùng chung.
+
+\begin{pitfall}[permission denied trên /var/run/docker.sock]
+Triệu chứng: CLI đã cài, socket đã mount, và mọi lệnh \code{docker}
+đều thất bại với lỗi quyền. Nguyên nhân: socket thuộc sở hữu của nhóm
+\code{docker} trên host --- GID 984 trên \code{ts-server} --- và con số
+đó chẳng có ý nghĩa gì bên trong image, nơi user \code{jenkins} thuộc
+một nhóm cùng tên nhưng GID khác (hoặc không có). Cách sửa trong
+\code{run.sh}: \code{--group-add "\$(stat -c \%g /var/run/docker.sock)"}
+thêm GID số của host vào user của container lúc chạy, không phải nướng
+một con số đặc thù của máy vào Dockerfile.
+\end{pitfall}
+
+\begin{decision}[Socket là root]
+Mount socket Docker trao quyền kiểm soát host tương đương root: ai
+chạy được \code{docker run -v /:/host} là sở hữu cả máy. Với một
+homelab một người dùng mà Jenkins chỉ truy cập được qua tailnet, đây
+là sự đánh đổi được chấp nhận, nói rõ thành lời. Production build
+image mà không cần daemon nào cả --- Kaniko hoặc BuildKit chạy như
+một pod không đặc quyền, hoặc Jib cho JVM --- và việc chuyển Jenkins
+vào cụm ở Chương~27 là nơi khoản thỏa hiệp này sẽ được trả lại.
+\end{decision}
+
+\begin{hardware}
+Pod frontend rẻ nhất namespace (yêu cầu 32\,Mi), nhưng \emph{build}
+thì không: \code{npm ci} cộng \code{tsc} cộng Vite chạy gần một
+CPU-phút và một gigabyte RAM trên controller, trong khi Maven có thể
+vẫn đang chạy trong cùng container 2\,GB đó. Jenkinsfile giữ các stage
+tuần tự vì lý do đó; trên cái máy này, stage song song chỉ tranh giành
+nhau.
+\end{hardware}
+
+\section{Kiểm chứng cột mốc}
+
+\begin{handson}[danh sách kiểm tra cột mốc 7]
+\begin{enumerate}
+  \item \code{kubectl -n ts get ingress} --- hai object trên
+  \code{ts.local}; \code{kubectl -n ts get pods -l app=frontend} Ready.
+  \item Mở \code{http://ts.local/} --- trang đăng nhập. Rồi dán thẳng
+  \code{http://ts.local/courses} vào thanh địa chỉ: một trang, không
+  phải 404 của nginx --- fallback SPA hoạt động.
+  \item Đăng ký, đăng nhập, tạo một khóa học: tab network của trình
+  duyệt cho thấy các request \code{/api/...} không có preflight
+  \code{OPTIONS} nào --- cùng origin.
+  \item \code{curl -sI http://ts.local/assets/index-*.js | grep
+  Cache-Control} --- \code{immutable}; làm tương tự với \code{/} ---
+  không có header cache.
+  \item Đổi một đoạn chữ bất kỳ trong một trang, push, và xem pipeline:
+  stage \code{Frontend image} dùng lại layer \code{npm ci}, và rollout
+  thay vào một image 15\,MB.
+\end{enumerate}
+\end{handson}
+
+Build~\#9 là lần chạy đầu tiên của stage mới: \code{docker build}
+hoàn tất trong 90 giây trên controller, rollout thay
+\code{frontend:f5d9213} vào, và danh sách kiểm tra ở trên đạt đúng
+như đã viết --- \code{/courses} trả về \code{index.html},
+\code{/api/courses} trả về JSON 401 của gateway, asset mang
+\code{immutable} và \code{/} không mang header cache nào.
+
+\begin{pitfall}[Ingress sống lâu hơn manifest của nó]
+\code{kubectl get ingress} hôm đó liệt kê \emph{ba} object trên
+\code{ts.local}: của gateway, của frontend --- và
+\code{course-service}, tám ngày tuổi, định tuyến \code{/courses} thẳng
+tới service mà không kiểm tra JWT. Manifest của nó đã bị gỡ khỏi
+\code{course-service.yaml} từ Chương~18 kèm một comment nói rõ điều
+đó, nhưng quy tắc của Chương~20 vẫn đúng: \code{apply} không bao giờ
+xóa thứ nó không còn thấy. Phải cần một lệnh tay
+\code{kubectl -n ts delete ingress course-service}. Bài học không phải
+là câu lệnh mà là việc kiểm toán: sau mỗi cột mốc, hãy liệt kê thứ
+cụm \emph{có}, không chỉ thứ git \emph{nói} --- cho đến khi việc dọn
+(prune) của GitOps (Chương~27) biến hai thứ đó thành một.
+\end{pitfall}
+
+\section{Truy cập từ bất cứ đâu: tên trên tailnet}
+
+Mọi thứ ở trên trả lời trên \code{ts.local} --- một cái tên chỉ tồn
+tại trong file hosts của một chiếc laptop, trên một LAN. ``Live''
+nghĩa là một URL phân giải được trên mọi thiết bị bạn có, và cái máy
+đã có sẵn một cái: Tailscale cho mỗi node một tên MagicDNS,
+\code{ts-server.tailbfe002.ts.net}, mà mọi peer trên tailnet phân
+giải được mà không cần sửa file hosts. Traefik định tuyến theo header
+\code{Host} (Chương~18), nên một cái tên nó không liệt kê sẽ nhận 404
+dù gói tin có tới nơi. Cách sửa là thêm một mục \code{rules} nữa với
+cùng danh sách đường dẫn trong cả hai object Ingress (Phụ lục~D có
+chúng) --- apply bằng tay với một bộ lọc chỉ trích ra các tài liệu
+Ingress từ đầu ra của \code{kubectl kustomize}, vì một lệnh
+\code{apply -k} đầy đủ sẽ đặt lại tag image của mọi Deployment về
+\code{1.0.0-SNAPSHOT} của manifest và roll cả namespace (\code{set
+image} của Chương~23 nằm \emph{sau} \code{apply} chính vì lý do này).
+
+Cái tên đó rồi phơi ra một lỗi mà LAN đã che giấu. Một lần đăng ký
+qua host mới sinh ra mail kích hoạt (chuỗi của Chương~25, trọn vẹn
+qua tailnet), nhưng link bên trong ghi
+\code{http://localhost:8080/api/auth/activate?code=...}: một host
+không điện thoại nào tới được, và một endpoint \code{POST} mà
+\code{GET} của trình đọc mail đằng nào cũng không dùng nổi.
+\code{EmailService} dựng mọi link --- kích hoạt, mời, đăng nhập --- từ
+chuỗi literal. Sửa chữa là quy tắc của Chương~16 áp dụng cho URL:
+origin công khai là \emph{cấu hình}. \code{app.frontend.base-url} mặc
+định là dev server của Vite trong \code{notification-service.yml} của
+config-server; manifest ghi đè nó bằng \code{APP\_FRONTEND\_BASE\_URL}
+đặt thành tên tailnet, cùng thủ thuật relaxed binding như
+\code{SPRING\_MAIL\_HOST}; và các link giờ trỏ tới trang
+\code{/activate} của frontend, nơi thực hiện \code{POST}. Hai biến
+OAuth chuyển sang cùng host, đồng nghĩa với thêm một mục nữa dưới
+``Authorized redirect URIs'' của Google --- việc đăng ký mà Chương~5
+gọi là thứ duy nhất không manifest nào tự động hóa được.
+
+\begin{pitfall}[một link là một hợp đồng với bên ngoài]
+Bất cứ thứ gì rời khỏi hệ thống --- một email, một payload webhook,
+một mã QR --- đều mang một URL phải hoạt động từ \emph{bên ngoài}, nên
+nó không bao giờ được là tên Service và không bao giờ nên là literal.
+Bài kiểm tra rất rẻ: đăng ký từ một thiết bị không phải laptop build
+và bấm vào. Trên stack này, chính request đầu tiên qua hostname mới
+đã phơi ra một lỗi có mặt từ commit đầu tiên.
+\end{pitfall}
+
+\section{Ngoài dự án}
+
+Mẫu hình --- router biên tách tĩnh khỏi API theo đường dẫn, phần tĩnh
+đến từ một file server ngờ nghệch --- là phổ quát, với file server
+thường được thay bằng lưu trữ đối tượng cộng CDN (S3 + CloudFront,
+hoặc một static host như Netlify) và việc tách do quy tắc origin của
+CDN làm. Giai đoạn build vẫn y nguyên nửa đầu của Dockerfile này. Hai
+thói quen chuyển sang trực tiếp: băm-và-cache-vĩnh-viễn cho asset kèm
+\code{index.html} không cache, và fallback SPA --- theo cách nói của
+CloudFront là ``ánh xạ 403/404 sang \code{/index.html} với mã 200'',
+cùng ý tưởng nhưng dùng vụng hơn.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Vì sao image frontend có hai dòng \code{FROM}, và chính xác
+  thứ gì băng qua giữa chúng?
+  \item Một người dùng bookmark \code{http://ts.local/courses/7} và mở
+  nó sáng hôm sau. Lần theo request qua Traefik và nginx, và nói dòng
+  nào khiến nó thành công.
+  \item Cả hai object Ingress đều khai báo \code{host: ts.local}.
+  Traefik quyết định thế nào để \code{/api/courses} đi tới gateway và
+  \code{/assets/x.js} đi tới nginx?
+  \item Giải thích vì sao \code{CorsConfig} của gateway trở nên không
+  liên quan trong cụm trong khi vẫn cần thiết trên laptop.
+  \item \code{--group-add "\$(stat -c \%g /var/run/docker.sock)"} sửa
+  điều gì, và vì sao giá trị được tính ra thay vì viết sẵn?
+  \item Link trong mail kích hoạt đã sai hàng tháng mà không ai để ý.
+  Nêu hai khiếm khuyết riêng biệt trong
+  \code{http://localhost:8080/api/auth/activate?code=...}, và nói mỗi
+  cái sẽ hỏng ở môi trường nào (laptop, compose, cụm).
+\end{enumerate}
+\end{quiz}
