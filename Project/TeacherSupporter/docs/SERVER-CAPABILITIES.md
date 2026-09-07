@@ -54,7 +54,7 @@ Everything at once, with `MaxRAMPercentage` and 512Mi limits per Java service:
 |---|---|
 | k3s control plane + OS | 1.5 GB |
 | 8 Spring services @ 512Mi | 4.0 GB |
-| Postgres ×2, Mongo, MinIO | 1.5 GB |
+| Postgres ×2, Mongo, RustFS | 1.5 GB |
 | Kafka via Strimzi | 2.0 GB |
 | Jenkins controller + one build agent | 3.0 GB |
 | Zipkin, frontend, registry | 0.7 GB |

@@ -112,7 +112,7 @@ you can require it to pass before merging (Settings → Branches → branch prot
 
 ### 3.2 A wrinkle specific to your repo right now
 
-Today you have **no integration tests that need Postgres/Kafka/MinIO**, so `mvn verify`
+Today you have **no integration tests that need Postgres/Kafka/RustFS**, so `mvn verify`
 passes on a bare runner. Good — start with the file above as-is.
 
 The moment you add a real `@SpringBootTest` that loads the full application context, it
@@ -125,7 +125,7 @@ stale module or exclude it — it's not part of the real system.
 
 ---
 
-## 4. When your tests need infrastructure (Postgres, Kafka, MinIO)
+## 4. When your tests need infrastructure (Postgres, Kafka, RustFS)
 
 This is the #1 thing that confuses people new to CI. Two approaches:
 
@@ -261,7 +261,7 @@ Your app already reads sensitive values from the environment, with dev defaults:
 
 - `JWT_SECRET` (auth-service, api-gateway)
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (OAuth2 login)
-- MinIO / DB credentials
+- RustFS / DB credentials
 
 In CI/CD these go in **GitHub → Settings → Secrets and variables → Actions**, then are
 referenced as `${{ secrets.JWT_SECRET }}`. Rules:

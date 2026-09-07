@@ -13,8 +13,11 @@ import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import java.net.URI;
 
 /**
- * S3 clients pointed at a MinIO endpoint. Path-style access is required because
- * MinIO does not support virtual-host-style bucket addressing by default.
+ * S3 clients pointed at a RustFS endpoint (S3-compatible; replaced MinIO, see
+ * docs/MIGRATION-RUSTFS.md). Path-style access is required because a self-hosted
+ * store on a plain hostname has no wildcard DNS for virtual-host-style buckets.
+ * Nothing here is RustFS-specific: only endpoint, region and credentials change
+ * between backends, and they all come from configuration.
  */
 @Configuration
 public class S3Config {

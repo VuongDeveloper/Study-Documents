@@ -8,7 +8,7 @@ Goal: run TeacherSupporter through the classic enterprise pipeline —
                                        mvn verify                           (ImageStreams /
                                        (test gate)                           internal registry)
                                                                                   │
-[ PostgreSQL / Kafka / MinIO ] <──(connects)── [ OpenShift ] <────(pulls image)───┘
+[ PostgreSQL / Kafka / RustFS ] <──(connects)── [ OpenShift ] <────(pulls image)───┘
      (in-cluster or external)                   (runs the app:
                                                  Deployments, Services,
                                                  Routes, ConfigMaps)
@@ -41,7 +41,7 @@ supported Jenkins template; agents spawn as disposable pods via the Kubernetes p
 
 > postgres-course → course-service → api-gateway → Route
 
-then widen. The full stack (8 JVMs + Kafka + 2 Postgres + Mongo + MinIO) fits in CRC at
+then widen. The full stack (8 JVMs + Kafka + 2 Postgres + Mongo + RustFS) fits in CRC at
 ~16 GB only with trimmed JVM heaps; it does not fit in the Sandbox.
 
 ---
@@ -110,7 +110,7 @@ interview classic. The answer is SCCs and arbitrary UIDs.
 | postgres-auth, postgres-course | `rhel9/postgresql-16` image + PVC (Phase 1 pattern), or the Crunchy Postgres operator |
 | mongodb | Bitnami MongoDB image + PVC |
 | kafka (KRaft) | **Strimzi operator** — the standard way to run Kafka on Kubernetes/OpenShift (Red Hat sells it as "AMQ Streams"). One `Kafka` custom resource replaces the whole hand-tuned listener config in docker-compose. CRC only; not installable in the Sandbox |
-| minio | MinIO image + PVC, or its operator |
+| rustfs | RustFS image + PVC (pinned rc tag) |
 | zipkin | plain Deployment (stateless) |
 | maildev | plain Deployment, no Route (or drop it: point Spring Mail at a real relay) |
 | kafka-ui | plain Deployment, no Route (access via `oc port-forward` — the SSH-tunnel equivalent) |
@@ -255,7 +255,7 @@ Notes:
    Deployment + Service + Route, axios base URL pointing at the gateway Route (or serve under
    one Route with path routing to avoid CORS).
 4. End-to-end: login flow (note: Google OAuth redirect URIs must include the Route hostname),
-   file upload to MinIO, Kafka event → notification mail, Zipkin trace across
+   file upload to RustFS, Kafka event → notification mail, Zipkin trace across
    gateway → service → Kafka.
 
 ---
@@ -265,7 +265,7 @@ Notes:
 | Group | Pods | Est. RAM |
 |---|---|---|
 | 8 Spring services (`-XX:MaxRAMPercentage`, 512Mi limits) | 8 | ~4 Gi |
-| Postgres ×2, Mongo, MinIO | 4 | ~1.5 Gi |
+| Postgres ×2, Mongo, RustFS | 4 | ~1.5 Gi |
 | Kafka (Strimzi, single node) | 2–3 | ~1.5 Gi |
 | Jenkins controller + one agent during builds | 1–2 | ~2.5 Gi |
 | Zipkin, frontend | 2 | ~0.7 Gi |

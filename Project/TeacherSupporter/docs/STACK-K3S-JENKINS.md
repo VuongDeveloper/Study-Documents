@@ -24,7 +24,7 @@ identical.
 | **Manifests** | **Kustomize** (built into kubectl) | base + overlays, no extra tooling |
 | **Secrets** | Kubernetes Secrets, created by script | not committed; Sealed Secrets later |
 | **Messaging** | **Strimzi** operator → Kafka (KRaft, 1 broker, RF=1) | the industry-standard way to run Kafka on K8s |
-| **Databases** | Postgres ×2, MongoDB, MinIO — Bitnami images + PVCs | run as arbitrary UID → OpenShift-portable |
+| **Databases** | Postgres ×2, MongoDB, RustFS — Bitnami images + PVCs | run as arbitrary UID → OpenShift-portable |
 | **Observability** | kube-prometheus-stack + existing Zipkin | added last; droppable under load |
 | **Remote access** | Tailscale — `kubectl` from Windows over the tailnet | no exposed API server |
 | **Public URL** (optional) | Cloudflare Tunnel → Traefik | CGNAT-proof, outbound-only |
@@ -46,7 +46,7 @@ identical.
                                      │                │
                                      v                v
                           [ k3s ]  Deployments · Services · Ingress · PVCs
-                                   Strimzi Kafka · Postgres ×2 · Mongo · MinIO
+                                   Strimzi Kafka · Postgres ×2 · Mongo · RustFS
                                      │
                           Traefik Ingress ──> reachable over Tailscale
                                           └──> (optional) Cloudflare Tunnel → public
@@ -224,7 +224,7 @@ Fold these into the `configure_firewall()` policy you're writing in
 | Jenkins controller | 2.0 GB |
 | Maven build (transient) | 1.5 GB |
 | 8 Spring services @ 512Mi | 4.0 GB |
-| Postgres ×2, Mongo, MinIO | 1.5 GB |
+| Postgres ×2, Mongo, RustFS | 1.5 GB |
 | Strimzi Kafka | 2.0 GB |
 | Registry, Zipkin, frontend | 0.7 GB |
 | kube-prometheus-stack | 1.5 GB |

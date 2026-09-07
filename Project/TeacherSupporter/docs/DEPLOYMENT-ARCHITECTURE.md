@@ -81,12 +81,12 @@ Docker Compose project on a single bridge network.
               │ │      │         container publishing ports) │ │
               │ │      ├─ /            → static React build  │ │
               │ │      ├─ /api/*       → [ api-gateway:8080 ]│ │
-              │ │      └─ /files/*     → [ minio:9000 ]      │ │
+              │ │      └─ /files/*     → [ rustfs:9000 ]      │ │
               │ │                          │                 │ │
               │ │   [ api-gateway ]────────┤ lb:// via       │ │
               │ │      │                   │ Eureka          │ │
               │ │      ├─> [ auth-service ]──> postgres-auth │ │
-              │ │      ├─> [ course-service ]─> postgres-course, minio
+              │ │      ├─> [ course-service ]─> postgres-course, rustfs
               │ │      ├─> [ dictionary-service ]─> mongodb  │ │
               │ │      └─> [ notification-service ]          │ │
               │ │                                            │ │
@@ -95,13 +95,13 @@ Docker Compose project on a single bridge network.
               │ │                                            │ │
               │ │   volumes: postgres-auth-data,             │ │
               │ │     postgres-course-data, mongo-data,      │ │
-              │ │     minio-data, caddy-data                 │ │
+              │ │     rustfs-data, caddy-data                 │ │
               │ └────────────────────────────────────────────┘ │
               └────────────────────────────────────────────────┘
                                     ▲
    :22 ── SSH ──────────────────────┘
           └─ tunnels for internal UIs: Eureka :8761, Zipkin :9411,
-             Kafka UI :9090, MinIO console :9001, MailDev :1080
+             Kafka UI :9090, RustFS console :9001, MailDev :1080
 ```
 
 ### Rules this topology encodes
@@ -113,10 +113,10 @@ Docker Compose project on a single bridge network.
    only by service name on the compose network (Docker's embedded DNS resolves `postgres-auth`,
    `kafka:19092`, …). No published port = unreachable from the internet, regardless of security
    list.
-3. **Operator access is SSH-only.** Dashboards (Eureka, Zipkin, Kafka UI, MinIO console, MailDev)
+3. **Operator access is SSH-only.** Dashboards (Eureka, Zipkin, Kafka UI, RustFS console, MailDev)
    are viewed through SSH tunnels; if published at all, bound to `127.0.0.1` on the host.
 4. **State lives in named volumes.** Containers are disposable; `postgres-*-data`, `mongo-data`,
-   `minio-data` survive `compose down` and image upgrades. Backup story = backing up these
+   `rustfs-data` survive `compose down` and image upgrades. Backup story = backing up these
    volumes (and eventually OCI block-volume backups).
 5. **No JDWP in production.** The debug agents from the dev compose file are stripped by
    `docker-compose.prod.yml`.
@@ -127,7 +127,7 @@ Docker Compose project on a single bridge network.
 config-server ──healthy──> discovery-server ──> api-gateway
       │
       ├──healthy──> auth-service        (also waits: postgres-auth healthy, kafka started)
-      ├──healthy──> course-service      (also waits: postgres-course, kafka, minio)
+      ├──healthy──> course-service      (also waits: postgres-course, kafka, rustfs)
       ├──healthy──> dictionary-service  (also waits: mongodb)
       └──healthy──> notification-service(also waits: kafka)
 ```
@@ -142,7 +142,7 @@ config-server ──healthy──> discovery-server ──> api-gateway
 | CPU arch | amd64 | **arm64** (base images must be multi-arch) |
 | Ports | everything published to localhost | only Caddy 80/443 |
 | JDWP debug agents | on (5080–5888) | **stripped** |
-| Secrets | defaults in compose (`root`, `minioadmin`) | server-side `.env`, chmod 600 |
+| Secrets | defaults in compose (`root`, `rustfsadmin`) | server-side `.env`, chmod 600 |
 | TLS | none (http://localhost) | Caddy + Let's Encrypt |
 | Frontend | Vite dev server :5173 | static build served by Caddy |
 | Mail | MailDev UI :1080 | real SMTP relay (or MailDev via tunnel) |

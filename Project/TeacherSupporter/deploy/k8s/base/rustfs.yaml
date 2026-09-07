@@ -1,0 +1,86 @@
+# RustFS is the S3-compatible object store (it replaced MinIO, whose community
+# edition went into maintenance mode in late 2025 and was archived in 2026 --
+# see docs/MIGRATION-RUSTFS.md). It is a hard startup dependency for
+# course-service: S3StorageService's @PostConstruct calls headBucket and only
+# catches NoSuchBucketException, so an unreachable store fails bean creation.
+# Kubernetes has no depends_on -- course-service will CrashLoopBackOff until
+# this pod is Ready, then recover.
+#
+# Image is pinned to an exact release candidate: RustFS is pre-GA (1.0.0-rc.x
+# as of Sept 2026) and `latest` moves weekly. Bump deliberately.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # RWO volume: never two pods holding it at once
+  selector:
+    matchLabels: { app: rustfs }
+  template:
+    metadata:
+      labels: { app: rustfs }
+    spec:
+      # The image runs as uid/gid 10001 (user `rustfs`). fsGroup makes the PVC
+      # mount group-writable by that gid regardless of what the CSI driver
+      # chowns it to -- the RustFS docs' "rustfs_perms" init container is the
+      # Compose-flavoured version of the same fix.
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.0-rc.5
+          env:
+            - { name: RUSTFS_ADDRESS, value: "0.0.0.0:9000" }
+            - { name: RUSTFS_CONSOLE_ADDRESS, value: "0.0.0.0:9001" }
+            - { name: RUSTFS_CONSOLE_ENABLE, value: "true" }
+            - { name: RUSTFS_VOLUMES, value: "/data" }     # single node, one dir
+            - { name: RUSTFS_OBS_LOGGER_LEVEL, value: "warn" }
+          envFrom:
+            - secretRef: { name: rustfs }   # RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY
+          ports:
+            - { name: s3, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          # /health returns {"status":"ok",...} once the S3 API is serving
+          # (verified on 1.0.0-rc.5; MinIO's /minio/health/ready also works).
+          readinessProbe:
+            httpGet: { path: /health, port: s3 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: s3 }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests: { memory: 256Mi, cpu: 100m }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: rustfs-data }
+---
+# New claim name on purpose. RustFS cannot read MinIO's on-disk format in its
+# default build (the MinIO-compatible reader is behind a preview feature flag),
+# so reusing minio-data would mount a directory full of unreadable objects.
+# Migrate objects over the S3 API instead (docs/MIGRATION-RUSTFS.md), then
+# delete the old claim: kubectl -n ts delete pvc minio-data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rustfs-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+spec:
+  selector: { app: rustfs }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }

@@ -13,8 +13,11 @@ set -euo pipefail
 NS="${NS:-ts}"
 PG_USER="${PG_USER:-postgres}"
 PG_PASSWORD="${PG_PASSWORD:-root}"
-MINIO_USER="${MINIO_USER:-minioadmin}"
-MINIO_PASSWORD="${MINIO_PASSWORD:-minioadmin}"
+# Object store credentials (RustFS replaced MinIO -- docs/MIGRATION-RUSTFS.md).
+# The override names changed with the product; MINIO_USER/MINIO_PASSWORD are
+# still honoured as a fallback so an existing shell profile keeps working.
+S3_USER="${S3_USER:-${MINIO_USER:-rustfsadmin}}"
+S3_PASSWORD="${S3_PASSWORD:-${MINIO_PASSWORD:-rustfsadmin}}"
 # Default matches the fallback baked into config-server's api-gateway.yml /
 # auth-service.yml so dev behaviour is unchanged. Override in anything public.
 JWT_SECRET="${JWT_SECRET:-mySecretKeyThatIsAtLeast256BitsLongForHS256Algorithm123456}"
@@ -43,17 +46,21 @@ kubectl -n "$NS" create secret generic postgres-course-app \
   --from-literal=SPRING_DATASOURCE_PASSWORD="$PG_PASSWORD" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# --- minio, server side ---
-kubectl -n "$NS" create secret generic minio \
-  --from-literal=MINIO_ROOT_USER="$MINIO_USER" \
-  --from-literal=MINIO_ROOT_PASSWORD="$MINIO_PASSWORD" \
+# --- rustfs, server side ---
+kubectl -n "$NS" create secret generic rustfs \
+  --from-literal=RUSTFS_ACCESS_KEY="$S3_USER" \
+  --from-literal=RUSTFS_SECRET_KEY="$S3_PASSWORD" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# --- minio, client side (course-service) ---
-kubectl -n "$NS" create secret generic minio-app \
-  --from-literal=APP_S3_ACCESS_KEY="$MINIO_USER" \
-  --from-literal=APP_S3_SECRET_KEY="$MINIO_PASSWORD" \
+# --- rustfs, client side (course-service) ---
+kubectl -n "$NS" create secret generic rustfs-app \
+  --from-literal=APP_S3_ACCESS_KEY="$S3_USER" \
+  --from-literal=APP_S3_SECRET_KEY="$S3_PASSWORD" \
   --dry-run=client -o yaml | kubectl apply -f -
+
+# The old MinIO secrets are harmless but stale; remove them once the
+# rustfs Deployment is Ready:
+#   kubectl -n "$NS" delete secret minio minio-app --ignore-not-found
 
 # --- postgres-auth, server side ---
 kubectl -n "$NS" create secret generic postgres-auth \
