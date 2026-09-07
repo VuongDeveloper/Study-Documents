@@ -1,0 +1,672 @@
+\chapter{Đào sâu: JWT ở quy mô lớn --- xác minh ở đâu, token béo phì và khóa bất đối xứng}
+\label{ch:jwt-scale}
+
+Chương~5 dạy thiết kế bảo mật của dự án đúng như nó đang có: token
+HS256, xác minh một lần tại gateway, danh tính chuyển tiếp dưới dạng
+header. Thiết kế đó đúng với một hệ thống có một gateway và năm service.
+Chương này là chương \emph{đào sâu} đầu tiên của cuốn sách: lấy một thiết
+kế đã có trong dự án và đẩy nó tới khi gãy, theo cách một người phỏng vấn
+hay một đợt tăng lưu lượng gấp mười sẽ làm. Câu hỏi lấy từ một bài viết
+tiếng Việt được chia sẻ rộng rãi về JWT trong
+microservices;\footnote{``Lột trần sự thật về JWT --- Phần 2: Trận chiến
+Microservices và nỗi ám ảnh Token béo phì'', viblo.asia, 2026.} câu trả
+lời lấy từ việc đọc code của dự án.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Nên xác minh token ở đâu} --- một lần tại gateway, hay
+  trong từng service?
+  \item \textbf{Chuyện gì xảy ra khi token phình to} --- và mẫu
+  \emph{phantom token} giữ nó gọn là gì?
+  \item \textbf{Chữ ký thực sự bảo đảm điều gì}, và vì sao lựa chọn
+  giữa HS256 và RS256 quyết định ai được tin cậy với thứ gì?
+\end{enumerate}
+
+\section{Xác minh ở đâu: gateway hay từng service?}
+\label{sec:where-to-verify}
+
+\subsection{Mô hình 1: xác minh tập trung (điều dự án đang làm)}
+
+Đọc lại hai nửa của mẫu biên tin cậy. Ở biên, trong
+\code{JwtAuthenticationFilter} của gateway:
+
+\begin{lstlisting}[language=Java]
+Claims claims = Jwts.parser()
+        .verifyWith(signingKey)                    (*@\co{1}@*)
+        .build()
+        .parseSignedClaims(token)
+        .getPayload();
+
+String userId = claims.getSubject();
+String role = claims.get(JwtConstants.CLAIM_ROLE, String.class);
+
+ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+        .header(JwtConstants.HEADER_USER_ID, userId)   (*@\co{2}@*)
+        .header(JwtConstants.HEADER_USER_ROLE, role)
+        .build();
+\end{lstlisting}
+
+Và phía sau nó, trong \code{GatewayHeaderAuthFilter} của mỗi service
+(bản của course-service):
+
+\begin{lstlisting}[language=Java]
+String userId = request.getHeader("X-User-Id");
+String userRole = request.getHeader("X-User-Role");
+
+if (userId != null && userRole != null) {               (*@\co{3}@*)
+    var authorities = List.of(
+            new SimpleGrantedAuthority("ROLE_" + userRole));
+    var authentication = new UsernamePasswordAuthenticationToken(
+            Long.valueOf(userId), null, authorities);
+    SecurityContextHolder.getContext().setAuthentication(authentication);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Mật mã chạy đúng một lần, ở đây. Khóa chính là
+  \code{app.jwt.secret} mà auth-service dùng để ký.
+  \item[\co{2}] Danh tính rời gateway dưới dạng hai header HTTP thuần.
+  Không gì ở phía sau phân biệt được gateway viết chúng hay ai khác
+  viết.
+  \item[\co{3}] Service \emph{không} kiểm tra gì. Có hai header nghĩa là
+  đã xác thực. Đó là toàn bộ hợp đồng.
+\end{description}
+
+Ưu điểm là thật: một nơi giữ secret, service không cần thư viện JWT lẫn
+xử lý khóa, và chi phí CPU kiểm tra chữ ký mỗi request chỉ trả một lần.
+Phần lớn tutorial Spring Cloud dừng ở đây.
+
+\subsection{Ngụy biện ``mạng nội bộ đáng tin''}
+
+Mẫu này dựa trên một bất biến --- \emph{mọi} đường tới một service đều
+đi qua gateway. Trong file Compose của dự án, bất biến đó đã sai sẵn.
+\code{docker-compose.yml} publish thẳng auth-service ở \code{8081} và
+course-service ở \code{8082} ra host, để bạn debug được. Bất kỳ ai trên
+host vì thế có thể bỏ qua gateway:
+
+\begin{handson}[giả mạo danh tính trong một dòng]
+Với stack đang chạy, hỏi course-service danh sách khóa học của một giáo
+viên mà không hề đưa token:
+\begin{lstlisting}[language=bash]
+$ curl -s -H "X-User-Id: 1" -H "X-User-Role: TEACHER" \
+       http://localhost:8082/courses | head -c 300
+\end{lstlisting}
+Nó trả lời. Giờ lặp lại qua gateway ở \code{8080} với cùng hai header và
+không có \code{Authorization}:
+\begin{lstlisting}[language=bash]
+$ curl -s -H "X-User-Id: 1" -H "X-User-Role: TEACHER" \
+       http://localhost:8080/api/courses
+{"error":"Unauthorized","message":"Missing or invalid Authorization header"}
+\end{lstlisting}
+Khác biệt giữa hai kết quả chính là toàn bộ mô hình bảo mật.
+\end{handson}
+
+Trong Kubernetes các cổng publish biến mất (Chương~18), nhưng mạng pod
+phẳng vẫn còn: pod nào trong namespace cũng với được
+\code{course-service:8082}. Ngụy biện nằm ở chỗ coi ``bên trong'' nghĩa
+là ``đáng tin''. Chỉ cần một container bị chiếm --- một image có lỗ
+hổng, một kubeconfig bị lộ, một dependency trong chuỗi cung ứng --- kẻ
+tấn công giả mạo \code{X-User-Id: 1} tới mọi service cùng lúc.
+
+\begin{pitfall}[header danh tính sống sót qua đường dẫn công khai]
+Triệu chứng: không thấy gì, và đó chính là vấn đề. Nhìn đầu hàm
+\code{JwtAuthenticationFilter.filter}: request tới đường dẫn công khai
+(\code{/api/auth/refresh}, \code{/actuator/**}) được chuyển tiếp
+\emph{nguyên vẹn} --- gateway không xác minh token cũng không đụng tới
+header. Client vì thế có thể gửi \code{X-User-Id: 1} tới một đường dẫn
+công khai và header tới service còn nguyên. Hôm nay không endpoint công
+khai nào đọc nó, nên chưa khai thác được; nhưng bất biến ``chỉ gateway
+mới viết các header này'' không được cưỡng chế, nó chỉ đúng nhờ may
+mắn. Cách sửa là một default filter trong \code{api-gateway.yml} gỡ cả
+hai header khỏi mọi request \emph{đi vào} trước khi filter JWT đặt
+chúng:
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - RemoveRequestHeader=X-User-Id
+        - RemoveRequestHeader=X-User-Role
+\end{lstlisting}
+Giờ các header chỉ có thể xuất phát từ gateway. Việc này đóng cánh cửa
+bên ngoài; nó không làm gì cho cánh cửa trong cụm.
+\end{pitfall}
+
+\subsection{Mô hình 2: zero trust --- service nào cũng xác minh}
+
+Phương án thay thế gỡ bỏ sự tin cậy: mỗi service tự parse và xác minh
+JWT, và bỏ qua mọi header danh tính. Header giả giờ vô giá trị vì
+service không bao giờ đọc; token giả thì trượt kiểm tra chữ ký. Gateway
+vẫn có thể xác minh --- loại token hỏng từ sớm rất rẻ --- nhưng không gì
+ở phía sau \emph{phụ thuộc} vào việc đó.
+
+Chi phí xuất hiện ngay: mọi bên xác minh đều cần khóa. Với HS256 nghĩa
+là chép \emph{secret ký} tới mọi service, còn tệ hơn vấn đề nó giải
+quyết (Mục~\ref{sec:hs-vs-rs}). Zero trust ở tầng ứng dụng chỉ hợp lý
+với khóa bất đối xứng, và đó là lý do hai nửa của chương này đi cùng
+nhau.
+
+\begin{decision}[header do gateway xác minh, cho tới lúc này]
+Dự án giữ Mô hình~1. Nó có đúng hai nơi giữ khóa, không có service bên
+thứ ba, và mọi service đều do cùng một pipeline triển khai --- bán kính
+thiệt hại của giả định biên tin cậy chỉ là một namespace. Ba tín hiệu
+sẽ lật quyết định: một service do đội khác viết, một service mà bên gọi
+không chỉ là gateway (một consumer Kafka cũng mở HTTP, một batch job),
+hoặc một yêu cầu tuân thủ đòi danh tính phải xác minh được tại điểm sử
+dụng. Lúc đó bước đi là RS256 cộng xác minh tại từng service, không
+phải thêm header. Hệ thống production thường đi đường thứ ba: giữ
+header, và để \emph{tầng vận chuyển} chứng minh người gửi bằng mutual
+TLS từ một service mesh (Istio, Linkerd). Gateway khi đó thành một đối
+tác được định danh bằng mật mã thay vì một hàng xóm không kiểm chứng
+được.
+\end{decision}
+
+\section{Chữ ký bảo đảm điều gì}
+
+Một JWT là \code{base64url(header).base64url(payload).signature}. Hai
+phần đầu được \emph{encode}, không phải mã hóa: dán bất kỳ token nào của
+dự án vào một bộ giải mã và \code{sub}, \code{email}, \code{role} đọc
+được ngay. Chữ ký thêm đúng hai tính chất:
+
+\begin{itemize}
+  \item \textbf{Toàn vẹn.} Đổi một byte của payload
+  (\code{"role":"STUDENT"} thành \code{"TEACHER"}) là xác minh thất bại.
+  \item \textbf{Xác thực.} Token do một bên giữ khóa ký tạo ra --- và
+  không ai khác.
+\end{itemize}
+
+Nó không thêm tính bí mật. Cả HS256 lẫn RS256 đều tính chữ ký trên cùng
+một chuỗi, \code{base64url(header) + "." + base64url(payload)}. Chúng
+chỉ khác ở \emph{khóa nào tạo chữ ký và khóa nào kiểm tra nó}. Một khác
+biệt duy nhất đó quyết định toàn bộ cấu trúc tin cậy của một hệ thống.
+
+\section{HS256 so với RS256}
+\label{sec:hs-vs-rs}
+
+\subsection{HS256: một khóa, hai vai}
+
+HS256 là HMAC-SHA256: một hàm băm có trộn khóa. Bạn không cần nhớ cấu
+trúc (hai lượt SHA-256 lồng nhau với khóa XOR cùng hai pad cố định); bạn
+cần một tính chất. \emph{Cùng một khóa vừa tạo vừa kiểm tra chữ ký.}
+Xác minh nghĩa là tính lại HMAC với bản khóa của mình rồi so byte. Không
+có khóa thì không tính được, nên không giả mạo được. Có khóa thì tính
+được, nên \emph{có thể} giả mạo. Bên xác minh và bên ký không phân biệt
+được với nhau.
+
+Hai bản sao của khóa đó trong dự án:
+
+\begin{lstlisting}[language=Java]
+// auth-service/.../service/JwtService.java
+this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+
+// api-gateway/.../filter/JwtAuthenticationFilter.java
+this.signingKey = Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8));
+\end{lstlisting}
+
+Cả hai đọc \code{app.jwt.secret}; trong cụm cả hai mount cùng một Secret
+\code{jwt} (Chương~16). Gateway chỉ bao giờ cần \emph{xác minh}, vậy mà
+nó giữ một khóa có thể \emph{đúc} token cho bất kỳ user với bất kỳ vai
+trò nào. Chiếm được pod gateway là sở hữu mọi danh tính trong hệ thống.
+Mở rộng Mô hình~2 một cách ngây thơ --- chép secret tới năm service ---
+và bạn có sáu nơi như vậy.
+
+\subsection{RS256: hai khóa, mỗi khóa một vai}
+
+RS256 là chữ ký RSA trên một mã băm SHA-256. RSA dựa trên một bất đối
+xứng trong số học: nhân hai số nguyên tố lớn thì tức thì; tìm lại chúng
+từ tích thì bất khả thi.
+
+Sinh khóa, một lần:
+
+\begin{enumerate}
+  \item Chọn hai số nguyên tố lớn $p$, $q$ (mỗi số khoảng 1024 bit cho
+  khóa 2048 bit). Tính $n = p \times q$.
+  \item Chọn số mũ công khai $e$; thực tế luôn là $65537$. Cặp $(n, e)$
+  là \textbf{khóa công khai}.
+  \item Tính $d$ sao cho $e \times d \equiv 1 \pmod{(p-1)(q-1)}$. Cặp
+  $(n, d)$ là \textbf{khóa riêng}. Tính $d$ cần $p$ và $q$; chỉ biết $n$
+  thì không suy ra được chúng.
+\end{enumerate}
+
+Ký và xác minh:
+
+\begin{lstlisting}
+h = SHA256(header "." payload), padded (PKCS#1 v1.5)
+sign:    signature = h^d  mod n      -- needs d: only auth-service
+verify:  signature^e mod n == h ?    -- needs e, n: anyone
+\end{lstlisting}
+
+Vì $e \times d \equiv 1$, nâng lũy thừa $d$ rồi lũy thừa $e$ trả về $h$.
+Ai có khóa công khai đều kiểm tra được chữ ký; không ai thiếu $d$ tạo
+được chữ ký. Đó là bất đối xứng mà HS256 không có, và nó thay đổi ai
+được giữ thứ gì:
+
+\begin{figure}[htb]
+\centering
+\begin{tikzpicture}[node distance=6mm and 15mm]
+  \node[boxdark] (auth) {auth-service\\khóa riêng $(n,d)$};
+  \node[boxfill, right=of auth] (jwks) {endpoint JWKS\\khóa công khai $(n,e)$, \code{kid}};
+  \node[box, right=of jwks] (gw) {api-gateway\\chỉ xác minh};
+  \node[box, above=of gw] (dict) {dictionary-service\\chỉ xác minh};
+  \node[box, below=of gw] (course) {course-service\\chỉ xác minh};
+  \draw[flow] (auth) -- node[lbl,above]{công bố} (jwks);
+  \draw[flowdash] (jwks.east) -- node[lbl,below,pos=0.55]{tải, cache} (gw.west);
+  \draw[flowdash] (jwks.east) -- (dict.west);
+  \draw[flowdash] (jwks.east) -- (course.west);
+\end{tikzpicture}
+\caption{Cấu trúc khóa RS256: một bên ký, bao nhiêu bên xác minh cũng
+được. Lộ một bên xác minh không lộ gì cả.}
+\label{fig:rs256-topology}
+\end{figure}
+
+\begin{itemize}
+  \item Auth-service giữ khóa riêng và là nơi \emph{duy nhất} có thể
+  phát hành token.
+  \item Gateway và mọi service giữ khóa công khai. Lộ nó vô hại --- nó
+  công khai theo định nghĩa. Bạn có thể in nó trong cuốn sách này.
+  \item Phân phối khóa không còn là bài toán quản lý bí mật: công bố
+  khóa công khai tại một URL quy ước (một \emph{JWKS}, JSON Web Key
+  Set), và bên xác minh nào cũng tải lúc khởi động rồi cache lại.
+\end{itemize}
+
+Bạn đã tiêu thụ cấu trúc này rồi. Đăng nhập Google ở Chương~5 trả về
+một \code{id\_token} ký RS256; OAuth2 client của Spring xác minh nó với
+JWKS của Google tại \code{https://www.googleapis.com/oauth2/v3/certs}.
+Google không bao giờ đưa bạn khóa riêng, và bạn không bao giờ cần nó.
+
+\subsection{Chi phí}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & HS256 & RS256 (2048-bit) \\
+\midrule
+Vật liệu khóa & một secret, $\ge$ 32 byte & cặp riêng/công khai, $\approx$1,7\,KB PEM \\
+Kích thước chữ ký & 32 byte (43 ký tự) & 256 byte (342 ký tự) \\
+Ký & micro giây & khoảng 1\,ms \\
+Xác minh & micro giây & vài chục micro giây \\
+Ai ký được & bất kỳ ai giữ khóa & chỉ người giữ khóa riêng \\
+Ai xác minh được & bất kỳ ai giữ khóa & bất kỳ ai \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Xác minh RSA rẻ hơn ký rất nhiều vì $e = 65537$ rất nhỏ trong khi $d$
+rộng 2048 bit. Bất đối xứng đó khớp với cấu trúc: một bên ký, nhiều bên
+xác minh. Nếu kích thước chữ ký quan trọng, ES256 (ECDSA trên đường cong
+P-256) cho chữ ký 64 byte và khóa nhỏ hơn nhiều, và là mặc định hiện
+đại cho các identity provider mới.
+
+\begin{pitfall}[nhầm lẫn thuật toán (algorithm confusion)]
+Triệu chứng: một token đáng lẽ bị từ chối lại được chấp nhận --- và log
+không thấy gì sai. Nguyên nhân: thư viện cũ đọc trường \code{alg} trong
+header để quyết định \emph{cách} xác minh. Kẻ tấn công lấy một token
+RS256 hợp lệ, sửa header thành \code{"alg":"HS256"}, và ký bằng HMAC với
+secret là \emph{chính các byte của khóa công khai} --- những byte vốn dĩ
+công khai. Bên xác minh ngây thơ thấy HS256, dùng khóa công khai mình có
+làm secret HMAC, và phép kiểm tra qua. JJWT chặn việc này bằng cách để
+\emph{loại khóa} chọn thuật toán, không phải header:
+\code{verifyWith(SecretKey)} từ chối mọi token bất đối xứng và
+\code{verifyWith(PublicKey)} từ chối mọi token HMAC. Đó là lý do
+\code{JwtAuthenticationFilter} an toàn hôm nay, và là lý do bạn không
+bao giờ được xác minh bằng một phương thức chấp nhận ``header nói gì thì
+làm nấy''.
+\end{pitfall}
+
+\subsection{Chuyển đổi dự án}
+
+Thay đổi đủ nhỏ để đọc trọn vẹn. Sinh cặp khóa một lần:
+
+\begin{lstlisting}[language=bash]
+$ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+      -out jwt-private.pem
+$ openssl pkey -in jwt-private.pem -pubout -out jwt-public.pem
+\end{lstlisting}
+
+PEM riêng chỉ đi vào Secret của auth-service; PEM công khai có thể đặt
+trong ConfigMap, vì nó không bí mật. \code{JwtService} ký bằng khóa
+riêng:
+
+\begin{lstlisting}[language=Java]
+@Service
+public class JwtService {
+
+    private final PrivateKey privateKey;   // sign
+    private final PublicKey publicKey;     // self-verify where needed
+
+    public JwtService(@Value("${app.jwt.private-key-pem}") String privPem,
+                      @Value("${app.jwt.public-key-pem}") String pubPem)
+            throws GeneralSecurityException {
+        KeyFactory kf = KeyFactory.getInstance("RSA");
+        this.privateKey = kf.generatePrivate(
+                new PKCS8EncodedKeySpec(decodePem(privPem)));      (*@\co{1}@*)
+        this.publicKey = kf.generatePublic(
+                new X509EncodedKeySpec(decodePem(pubPem)));
+    }
+
+    public String generateAccessToken(User user) {
+        return Jwts.builder()
+                .header().keyId("2026-09-key1").and()             (*@\co{2}@*)
+                .subject(String.valueOf(user.getId()))
+                .claim("email", user.getEmail())
+                .claim("role", user.getRole().name())
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis()
+                        + accessTokenExpiryMs))
+                .signWith(privateKey, Jwts.SIG.RS256)             (*@\co{3}@*)
+                .compact();
+    }
+
+    private static byte[] decodePem(String pem) {
+        String body = pem.replaceAll("-----BEGIN [A-Z ]+-----", "")
+                         .replaceAll("-----END [A-Z ]+-----", "")
+                         .replaceAll("\\s", "");
+        return Base64.getDecoder().decode(body);
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] PKCS\#8 là định dạng chứa mà \code{openssl genpkey} ghi
+  cho khóa riêng; X.509 \code{SubjectPublicKeyInfo} là thứ
+  \code{-pubout} ghi. Bóc vỏ PEM, giải mã base64, xong.
+  \item[\co{2}] \code{kid} (key id) đặt tên cho khóa đã ký token này.
+  Tốn vài byte bây giờ và cho phép xoay khóa về sau.
+  \item[\co{3}] JJWT suy ra RS256 từ loại khóa; nêu tên tường minh để
+  ghi lại ý định.
+\end{description}
+
+Gateway --- và bất kỳ service nào muốn tự xác minh --- chỉ giữ khóa
+công khai:
+
+\begin{lstlisting}[language=Java]
+public JwtAuthenticationFilter(@Value("${app.jwt.public-key-pem}") String pubPem)
+        throws GeneralSecurityException {
+    this.publicKey = KeyFactory.getInstance("RSA")
+            .generatePublic(new X509EncodedKeySpec(decodePem(pubPem)));
+}
+
+Claims claims = Jwts.parser()
+        .verifyWith(publicKey)      // PublicKey: accepts RS/PS/ES only
+        .build()
+        .parseSignedClaims(token)
+        .getPayload();
+\end{lstlisting}
+
+Không gì khác thay đổi: cùng claim, cùng header, cùng
+\code{GatewayHeaderAuthFilter}. Gateway không còn đúc được token, và
+\code{api-gateway.yml} không cần \code{app.jwt.secret} nữa.
+
+\subsection{Xoay khóa, và \code{kid} để làm gì}
+
+Khóa có tuổi: chính sách bảo xoay mỗi 90 ngày, hoặc một chiếc laptop
+chứa file PEM bị mất. Xoay khóa mà không đăng xuất toàn bộ người dùng là
+một nghi thức bốn bước:
+
+\begin{enumerate}
+  \item Sinh cặp khóa mới; thêm khóa công khai của nó vào JWKS bên cạnh
+  khóa cũ, dưới một \code{kid} mới.
+  \item Đợi tới khi mọi bên xác minh đã làm mới cache (hoặc khởi động
+  lại chúng).
+  \item Chuyển auth-service sang ký bằng khóa riêng mới. Token mới mang
+  \code{kid} mới; token cũ, còn đang lưu hành, mang \code{kid} cũ --- và
+  bên xác minh chọn đúng khóa công khai theo \code{kid}.
+  \item Sau khi thời gian sống dài nhất của token đã trôi qua (ở đây 15
+  phút cho access token), gỡ khóa cũ khỏi JWKS.
+\end{enumerate}
+
+Không có \code{kid}, bên xác minh sẽ phải thử mọi khóa nó biết; có nó,
+tra cứu là chính xác và khóa cũ có thể nghỉ hưu một cách chắc chắn. Phiên
+bản PEM tĩnh ở trên chưa có endpoint JWKS; bước tự nhiên tiếp theo là
+phục vụ \code{/.well-known/jwks.json} từ auth-service và để các bên xác
+minh dùng \code{NimbusJwtDecoder.withJwkSetUri(...)} của Spring
+Security, thứ tự động cache và tải lại khi gặp \code{kid} lạ.
+
+\section{Token béo phì (payload bloat)}
+\label{sec:payload-bloat}
+
+Phi trạng thái rất quyến rũ: nếu token mang mọi thứ một service cần,
+không service nào phải gọi service khác để hỏi ``user này được làm việc
+này không?'' Các đội theo logic đó cho tới khi token mang vai trò,
+quyền, nhóm, feature flag và hồ sơ của user --- và nặng 4\,KB. Phép tính
+lúc đó quay lại chống họ. Một trang dashboard bắn 20 lời gọi API song
+song gửi đi 80\,KB token trước khi có một byte dữ liệu nghiệp vụ nào.
+Nhân với vài chục nghìn user đồng thời và header xác thực chiếm một phần
+đo được của băng thông vào. Cookie, nếu token nằm ở đó, có trần 4\,KB;
+một số proxy giới hạn kích thước header ở 8\,KB; log ghi header phình
+theo.
+
+Access token của dự án mỏng. \code{JwtService.generateAccessToken} ghi
+\code{sub}, \code{email}, \code{role}, \code{iat}, \code{exp} --- khoảng
+200 byte đã ký. Giữ nó như vậy bằng một quy tắc: \textbf{token mang danh
+tính; quyền hạn thì tra cứu.} Khoảnh khắc course-service cần biết ``giáo
+viên này được sửa khóa học nào?'', cám dỗ thêm claim \code{courseIds}
+xuất hiện. Hãy cưỡng lại. Danh sách đó thay đổi khi một khóa học được
+tạo, điều token không thể biết cho tới khi hết hạn; và nó lớn không giới
+hạn. Service vốn đã sở hữu dữ liệu ghi danh (Chương~7) --- một truy vấn
+có index trả lời câu hỏi đúng và cập nhật.
+
+\section{Mẫu phantom token}
+
+Giả sử token béo là không tránh khỏi --- một mô hình phân quyền cũ, một
+tích hợp với đối tác. Mẫu phantom token giữ token \emph{bên ngoài} nhỏ
+xíu trong khi token \emph{bên trong} vẫn tự chứa:
+
+\begin{enumerate}
+  \item Auth-service tạo JWT đầy đủ nhưng \emph{không} trả về. Nó cất
+  JWT vào một kho nhanh (Redis) dưới một định danh mờ ngẫu nhiên, và chỉ
+  trả về định danh đó --- một UUID, 36 byte.
+  \item Gateway nhận UUID, tra cứu, và thay bằng JWT thật trước khi
+  chuyển tiếp. Service nội bộ thấy một token ký bình thường.
+  \item Service nội bộ tự xác minh nó (RS256, JWKS). Bên trong vành đai,
+  hệ thống phi trạng thái và zero trust; bên ngoài, client mang một token
+  không có nội dung nào đọc được.
+\end{enumerate}
+
+Đăng xuất trở nên tầm thường và \emph{tức thì}: \code{DEL <uuid>} trong
+Redis, và request kế tiếp với định danh đó thất bại tại gateway với 401,
+bất kể JWT bên trong còn sống bao lâu. Đây là phần thưởng thật của mẫu
+này --- nó sửa điểm yếu cấu trúc duy nhất của JWT, không thu hồi được.
+
+Dự án đã chạy một nửa của nó. Nhìn
+\code{JwtService.generateRefreshTokenValue}:
+
+\begin{lstlisting}[language=Java]
+public String generateRefreshTokenValue() {
+    return UUID.randomUUID().toString();
+}
+\end{lstlisting}
+
+Refresh token không phải JWT. Nó là một định danh mờ lưu trong bảng
+\code{refresh\_tokens} (Flyway \code{V2}) và bị thu hồi bằng cách xóa
+dòng --- \code{AuthService.logout} làm đúng thế. Access token vẫn là
+một JWT tự chứa. Vậy độ trễ thu hồi của dự án bị chặn trên bởi 15 phút
+của access token, và \emph{cơ chế} thu hồi của nó là mẫu phantom áp dụng
+cho riêng thông tin xác thực sống dài.
+
+\begin{pitfall}[refresh không xoay vòng]
+Đọc \code{AuthService.refreshToken}: nó trả về \emph{đúng} refresh
+token nó nhận được. Một refresh token bị đánh cắp một lần vì thế hợp lệ
+suốt bảy ngày, và vụ trộm không thể phát hiện. Thực hành trong ngành là
+\emph{xoay vòng} (rotation): mỗi lần \code{/refresh} phát một refresh
+token mới và vô hiệu token cũ. Nếu token cũ có lúc nào bị đưa ra lại,
+hai bên đang giữ bản sao --- thu hồi cả họ token. Bảng đã có đủ cột để
+làm việc này; thay đổi là một cặp xóa-và-chèn trong một transaction.
+\end{pitfall}
+
+\begin{decision}[ba cách thu hồi một access token]
+Khi admin vô hiệu một tài khoản, câu trả lời của dự án là ``trong vòng
+15 phút''. Các phương án, theo chi phí tăng dần:
+\begin{enumerate}
+  \item \textbf{Đợi cho hết hạn.} Access token ngắn cộng refresh token
+  có trạng thái. Không thêm hạ tầng; độ trễ thu hồi bằng thời gian sống
+  của access token. Chấp nhận được với phần lớn ứng dụng, và là điều dự
+  án đang làm.
+  \item \textbf{Danh sách cấm (deny-list).} Thêm claim \code{jti} (id
+  token); khi đăng xuất hoặc vô hiệu, ghi \code{jti} vào Redis với TTL
+  bằng phần đời còn lại của token; gateway tra Redis mỗi request. Một
+  lượt tra nhanh mỗi request, và chỉ token bị thu hồi mới được lưu.
+  \item \textbf{Phantom token.} Định danh mờ bên ngoài, JWT bên trong,
+  Redis làm bảng ánh xạ. Thu hồi tức thì và trình duyệt không có token
+  đọc được --- nhưng Redis giờ nằm trên đường găng của \emph{mọi}
+  request. Redis chết nghĩa là mọi user bị đăng xuất cùng lúc.
+\end{enumerate}
+Phản biện của một kỹ sư senior với sự hào hứng của bài viết: phương
+án~3 đổi ``không thu hồi được'' lấy ``một điểm lỗi đơn mới''. Phần lớn
+đội nên với tới phương án~2 trước và coi phương án~3 là phù hợp với yêu
+cầu cấp ngân hàng, nơi chính bài viết cũng thừa nhận session có thể là
+công cụ tốt hơn.
+\end{decision}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Phân tích sự cố là cách nhanh nhất để phân biệt hai mô hình khóa.
+Auth-service chết lúc 3 giờ sáng; không gì khác chết.
+
+\begin{itemize}
+  \item \textbf{HS256, như đang triển khai.} Gateway giữ secret và xác
+  minh cục bộ: mọi user đang đăng nhập tiếp tục dùng được cho tới khi
+  access token hết hạn. Lời gọi refresh thất bại (auth-service là
+  endpoint \code{/refresh}), nên phiên chết trong vòng 15 phút. Đăng
+  nhập mới thất bại. Hồi phục tức thì khi auth-service trở lại.
+  \item \textbf{RS256 với JWKS đã cache.} Giống hệt với các bên xác
+  minh đang chạy: chúng đã cache khóa công khai lúc khởi động và không
+  cần gì từ auth-service. Sự cố mới là một bên xác minh \emph{lạnh} ---
+  một pod gateway khởi động lại trong lúc sự cố không tải được JWKS, và
+  tùy cấu hình sẽ từ chối mọi token (fail closed) hoặc crash lúc boot.
+  Giảm nhẹ: kèm khóa công khai hiện hành trong cấu hình làm phương án
+  dự phòng, hoặc cho cache JWKS một thời gian ân hạn dài.
+  \item \textbf{Phantom token.} Thêm Redis vào danh sách những thứ phải
+  sống. Auth-service chết có cùng hệ quả như trên; Redis chết là sập
+  toàn bộ lưu lượng đã xác thực.
+\end{itemize}
+
+Bài học khái quát: phi trạng thái mua cho bạn sự độc lập khỏi bên phát
+hành tại thời điểm request. Mọi cơ chế bạn thêm để giành lại quyền kiểm
+soát --- JWKS, deny-list, ánh xạ mờ --- đều đưa trở lại một phụ thuộc,
+và bạn phải gọi tên được nó và nói được chuyện gì xảy ra khi nó không
+sẵn sàng.
+
+\section{Khi JWT là công cụ sai}
+
+Bài viết khép lại bằng một cảnh báo đáng nhắc lại, vì chính con đường
+của dự án (Chương~27) có một phương án monolith. JWT xứng đáng với độ
+phức tạp của nó khi \emph{nhiều bên độc lập} phải trả lời ``ai đang
+gọi?'' mà không chia sẻ kho session: microservices, đăng nhập một lần
+xuyên ứng dụng, liên kết OAuth2/OIDC. Nó là công cụ sai khi hệ thống là
+một khối triển khai duy nhất có đủ chỗ cho session trong bộ nhớ, khi
+quyền thay đổi thường xuyên và phải có hiệu lực ngay, hoặc khi cơ quan
+quản lý đòi một phiên phải chấm dứt được trong mili giây. Những trường
+hợp đó, session phía server với cookie đơn giản hơn, thu hồi được, và
+nhàm chán --- mà nhàm chán là một tính năng.
+
+\section{Ngoài dự án}
+
+Keycloak, Auth0, Cognito, Okta và Entra ID đều phát hành token RS256
+hoặc ES256 và công bố JWKS; mọi resource server Spring trong ngành xác
+minh bằng cấu hình một dòng \code{jwk-set-uri} đã thấy ở Chương~5.
+Service mesh (Istio, Linkerd) hiện thực biến thể mTLS của zero trust để
+code ứng dụng vẫn đọc header trong khi tầng vận chuyển chứng minh ai
+viết chúng. Mẫu phantom token được sản phẩm hóa bởi Curity và các API
+gateway như Kong, Apigee dưới các tên ``token introspection'' và
+``opaque token exchange''. Biết phiên bản tự tay làm --- một secret
+HS256, hai nơi giữ --- là thứ khiến những sản phẩm đó đọc hiểu được.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+Những câu này được hỏi như bài toán mở, không phải định nghĩa. Câu trả
+lời dưới đây là điều một kỹ sư senior nói trong hai phút đầu; người
+phỏng vấn sau đó đào vào đúng đánh đổi bạn vừa nêu.
+
+\subsection*{Q: Làm sao vô hiệu một JWT trước khi nó hết hạn?}
+
+Bạn không làm được; bạn giới hạn thiệt hại. Access token sống vài phút,
+không phải vài giờ, nên ``đợi hết hạn'' là mức nền. Muốn thu hồi tức
+thì, thêm claim \code{jti} và một deny-list trong Redis với TTL bằng
+phần đời còn lại của token --- một lượt tra mỗi request, chỉ lưu token
+bị thu hồi, và khi Redis không sẵn sàng có thể fail open hay fail closed
+theo chính sách. Mờ hoàn toàn (phantom token) cho thu hồi tức thì nhưng
+đặt Redis lên đường găng của mọi request. Trong dự án này refresh token
+đã là mờ và lưu trong cơ sở dữ liệu, nên ``đăng xuất mọi nơi'' là
+\code{DELETE FROM refresh\_tokens WHERE user\_id = ?} cộng thêm nhiều
+nhất 15 phút truy cập còn sót.
+
+\subsection*{Q: Lưu lượng đăng nhập tăng từ 10 lên 10\,000 mỗi giây. Cái gì gãy?}
+
+Ký trước tiên: ký RS256 tốn khoảng 1\,ms CPU mỗi token, nên mười nghìn
+lần đăng nhập mỗi giây là mười nhân CPU chỉ để ký, trong khi HS256 gần
+như không đáng kể. Rồi tới băm mật khẩu, thứ cố ý chậm (bcrypt cost 10
+khoảng 100\,ms) --- đó mới là bức tường thật, và câu trả lời là mở rộng
+ngang auth-service cộng rate limit theo IP và theo tài khoản tại
+gateway. Xác minh không phải vấn đề: verify RS256 mất vài chục micro
+giây và không cần mạng. Cũng kiểm tra rằng lệnh insert refresh token
+không dồn lên một index nóng và bảng \code{refresh\_tokens} được dọn các
+dòng hết hạn.
+
+\subsection*{Q: Hai region, một hệ thống auth. Cái gì phải chia sẻ?}
+
+Với HS256 là secret, một bài toán phân phối bạn không muốn có xuyên
+region. Với RS256 chỉ là bộ khóa công khai, thứ cache được, công khai,
+và có thể trễ an toàn trong khoảng chồng lấn của chu kỳ xoay khóa. Đồng
+hồ quan trọng hơn khóa: \code{exp} và \code{iat} được so với đồng hồ
+của bên xác minh, nên cho phép một độ lệch nhỏ (\code{clockSkewSeconds}
+của JJWT, thường 30--60\,s) và chạy NTP ở mọi nơi. Refresh token có
+trạng thái, nên hoặc ghim refresh về region phát hành hoặc sao chép
+bảng; Postgres đơn lẻ của dự án sẽ là thứ đầu tiên phải đổi.
+
+\subsection*{Q: Một token bị đánh cắp từ trình duyệt của người dùng. Bạn làm gì?}
+
+Khoanh vùng, rồi phát hiện. Khoanh vùng: thu hồi refresh token của
+user; access token chết trong vòng đời của nó. Phát hiện: xoay vòng
+refresh token biến một token cũ bị dùng lại thành tín hiệu --- hai bên
+cùng đưa ra một họ token nghĩa là bị trộm, thu hồi cả họ. Phòng ngừa:
+giữ refresh token trong cookie \code{HttpOnly} để script bị tiêm không
+đọc được, và giữ access token trong bộ nhớ thay vì
+\code{localStorage} (Chương~38). Chỉ thêm ràng buộc thiết bị hoặc IP
+nếu bạn chấp nhận chi phí báo động giả với người dùng di động.
+
+\subsection*{Q: Sao không kiểm tra cơ sở dữ liệu ở mọi request cho xong?}
+
+Có thể, và monolith làm thế --- đó là session. Lý do không làm trong
+kiến trúc service là mọi service sẽ cần kho user hoặc một lời gọi tới
+service có nó, đặt auth-service lên đường găng của mọi thứ và ghép mọi
+lần deploy vào nó. Token có chữ ký cho mỗi chặng tự trả lời ``đây là
+ai'' tại chỗ. Câu trả lời thật thà nêu cái giá --- độ trễ thu hồi ---
+và cái bạn đã trả để mua lại quyền kiểm soát: vòng đời ngắn, refresh
+token có trạng thái, và tùy chọn một deny-list.
+
+\subsection*{Q: Trong token của bạn có gì, và cố ý không có gì?}
+
+Subject, vai trò, thời điểm phát hành, hạn dùng, và ở đây một e-mail
+--- danh tính, không phải quyền hạn. Không có: danh sách permission,
+thành viên nhóm, bất cứ thứ gì thay đổi nhanh hơn hạn token, bất cứ thứ
+gì service khác sở hữu, và bất cứ thứ gì bí mật (payload đọc được). Nếu
+người phỏng vấn ép ``cho permission vào để khỏi query'', câu trả lời
+senior là phép tính ở Mục~\ref{sec:payload-bloat}: 4\,KB nhân mọi
+request, và một quyết định phân quyền lỗi thời bị đóng băng suốt đời
+token.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Sau khi chuyển sang RS256, \code{api-gateway.yml} không còn
+  chứa \code{app.jwt.secret}. Nếu toàn bộ config-server bị lộ, kẻ tấn
+  công có giả mạo được token không? Giải thích file nào mới là thứ phải
+  lộ.
+  \item Mô tả nghi thức xoay khóa 90 ngày và nêu chính xác \code{kid}
+  giải quyết vấn đề gì ở bước~3.
+  \item Ba mươi service, mỗi cái xác minh token RS256 bằng JWKS tải lúc
+  khởi động. Auth-service chết lúc 3 giờ sáng. User nào bị ảnh hưởng,
+  khi nào, và sự kiện duy nhất nào trong lúc sự cố khiến một bên xác
+  minh từ chối \emph{toàn bộ} lưu lượng?
+  \item Một đồng nghiệp đề xuất thêm claim \code{courseIds} để
+  course-service phân quyền mà không cần truy vấn. Nêu hai lý do từ
+  chối không liên quan tới kích thước token.
+  \item Gateway chuyển tiếp request tới đường dẫn công khai mà không
+  đụng header. Giải thích vì sao hôm nay đây là lỗ hổng tiềm ẩn chứ chưa
+  phải đang hoạt động, và nêu cấu hình một dòng loại bỏ sự tiềm ẩn đó.
+  \item Admin vô hiệu một user đang đăng nhập. Cho biết độ trễ thu hồi
+  với thiết kế hiện tại của dự án, và nêu phụ thuộc thêm mà mỗi thiết
+  kế nhanh hơn trong hai thiết kế còn lại đưa vào.
+\end{enumerate}
+\end{quiz}

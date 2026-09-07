@@ -9,21 +9,46 @@
 \gloss{Advertised listener}{Địa chỉ mà broker Kafka bảo client dùng
   sau bước bootstrap --- nguyên nhân thường gặp của hiện tượng kết nối
   được rồi timeout (Ch.~10).}
+\gloss{Algorithm confusion}{(nhầm lẫn thuật toán) Tấn công sửa header
+  \code{alg} của token để bên xác minh áp dụng HMAC với khóa công khai
+  làm secret; bị chặn khi loại khóa, không phải header, chọn thuật toán
+  (Ch.~28).}
 \gloss{Artifact}{Bất cứ thứ gì một build sinh ra đáng giữ lại (jar,
   image, báo cáo); phải bất biến và truy nguyên được (Ch.~21).}
 \gloss{Auto-configuration}{(tự cấu hình) Spring Boot áp dụng cấu hình
   có điều kiện dựa trên classpath, thuộc tính và bean của người dùng
   (Ch.~1).}
+\gloss{Backend for frontend}{Service nhỏ ghép nhiều lời gọi service
+  thành một response theo hình dạng client; chỗ đúng cho việc gộp mà
+  gateway không được làm (Ch.~31).}
 \gloss{Bootstrap servers}{Các địa chỉ Kafka ban đầu mà client liên hệ
   để lấy metadata; mọi lưu lượng sau đó dùng advertised listener
   (Ch.~10).}
+\gloss{Bulkhead}{Giới hạn số lời gọi đồng thời tới một phụ thuộc
+  (semaphore hoặc thread pool riêng) để một phụ thuộc chậm không tiêu
+  hết thread của bên gọi (Ch.~32).}
+\gloss{Cipher value}{(giá trị mã hóa) Giá trị config-server có tiền tố
+  \code{\{cipher\}}, mã hóa bằng khóa của server để repository chỉ giữ
+  bản mã; được giải mã lúc phục vụ (Ch.~29).}
+\gloss{Circuit breaker}{(bộ ngắt mạch) Máy trạng thái trên cửa sổ trượt
+  các kết quả gọi: CLOSED cho qua, OPEN từ chối tức thì trong một
+  khoảng chờ, HALF\_OPEN thăm dò bằng vài lời gọi (Ch.~32).}
 \gloss{ClusterIP}{Kiểu Service mặc định: một IP ảo ổn định, chỉ tới
   được từ bên trong cụm (Ch.~18).}
 \gloss{Consumer group}{(consumer group) Một nhóm consumer Kafka có tên,
   chia nhau các partition của một topic; mỗi nhóm giữ offset riêng
   (Ch.~10).}
+\gloss{Consumer lag}{(độ trễ tiêu thụ) Khoảng cách giữa offset mới nhất
+  của partition và offset đã commit của group; đo bằng giây, đặt cảnh
+  báo trên nó (Ch.~34).}
 \gloss{Controller (k8s)}{Một vòng lặp điều hòa hội tụ trạng thái thực
   tế về trạng thái mong muốn cho một kind object (Ch.~14).}
+\gloss{CORS / preflight}{Cơ chế trình duyệt cưỡng chế để nới lỏng
+  chính sách same-origin; request cross-origin không đơn giản tốn
+  thêm một vòng \code{OPTIONS} trừ khi được cache --- và không bao giờ
+  xảy ra khi trang và API chung một origin (Ch.~31, 38).}
+\gloss{CQRS}{Tách lệnh/truy vấn xuyên service: ghi đi tới service sở
+  hữu, đọc đi tới một mô hình dựng từ sự kiện của nó (Ch.~33).}
 \gloss{CrashLoopBackOff}{Trạng thái pod: container liên tục thoát; độ
   trễ khởi động lại tăng gấp đôi mỗi lần (Ch.~24).}
 \gloss{CRD / Operator}{Các kind resource tùy biến cộng một controller
@@ -36,39 +61,90 @@
   rollback (Ch.~15).}
 \gloss{Digest}{Mã băm nội dung bất biến của một image
   (\code{@sha256:...}); tag dịch chuyển, digest thì không (Ch.~13).}
+\gloss{Dual write}{(ghi kép) Ghi vào hai hệ thống (cơ sở dữ liệu và
+  Kafka) không có transaction chung; cái này có thể thành công trong khi
+  cái kia thất bại (Ch.~33).}
 \gloss{Endpoint (k8s)}{Một pod Ready đứng sau một Service; danh sách
   sống được duy trì theo label selector và readiness (Ch.~18).}
 \gloss{Eureka}{Service registry của Netflix/Spring Cloud: đăng ký,
   heartbeat, cache phía client (Ch.~3).}
+\gloss{Event loop}{(vòng lặp sự kiện) Nhóm thread nhỏ, cố định của
+  Reactor Netty, mỗi thread ghép kênh nhiều socket bằng I/O không
+  chặn; một lời gọi chặn làm khựng mọi request trên vòng lặp đó
+  (Ch.~31).}
+\gloss{explain (Mongo)}{\code{find(...).explain("executionStats")}:
+  kế hoạch truy vấn với các stage \code{IXSCAN}/\code{FETCH} và
+  \code{totalDocsExamined} so với \code{nReturned} --- thứ đầu tiên
+  cần đọc khi một truy vấn chậm (Ch.~36).}
+\gloss{Fallback}{Giá trị hay hành động thay thế khi lời gọi được bảo vệ
+  thất bại hoặc bị từ chối; nên là giá trị cache, suy giảm-nhưng-có
+  kiểu, rỗng, hoặc lỗi có kiểu --- không bao giờ \code{null} (Ch.~32).}
 \gloss{Flyway}{Các migration SQL có phiên bản, bất biến, áp dụng lúc
   khởi động và ghi vào một bảng lịch sử (Ch.~7).}
 \gloss{GitOps}{Mô hình triển khai trong đó một agent trong cụm kéo
   trạng thái mong muốn từ git và hội tụ cụm về đó (Ch.~26).}
+\gloss{Head-based / tail-based sampling}{(lấy mẫu theo đầu / theo
+  đuôi) Quyết định tại span gốc có giữ trace hay không (rẻ, mù với kết
+  quả) so với quyết định sau khi biết trọn trace (giữ lỗi và request
+  chậm; cần collector) (Ch.~37).}
+\gloss{HS256 / RS256}{Thuật toán ký JWT. HS256: một secret dùng chung
+  vừa ký vừa xác minh. RS256: khóa riêng RSA ký, khóa công khai xác
+  minh --- một bên phát hành, bao nhiêu bên xác minh cũng được
+  (Ch.~28).}
+\gloss{HttpOnly cookie}{Cookie mà JavaScript không đọc được; cùng
+  \code{Secure}, \code{SameSite} và một \code{Path} hẹp, nó là chỗ ở
+  an toàn cho refresh token (Ch.~38).}
+\gloss{Idempotent consumer}{(consumer lũy đẳng) Listener giành mỗi id
+  sự kiện trong cùng transaction với hiệu ứng phụ, nên giao lại là
+  no-op (Ch.~34).}
+\gloss{Idempotent producer}{(producer lũy đẳng) Producer Kafka mà các
+  lần thử lại được broker khử trùng theo số thứ tự; mặc định từ
+  Kafka~3.0 (Ch.~34).}
 \gloss{Ingress}{Object định tuyến HTTP tầng 7 (host/đường dẫn
   $\rightarrow$ Service), được thực thi bởi một Ingress controller như
   Traefik (Ch.~18).}
 \gloss{Jib}{Plugin Maven build image OCI theo layer mà không cần Docker
   daemon (Ch.~13).}
+\gloss{JWKS}{JSON Web Key Set: các khóa công khai mà bên phát hành công
+  bố tại một URL quy ước để bên xác minh tải và cache (Ch.~28).}
 \gloss{JWT}{Token danh tính tự chứa, có chữ ký:
   header.payload.signature; kiểm tra được mà không cần cơ sở dữ liệu
-  (Ch.~5).}
+  (Ch.~5; ở quy mô lớn, Ch.~28).}
+\gloss{Keyset pagination}{(phân trang theo khóa) Phân trang bằng ``các
+  dòng sau khóa này'' trên cột sort có index thay vì \code{skip}, để
+  trang sâu tốn bằng trang đầu (Ch.~36).}
+\gloss{kid}{Key id trong header JWT, đặt tên khóa đã ký nó; thứ cho
+  phép xoay khóa trong khi token cũ còn lưu hành (Ch.~28).}
 \gloss{KRaft}{Cơ chế đồng thuận Raft tích hợp sẵn của Kafka thay cho
   ZooKeeper (Ch.~10).}
 \gloss{kubelet}{Agent trên mỗi node, chạy pod và thực thi probe
   (Ch.~14).}
 \gloss{Kustomize}{Ghép manifest không dùng template: base, overlay,
   patch; tích hợp sẵn trong kubectl (Ch.~20).}
+\gloss{Lease (Eureka)}{Đăng ký của một instance, gia hạn bằng heartbeat
+  mỗi 30\,s và hết hạn sau 90\,s im lặng; server quét mỗi 60\,s, nên
+  instance chết có thể lưu lại vài phút (Ch.~30).}
 \gloss{Liveness probe}{``Khởi động lại tôi nếu cái này hỏng'' --- probe
   cần dè dặt nhất (Ch.~17).}
+\gloss{Multipart upload}{Cơ chế S3 chia một object lớn thành các phần
+  ít nhất 5\,MB, upload song song và ráp phía server; phần bị bỏ dở cần
+  quy tắc lifecycle hủy (Ch.~35).}
 \gloss{Namespace}{Phân vùng của cụm; phạm vi cho tên và RBAC
   (Ch.~14).}
 \gloss{OOMKilled}{Exit 137: kernel giết container vì vượt giới hạn bộ
   nhớ; không có trace nào từ phía ứng dụng (Ch.~17).}
 \gloss{Outbox pattern}{Làm cho ghi DB + phát sự kiện trở nên nguyên tử
   trên thực tế bằng cách ghi sự kiện vào một bảng trong cùng giao dịch
-  (Ch.~11).}
+  (Ch.~11; Ch.~33).}
 \gloss{Partition}{(phân vùng) Đơn vị thứ tự và song song của Kafka;
   một chuỗi bản ghi bất biến, có thứ tự (Ch.~10).}
+\gloss{Path-style addressing}{(địa chỉ kiểu đường dẫn) Dạng URL S3 với
+  bucket nằm trong đường dẫn (\code{host/bucket/key}) thay vì là
+  subdomain DNS; MinIO cần dạng này khi không có wildcard DNS
+  (Ch.~35).}
+\gloss{Phantom token}{Định danh mờ bên ngoài, JWT đầy đủ bên trong;
+  gateway đổi cái này lấy cái kia qua một kho nhanh, cho token ngoài
+  mỏng và thu hồi tức thì với cái giá là một phụ thuộc mới (Ch.~28).}
 \gloss{Poison pill}{Một thông điệp giải tuần tự thất bại mãi mãi, làm
   kẹt partition của nó trừ khi xử lý lỗi bỏ qua nó (Ch.~11).}
 \gloss{Presigned URL}{(presigned URL) Một link có chữ ký, giới hạn thời
@@ -77,6 +153,10 @@
 \gloss{Probe (startup/readiness/liveness)}{Các kiểm tra sức khỏe của
   kubelet, lần lượt gác việc khởi động lại, nhận lưu lượng, và thời
   gian ân hạn lúc boot (Ch.~17).}
+\gloss{Property source precedence}{(thứ tự ưu tiên nguồn thuộc tính)
+  Danh sách có thứ tự các nguồn cấu hình của Spring Boot; biến môi
+  trường đứng trên tài liệu từ config-server, tài liệu đó đứng trên
+  YAML đóng gói (Ch.~29).}
 \gloss{PV / PVC / StorageClass}{Lưu trữ đã cấp phát, yêu cầu của một
   workload lên nó, và nhà máy tạo PV theo nhu cầu (Ch.~19).}
 \gloss{RBAC}{Kiểm soát truy cập theo vai trò: ServiceAccount (danh
@@ -85,6 +165,12 @@
 \gloss{Reconciliation}{(điều hòa) Vòng lặp điều khiển: so sánh trạng
   thái mong muốn và thực tế, hành động trên phần chênh lệch, mãi mãi
   (Ch.~14).}
+\gloss{RED / USE}{Rate, Errors, Duration cho service theo request;
+  Utilization, Saturation, Errors cho tài nguyên --- hai bộ từ vựng
+  dashboard (Ch.~37).}
+\gloss{Refresh scope}{Các bean được dựng lại khi \code{/actuator/refresh}
+  để thay đổi cấu hình có hiệu lực không cần khởi động lại; theo từng
+  instance trừ khi Spring Cloud Bus phát sóng (Ch.~29).}
 \gloss{Registry}{Kho lưu image nói giao thức Docker/OCI; giao diện giữa
   bên build và cụm (Ch.~13).}
 \gloss{Relaxed binding}{Cách Spring ánh xạ
@@ -92,20 +178,47 @@
   (Ch.~1).}
 \gloss{ReplicaSet}{Bộ đếm giữ N pod của một template luôn sống; do
   Deployment quản lý, giữ lại để rollback (Ch.~15).}
+\gloss{Retry storm}{(bão retry) Các lần retry đồng bộ từ nhiều client
+  nhân tải lên một phụ thuộc đang lỗi; ngăn bằng jitter, ngân sách
+  retry và chỉ retry lời gọi lũy đẳng (Ch.~32).}
+\gloss{Retry topic}{Topic theo độ trễ mà một record thất bại được phát
+  lại vào (\code{-retry-2000}, \ldots), kết thúc ở dead-letter topic;
+  \code{@RetryableTopic} của Spring (Ch.~34).}
 \gloss{Rolling update}{(cập nhật cuốn chiếu) Thay pod từng phần, gác
   bằng readiness, để service không bao giờ dừng hẳn (Ch.~15).}
+\gloss{Saga}{Một lần ghi xuyên service dưới dạng chuỗi transaction cục
+  bộ, mỗi bước có hành động bù nếu bước sau thất bại (Ch.~33).}
 \gloss{Secret (k8s)}{Object key/value theo namespace cho thông tin xác
   thực; mã hóa base64, được bảo vệ bởi RBAC chứ không phải mật mã học
   (Ch.~16).}
+\gloss{Self-preservation}{(chế độ tự bảo toàn) Chế độ Eureka vào khi
+  gia hạn rơi dưới 85\,\% kỳ vọng; loại bỏ dừng hoàn toàn --- kích hoạt
+  chỉ bởi một crash trên đội tàu năm instance (Ch.~30).}
 \gloss{Service (k8s)}{Tên ổn định + IP ảo trên một tập pod chọn theo
   label, lọc theo readiness (Ch.~18).}
 \gloss{ServiceAccount}{Một danh tính phi con người để truy cập API ---
   thứ Jenkins dùng để deploy (Ch.~22).}
+\gloss{SigV4}{AWS Signature Version 4: một chuỗi HMAC trên ngày, region
+  và dịch vụ ký một canonical request luôn bao gồm header \code{Host}
+  --- presigned URL bị gắn chặt với host nó được ký cho (Ch.~35).}
+\gloss{Single-flight refresh}{(refresh một chuyến) Một promise chờ
+  dùng chung để các 401 đồng thời chỉ kích hoạt đúng một lần refresh
+  token và tất cả replay với kết quả của nó; bắt buộc khi refresh
+  token có xoay vòng (Ch.~38).}
 \gloss{StatefulSet}{Controller workload cho các replica có trạng thái:
   tên ổn định, PVC riêng từng replica, thay thế theo thứ tự (Ch.~15).}
+\gloss{Text index (Mongo)}{Index tách token và rút gốc các trường chuỗi
+  có trọng số, truy vấn qua \code{\$text}/\code{TextCriteria}; khớp từ
+  trọn vẹn, không khớp chuỗi con (Ch.~36).}
+\gloss{Token bucket}{Thuật toán rate limit: token nạp lại đều đặn tới
+  một sức chứa burst và mỗi request tiêu một; Spring Cloud Gateway giữ
+  bucket trong Redis (Ch.~31).}
+\gloss{TOTP}{Mật khẩu một lần theo thời gian: bí mật chia sẻ + đồng hồ,
+  RFC 6238 (Ch.~5).}
+\gloss{traceparent}{Header W3C Trace Context mang trace id, span id
+  cha và cờ lấy mẫu giữa các service; Boot~3 phát nó và cũng chấp nhận
+  B3 (Ch.~37).}
 \gloss{Trusted edge}{(biên tin cậy) Gateway kiểm tra JWT một lần và
   chuyển tiếp các header danh tính; các service tin chúng --- chỉ đúng
   khi không có đường nào đi vòng qua gateway (Ch.~5).}
-\gloss{TOTP}{Mật khẩu một lần theo thời gian: bí mật chia sẻ + đồng hồ,
-  RFC 6238 (Ch.~5).}
 \end{description}

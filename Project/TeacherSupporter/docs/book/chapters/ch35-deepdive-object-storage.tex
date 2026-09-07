@@ -1,0 +1,723 @@
+\chapter{Deep Dive: Files at Scale --- Presigned URLs, Endpoints, and Why Bytes Don't Belong in Postgres}
+\label{ch:dd-storage}
+
+Chapter~9 introduced MinIO as ``S3 at home'' and explained the
+two-endpoints bug. That was enough to make submissions work. This chapter
+asks what the design costs once the files are many, large, and important
+--- the moment a student's graded essay is the only copy anywhere. The
+project's own code is the specimen: one \code{S3Config}, one
+\code{S3StorageService}, one column called \code{file\_object\_key}.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{Where should bytes live} --- in the database, on a
+  disk, or in an object store --- and what exactly does each choice cost?
+  \item \textbf{Who should move the bytes} --- the browser through the
+  service, or the browser straight to storage with a signed permission
+  slip?
+  \item \textbf{What happens when the two stores disagree} --- a row that
+  names an object that does not exist, or an object no row names?
+\end{enumerate}
+
+\section{Why object storage, and what it solves}
+
+A submission has two halves: facts about it (who, when, which attempt,
+what score) and the file itself. The facts are relational and tiny; the
+file is opaque and potentially 20\,MB. Three homes are possible for the
+file.
+
+\textbf{In Postgres, as \code{bytea}.} One store, one transaction, one
+backup. It is also where the trouble starts. Every row read pulls the
+blob through shared buffers; \code{pg\_dump} grows by the size of every
+essay ever submitted; each update rewrites the whole value and leaves a
+dead tuple for autovacuum; the write-ahead log carries every byte twice
+(WAL, then the page); replication streams it to every standby; and a
+download must be materialized in the JVM before it reaches the socket.
+Postgres will do it, and up to a few gigabytes nobody notices. Past that,
+every operational task --- backup, restore, replication lag, vacuum ---
+is dominated by data the database adds no value to.
+
+\textbf{On a volume mounted into the service.} Fast and simple until the
+service has two replicas on two nodes, which is the first thing
+Kubernetes wants to do. A \code{ReadWriteOnce} claim (Chapter~19) binds
+to one node; \code{ReadWriteMany} needs NFS or a storage driver, and the
+service now owns file layout, permissions, cleanup, and its own backup.
+The disk is also inside the failure domain of the pod.
+
+\textbf{In an object store.} Flat namespace, HTTP API, content-addressed
+durability, and --- decisively --- the ability to hand a client a URL and
+step out of the data path. Backups become a bucket replication rule.
+Serving becomes a CDN's job. The database keeps a 500-character key.
+
+\begin{decision}[a key in Postgres, bytes in MinIO]
+The project stores metadata in the \code{submission} table and the file
+under a key in the \code{ts-submissions} bucket. The row references the
+object by name; nothing references the row from the object. The
+alternatives lose on the axis that matters for a school: submissions are
+written once, read a few times, and kept for years --- the profile object
+storage is built for and databases are worst at. The decision would
+reverse only if files were tiny (a few KB), needed transactional
+atomicity with the row, and were read on every row access --- an avatar
+thumbnail, say. Even then the honest answer is usually ``still S3, plus
+a cache''.
+\end{decision}
+
+\section{Reading the project's code}
+
+\subsection{Two clients, two endpoints}
+
+The gateway to everything is \code{S3Config}. Read it with the compose
+environment in mind (\code{APP\_S3\_ENDPOINT=http://minio:9000},
+\code{APP\_S3\_PUBLIC\_ENDPOINT=http://localhost:9000}):
+
+\begin{lstlisting}[language=Java]
+@Bean
+public S3Client s3Client() {
+    return S3Client.builder()
+            .endpointOverride(URI.create(endpoint))            (*@\co{1}@*)
+            .region(Region.of(region))
+            .credentialsProvider(credentialsProvider())
+            .serviceConfiguration(S3Configuration.builder()
+                    .pathStyleAccessEnabled(true).build())     (*@\co{2}@*)
+            .build();
+}
+
+@Bean
+public S3Presigner s3Presigner() {
+    return S3Presigner.builder()
+            .endpointOverride(URI.create(publicEndpoint))      (*@\co{3}@*)
+            .region(Region.of(region))
+            .credentialsProvider(credentialsProvider())
+            .serviceConfiguration(S3Configuration.builder()
+                    .pathStyleAccessEnabled(true).build())
+            .build();
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The client that moves bytes talks to the
+  \emph{internal} name. Inside Compose or the cluster, \code{minio} is a
+  DNS name on the private network (Chapter~18); from a browser it is
+  nothing.
+  \item[\co{2}] Path-style addressing: the bucket goes in the URL path,
+  so the request is \code{/ts-submissions/key} on host \code{minio:9000}.
+  AWS's default is virtual-host style, where the bucket is a DNS
+  subdomain --- host \code{ts-submissions.s3.amazonaws.com}, path
+  \code{/key}. MinIO can do that too, but only
+  when it knows its own domain (\code{MINIO\_DOMAIN}) and wildcard DNS
+  exists for it; on a home network neither is true, so the path form is
+  the only one that resolves.
+  \item[\co{3}] The presigner never sends a request. It only computes
+  signatures --- and it must compute them for the host the
+  \emph{browser} will contact. This is a separate bean for that reason
+  alone. Section~\ref{sec:sigv4} explains why the host cannot be swapped
+  afterwards.
+\end{description}
+
+\subsection{The key, the upload, the download}
+
+\code{S3StorageService} is short enough to read whole; the important
+lines are these:
+
+\begin{lstlisting}[language=Java]
+@PostConstruct
+void ensureBucketExists() {
+    try {
+        s3Client.headBucket(HeadBucketRequest.builder()
+                .bucket(bucket).build());
+    } catch (NoSuchBucketException e) {                     (*@\co{1}@*)
+        s3Client.createBucket(CreateBucketRequest.builder()
+                .bucket(bucket).build());
+    }
+}
+
+public String upload(MultipartFile file, Long assignmentId,
+                     Long studentId) {
+    String key = "submissions/%d/%d/%s-%s".formatted(
+            assignmentId, studentId, UUID.randomUUID(), original); (*@\co{2}@*)
+    s3Client.putObject(PutObjectRequest.builder()
+                    .bucket(bucket).key(key)
+                    .contentType(file.getContentType())
+                    .contentLength(file.getSize()).build(),
+            RequestBody.fromInputStream(file.getInputStream(),
+                    file.getSize()));                          (*@\co{3}@*)
+    return key;
+}
+
+public String presignedDownloadUrl(String key) {
+    GetObjectPresignRequest presignRequest = GetObjectPresignRequest
+            .builder()
+            .signatureDuration(Duration.ofMinutes(presignedExpiryMinutes))
+            .getObjectRequest(GetObjectRequest.builder()
+                    .bucket(bucket).key(key).build())
+            .build();
+    return s3Presigner.presignGetObject(presignRequest).url().toString();
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Only \code{NoSuchBucketException} is caught. A
+  connection refused --- MinIO not up yet --- is an
+  \code{SdkClientException}, which escapes, fails bean creation, and
+  takes the whole service down. The Kubernetes manifest for MinIO says
+  so in its first comment: course-service will \code{CrashLoopBackOff}
+  until MinIO answers. Compose hides this with
+  \code{depends\_on: service\_healthy}.
+  \item[\co{2}] The key is the whole data model of an object store. S3
+  has no directories; the slashes are characters in a string. But
+  \emph{prefixes} are what you can list by, so
+  \code{submissions/\{assignmentId\}/\{studentId\}/} means ``every attempt
+  by this student for this assignment'' is one \code{ListObjectsV2} call
+  with a prefix. The UUID guarantees a fresh key per attempt, so
+  nothing is ever overwritten and versioning is not needed for safety.
+  The original filename is appended for human readability in the
+  console; the database keeps it separately in \code{file\_name} because
+  a key is not a good place for spaces, Unicode, or \code{..}.
+  \item[\co{3}] The bytes flow \emph{through} this JVM:
+  Spring's multipart support has already parsed them (spooled to a temp
+  file above a small threshold), and now they are streamed to MinIO. The
+  request thread is occupied for the whole transfer, twice.
+\end{description}
+
+And the seam with the relational half, in \code{SubmissionService}:
+
+\begin{lstlisting}[language=Java]
+@Transactional
+public SubmissionResponse submit(...) {
+    ...
+    if (hasFile) {
+        String key = s3StorageService.upload(file, assignmentId,
+                student.getId());                              (*@\co{1}@*)
+        submission.setFileObjectKey(key);
+        submission.setFileName(file.getOriginalFilename());
+    }
+    submission = submissionRepository.save(submission);        (*@\co{2}@*)
+    return toResponse(submission);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] An HTTP call to another system, inside a database
+  transaction. It is not, and cannot be, part of that transaction.
+  \item[\co{2}] If this insert fails --- the unique constraint on
+  \code{(assignment\_id, student\_id, attempt\_number)} loses a race
+  between two tabs, or Postgres is briefly unreachable --- the
+  transaction rolls back and the object uploaded at \co{1} stays in the
+  bucket, named by a key no row will ever record. Chapter~11 called
+  this the dual-write problem when the second system was Kafka; it is
+  the same problem with a different second system.
+\end{description}
+
+\section{Signature Version 4, and why the host is welded in}
+\label{sec:sigv4}
+
+A presigned URL is an ordinary S3 request with the authentication moved
+from headers into the query string. The project's download link looks
+like this (wrapped):
+
+\begin{lstlisting}
+http://localhost:9000/ts-submissions/submissions/7/3/2f9c...-essay.pdf
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &X-Amz-Credential=minioadmin/20260907/us-east-1/s3/aws4_request
+  &X-Amz-Date=20260907T091500Z
+  &X-Amz-Expires=900
+  &X-Amz-SignedHeaders=host
+  &X-Amz-Signature=3c1f...e9a0
+\end{lstlisting}
+
+The signature is computed in two stages. First a \emph{signing key} is
+derived from the secret through a chain of HMACs over the date, region,
+service name and the literal \code{aws4\_request}, so the secret itself
+never touches a request. Then that key signs a \emph{string to sign}
+that contains the SHA-256 of a \emph{canonical request}: the HTTP
+method, the canonical URI (bucket and key, path-style), the sorted query
+string, the signed headers, and the payload hash. Look at
+\code{X-Amz-SignedHeaders=host}: the \code{Host} header is always
+signed. Change the host --- \code{minio} to \code{localhost}, or
+\code{localhost} to \code{127.0.0.1} --- and the canonical request
+changes, the hash changes, the signature no longer matches, and MinIO
+answers \code{403 SignatureDoesNotMatch}. There is no way to sign against
+the internal name and rewrite the link for the outside world. Whoever
+signs must know the exact origin the browser will use.
+
+\begin{handson}[break a signature on purpose]
+Log in, submit an assignment with a file, and copy the
+\code{downloadUrl} the API returns. It works as issued:
+\begin{lstlisting}[language=bash]
+$ curl -s -o /dev/null -w "%{http_code}\n" "$URL"
+200
+\end{lstlisting}
+Now change nothing but the host, to an address that reaches the very
+same MinIO container:
+\begin{lstlisting}[language=bash]
+$ curl -s "${URL/localhost/127.0.0.1}" | head -c 160
+<?xml version="1.0" encoding="UTF-8"?><Error>
+<Code>SignatureDoesNotMatch</Code><Message>The request signature we
+calculated does not match the signature you provided.
+\end{lstlisting}
+Same server, same object, same credentials --- and a different
+\code{Host} header is enough. That is the whole reason
+\code{public-endpoint} exists.
+\end{handson}
+
+\begin{pitfall}[download links work in Compose and fail in the cluster]
+Symptom: on the cluster, clicking a submission's file opens
+\code{http://localhost:9000/...} and the browser shows connection
+refused. Cause: the course-service Deployment sets
+\code{APP\_S3\_ENDPOINT} to \code{http://minio:9000} but never sets
+\code{APP\_S3\_PUBLIC\_ENDPOINT}, so the config-server default
+\code{http://localhost:9000} is signed into every link --- an address
+that meant ``the developer's laptop'' and now means ``the user's
+laptop''. Fix in two parts: expose MinIO's S3 port through an Ingress
+rule on its own host (path-style signatures include the path, so the
+Ingress must not add a prefix), and set the public endpoint to that
+origin:
+\begin{lstlisting}[language=yaml]
+- { name: APP_S3_PUBLIC_ENDPOINT,
+    value: "https://files.ts-server.tailbfe002.ts.net" }
+\end{lstlisting}
+Until a second hostname exists, the honest interim is to stream
+downloads through course-service (\code{GetObject} into the response
+body) so the browser never needs to reach MinIO at all --- slower, but
+correct.
+\end{pitfall}
+
+\section{Who moves the bytes}
+
+Today's upload path is: browser $\rightarrow$ Traefik $\rightarrow$
+api-gateway $\rightarrow$ course-service $\rightarrow$ MinIO. Every hop
+sees every byte. The service enforces \code{max-file-size: 20MB} and
+\code{max-request-size: 25MB} in its multipart settings, so the worst
+case is bounded; but each upload holds a Tomcat thread and a temp file
+for its whole duration, the reactive gateway (Chapter~4) forwards the
+body chunk by chunk but still spends its event loop on it, and any
+ingress-level body limit or idle timeout applies in front of all of
+them. Under a deadline --- 200 students uploading at 23:59 --- the
+service's thread pool is the bottleneck for work it does not need to do.
+
+The alternative is the pattern Chapter~9 mentioned for downloads,
+applied to uploads: the service signs a \emph{PUT} for a key it chose,
+the browser uploads directly to MinIO, and only then does the service
+record the row. The service spends microseconds per file and never sees
+the bytes. What it gives up: it cannot inspect the content before it
+lands (virus scan, type sniffing) and it must learn, from somewhere, that
+the upload actually completed. Section~\ref{sec:presigned-put} builds
+this properly.
+
+Beyond about 100\,MB a single PUT is the wrong tool on any network:
+\emph{multipart upload} splits the object into parts of at least
+5\,MB, uploads them in parallel, resumes after a failure by re-sending
+one part, and assembles them server-side in a final call. The SDK's
+\code{S3TransferManager} does this automatically above a threshold. The
+operational tail: abandoned uploads leave invisible parts that are
+billed and counted --- every bucket should carry a lifecycle rule that
+aborts incomplete multipart uploads after a few days.
+
+\section{Pros and cons, candidly}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.62\linewidth}@{}}
+\toprule
+\textbf{Strength} & \textbf{Where the project pays for it} \\
+\midrule
+Database stays small; backup is metadata only &
+  Two stores to back up, and only one of them transactionally \\
+Standard API: MinIO today, S3 tomorrow with two env vars &
+  Two endpoints to keep straight, and the cluster gets one wrong \\
+Presigned downloads take the service out of the data path &
+  Uploads still go through the service, thread-per-file \\
+Keys give free ``directories'' by prefix &
+  Key design is a one-way door; renaming means copying \\
+Durability is storage's problem &
+  On this hardware it is one container and one 5\,GB claim \\
+Credentials are two strings &
+  They are the MinIO \emph{root} credentials, in every course-service pod \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The last row deserves emphasis. \code{minioadmin} can create buckets,
+delete buckets, and read every object in every bucket. The service
+needs \code{PutObject}, \code{GetObject} and \code{HeadBucket} on one
+bucket. Least privilege here is a MinIO user with a policy scoped to
+\code{arn:aws:s3:::ts-submissions/*}; on AWS it is an IAM role attached
+to the pod's ServiceAccount (IRSA) so that no static key exists at all.
+An interviewer who asks ``how does your service authenticate to S3?''
+is listening for whether you say ``an IAM role'' or ``a key in an env
+var'' --- and, if the latter, whether you know it is the weaker answer.
+
+\section{What breaks}
+
+\begin{pitfall}[the service that will not start without its bucket]
+Symptom: course-service in \code{CrashLoopBackOff} on a fresh cluster;
+logs end in \code{Error creating bean with name 's3StorageService'} with
+a \code{Connection refused} several causes down. Cause: the
+\code{@PostConstruct} bucket check treats any failure other than
+``bucket missing'' as fatal, and MinIO's pod is still pulling its image.
+The kubelet's restart back-off eventually lands on a moment when MinIO
+is ready, so it self-heals --- slowly. Fix: catch
+\code{SdkClientException} too, log a warning, and let the readiness
+probe (Chapter~17) keep traffic away until the first successful
+\code{headBucket}; a storage dependency should degrade the file feature,
+not the service.
+\end{pitfall}
+
+\begin{pitfall}[orphans]
+Symptom: the bucket holds more objects than the \code{submission} table
+has non-null keys; nobody notices for a year; the 5\,GB claim fills.
+Cause: the dual write in \code{submit}. Upload first, insert second: a
+failed insert orphans an object. Insert first, upload second: a failed
+upload leaves a row pointing at nothing, and the student sees ``file
+attached'' with a dead link. Neither order is safe on its own. The
+standard resolution is to make one side idempotent and the other side
+reconcilable: insert the row with status \code{PENDING\_FILE} and the
+chosen key, upload, then flip the status to \code{SUBMITTED} in a second
+transaction; a nightly job deletes objects under keys whose row is still
+\code{PENDING\_FILE} after an hour, and lists the prefix for keys no row
+names at all. Section~\ref{sec:presigned-put} folds this into the new
+flow, where it comes almost free.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+MinIO's pod is gone --- node reboot, claim not yet reattached. Walk the
+endpoints:
+
+\begin{itemize}
+  \item \textbf{Text and link submissions} still work: \code{upload} is
+  only called when a file is present, and \code{save} touches only
+  Postgres.
+  \item \textbf{File submissions} fail with a 500 after the SDK's retry
+  budget --- several seconds of a held thread each. Under load these
+  threads accumulate and starve the text submissions that would have
+  worked. This is the Chapter~17 argument for a bulkhead: a separate,
+  bounded executor for storage calls.
+  \item \textbf{Listing submissions} works and even returns download
+  links. Presigning is pure computation; no request is made. The links
+  fail only when clicked, which is the correct failure --- the metadata
+  is true, the bytes are temporarily unavailable.
+  \item \textbf{A course-service restart} during the outage does not
+  come back up, for the reason in the pitfall above. An outage of the
+  file store has become an outage of grading, enrollment, and everything
+  else the service does.
+\end{itemize}
+
+Now the other way: Postgres is down and MinIO is fine. Everything fails,
+including uploads that would have succeeded at the storage layer ---
+and each one that reached \co{1} in \code{submit} before failing at
+\co{2} left an orphan behind. A 3\,a.m. database blip produces a small
+pile of unowned objects, which is the concrete reason the reconciliation
+job exists.
+
+\section{Enhancing the resolution: presigned PUT}
+\label{sec:presigned-put}
+
+The upgrade moves the bytes off the service and closes the orphan
+window at the same time. Three calls replace one:
+
+\begin{enumerate}
+  \item \code{POST /assignments/\{id\}/submissions/upload-url} --- the
+  service checks the student may submit, chooses the key, signs a PUT,
+  and inserts a \code{PENDING\_FILE} row.
+  \item The browser PUTs the file to MinIO with that URL.
+  \item \code{POST /assignments/\{id\}/submissions} with the key --- the
+  service confirms the object exists with a \code{HEAD}, then completes
+  the row.
+\end{enumerate}
+
+The storage service gains two methods. Both are complete:
+
+\begin{lstlisting}[language=Java]
+/** Sign a PUT for a key we chose; the browser must send exactly this
+ *  content type, because it is part of the signature. */
+public String presignedUploadUrl(String key, String contentType,
+                                 long contentLength) {
+    PutObjectRequest put = PutObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .contentType(contentType)
+            .contentLength(contentLength)                  (*@\co{1}@*)
+            .build();
+    PutObjectPresignRequest req = PutObjectPresignRequest.builder()
+            .signatureDuration(Duration.ofMinutes(10))
+            .putObjectRequest(put)
+            .build();
+    return s3Presigner.presignPutObject(req).url().toString();
+}
+
+/** Confirm an object exists and report its size; empty if missing. */
+public Optional<Long> objectSize(String key) {
+    try {
+        HeadObjectResponse head = s3Client.headObject(
+                HeadObjectRequest.builder().bucket(bucket).key(key).build());
+        return Optional.of(head.contentLength());
+    } catch (NoSuchKeyException e) {                        (*@\co{2}@*)
+        return Optional.empty();
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Signing \code{Content-Length} and \code{Content-Type}
+  turns them into a contract: a browser that sends a different size or
+  type gets \code{403}. That is how the 20\,MB limit survives the move
+  out of the service.
+  \item[\co{2}] \code{HEAD} costs one round trip and no bytes. It is the
+  cheapest possible proof that step~2 happened.
+\end{description}
+
+The submission service splits its old method in two. The key prefix is
+built from server-side facts, so a client cannot claim someone else's
+upload:
+
+\begin{lstlisting}[language=Java]
+public UploadTicket prepareUpload(Long assignmentId, Long studentUserId,
+                                  String fileName, String contentType,
+                                  long size) {
+    Assignment assignment = requireOpenAssignment(assignmentId);
+    Student student = requireEnrolled(assignment, studentUserId);
+    if (size > MAX_FILE_BYTES) {
+        throw new ApiException(413, "File exceeds 20 MB");
+    }
+    String key = "submissions/%d/%d/%s-%s".formatted(
+            assignmentId, student.getId(), UUID.randomUUID(),
+            safeName(fileName));                            (*@\co{1}@*)
+    Submission pending = Submission.builder()
+            .assignment(assignment).student(student)
+            .attemptNumber(nextAttempt(assignmentId, student.getId()))
+            .fileObjectKey(key).fileName(fileName)
+            .status("PENDING_FILE")                         (*@\co{2}@*)
+            .build();
+    submissionRepository.save(pending);
+    String url = s3StorageService.presignedUploadUrl(key, contentType,
+            size);
+    return new UploadTicket(pending.getId(), key, url);
+}
+
+public SubmissionResponse completeUpload(Long submissionId,
+                                         Long studentUserId) {
+    Submission s = findOrThrow(submissionId);
+    if (!s.getStudent().getUserId().equals(studentUserId)
+            || !"PENDING_FILE".equals(s.getStatus())) {
+        throw new ApiException(409, "Nothing to complete");
+    }
+    long size = s3StorageService.objectSize(s.getFileObjectKey())
+            .orElseThrow(() -> new ApiException(400,
+                    "Upload not found; request a new upload URL")); (*@\co{3}@*)
+    if (size > MAX_FILE_BYTES) {
+        throw new ApiException(413, "File exceeds 20 MB");
+    }
+    s.setStatus("SUBMITTED");
+    return toResponse(submissionRepository.save(s));
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{safeName} strips path separators and
+  non-ASCII; the display name stays in \code{file\_name}.
+  \item[\co{2}] The row exists \emph{before} the bytes. A crash anywhere
+  after this point leaves a \code{PENDING\_FILE} row that the cleanup
+  job can find, instead of an object nobody can find.
+  \item[\co{3}] The only way to reach \code{SUBMITTED} is through a
+  successful \code{HEAD}. The row never claims a file that is not there.
+\end{description}
+
+The cleanup job is now a query, not a bucket scan:
+
+\begin{lstlisting}[language=Java]
+@Scheduled(cron = "0 15 * * * *")   // hourly, at :15
+public void reapAbandonedUploads() {
+    List<Submission> stale = submissionRepository
+            .findByStatusAndSubmittedAtBefore("PENDING_FILE",
+                    LocalDateTime.now().minusHours(1));
+    for (Submission s : stale) {
+        s3StorageService.deleteQuietly(s.getFileObjectKey()); // idempotent
+        submissionRepository.delete(s);
+    }
+}
+\end{lstlisting}
+
+MinIO must allow the browser's cross-origin PUT. The bucket's CORS rule
+is set once with the MinIO client:
+
+\begin{lstlisting}[language=bash]
+$ mc cors set local/ts-submissions cors.json
+# cors.json: allow PUT from the frontend origin, expose ETag
+{ "CORSRules": [ { "AllowedOrigins": ["http://localhost:3000"],
+    "AllowedMethods": ["PUT", "GET"],
+    "AllowedHeaders": ["Content-Type", "Content-Length"],
+    "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 3600 } ] }
+\end{lstlisting}
+
+And the frontend side is a plain \code{fetch}; no axios instance, no
+gateway, no JWT --- the URL \emph{is} the credential:
+
+\begin{lstlisting}
+const ticket = await api.post(
+  `/assignments/${id}/submissions/upload-url`,
+  { fileName: file.name, contentType: file.type, size: file.size });
+
+const put = await fetch(ticket.url, {
+  method: 'PUT',
+  headers: { 'Content-Type': file.type },   // must match the signature
+  body: file,
+});
+if (!put.ok) throw new Error(`upload failed: ${put.status}`);
+
+await api.post(`/submissions/${ticket.submissionId}/complete`);
+\end{lstlisting}
+
+\begin{decision}[presigned PUT versus proxied upload]
+Proxy when the service must see the bytes before they are stored ---
+virus scanning, image re-encoding, content-type sniffing --- or when the
+storage endpoint cannot be reached from the client at all. Presign when
+files are large or many and the service adds nothing to the transfer:
+the thread pool, the ingress body limit, and the double network hop all
+disappear. The project's case is the second, with one caveat that
+decides the order of work: presigned uploads require a browser-reachable
+MinIO origin, which the cluster does not have yet. The pitfall above and
+this enhancement share a prerequisite --- a public files hostname ---
+and should be scheduled together.
+\end{decision}
+
+\section{Outside the project}
+
+On AWS the same code runs against S3 with the endpoint override removed
+and static keys replaced by an IAM role; CloudFront signed URLs play the
+presigner's role with a CDN in front, and \emph{S3 POST policies} are the
+older, browser-form-friendly cousin of presigned PUT, with a
+\code{content-length-range} condition built in. Google Cloud Storage and
+Azure Blob Storage have the same three ideas under other names ---
+signed URLs, SAS tokens, resumable uploads. Production MinIO runs as a
+distributed set with erasure coding across drives and nodes; a single
+container with one claim is a development shape, and the SDK cannot tell
+the difference, which is the point of the standard. The interview
+version of this chapter is one question --- ``a user uploads a 2\,GB
+video; walk me through it'' --- and the senior answer names presigned or
+multipart upload, a size and type contract in the signature, a
+confirmation step, an orphan reaper, and a lifecycle rule for
+incomplete parts, in about that order.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: Users started uploading 1\,GB videos and the service runs out of memory. Fix it.}
+
+First establish that the bytes are the problem, not the metadata: a heap
+dump during an upload shows multipart buffers or a
+\code{ByteArrayOutputStream}, and the pod's memory limit
+(Chapter~17) is what kills it. The short-term fix is to make sure Spring
+spools to disk (\code{file-size-threshold} small, a temp volume with room)
+and stream to storage with a known \code{Content-Length}, as
+\code{S3StorageService.upload} already does --- that gets you to
+hundreds of MB without heap growth, but still one thread and one
+temp file per upload. The real fix is to take the service out of the
+path: presigned PUT for anything under about 100\,MB, and multipart
+upload with \code{S3TransferManager} or browser-side parts above it,
+with a lifecycle rule aborting incomplete uploads after seven days. Then
+the service's memory is independent of file size by construction, and
+\code{max-file-size} becomes a signed \code{Content-Length} instead of
+a servlet setting.
+
+\subsection*{Q: We need to serve ten thousand downloads per second. How, without touching the service?}
+
+Presigned GET already means the service does no I/O per download, only
+a signature --- microseconds, no network. Ten thousand per second is
+therefore a storage and edge question. Object stores scale reads
+horizontally by key prefix distribution; a CDN in front (CloudFront with
+signed URLs, or any CDN with origin-pull to the bucket) serves repeated
+objects from cache and absorbs the fan-out. Keep the signing cheap by
+caching nothing --- signatures are stateless --- and set the expiry to
+match the CDN's cache window so a cached object does not outlive its
+authorization by much. The trap is signing on every list call:
+\code{toResponse} in the project presigns for every row of every
+listing, which is fine at 15 minutes' expiry but means a listing of a
+thousand submissions computes a thousand HMAC chains. Sign lazily, on a
+dedicated ``get link'' endpoint, once volume justifies it.
+
+\subsection*{Q: An object exists in the bucket but the row is missing, or the row exists and the object does not. How do you reconcile?}
+
+Say first that both are expected outcomes of a dual write and that the
+fix is design, not a script. Design: write the row in a
+\code{PENDING} state with the key before the upload, confirm with
+\code{HEAD} before marking it complete, and never let a row claim a
+file it has not verified. Reconciliation then has two cheap halves. Rows
+stuck in \code{PENDING} older than the presign expiry are deleted along
+with their objects --- a query, not a scan. Objects with no row are found
+by listing the prefix and anti-joining against the table, which you can
+afford nightly because the prefix is per assignment; on AWS an S3
+Inventory report replaces the listing. Whatever you do, make the object
+delete idempotent so the job can be rerun.
+
+\subsection*{Q: How do you secure a presigned URL?}
+
+Four dials, and a senior answer names all of them. \emph{Scope}: sign
+one method on one key; a GET URL cannot be used to PUT, and a PUT URL
+cannot be used on a different key because the canonical URI is signed.
+\emph{Expiry}: minutes, not days; the project uses 15 for downloads and
+10 would do for uploads --- long enough for a slow connection, short
+enough that a leaked link in a chat log is dead by the time it is
+noticed. \emph{Content contract}: sign \code{Content-Type} and
+\code{Content-Length} on uploads so the client cannot change what it
+declared. \emph{Identity of the signer}: the credentials behind the
+signature should be a least-privilege user on that one bucket, so even a
+compromised signer cannot list or delete. And say the thing people
+forget: a presigned URL is a bearer credential --- log it nowhere,
+return it over HTTPS only, and never put it in a redirect that a proxy
+might cache.
+
+\subsection*{Q: Migrate from MinIO to AWS S3 with zero downtime.}
+
+Because the code speaks the S3 API, the migration is a data move plus a
+config change, and the trick is ordering. Set up bucket replication or
+run \code{mc mirror --watch} from MinIO to the S3 bucket until the lag
+is seconds. Switch \emph{writes} first by changing
+\code{APP\_S3\_ENDPOINT} and credentials (an IAM role, now) on a rolling
+restart --- new objects land in S3, mirroring keeps copying anything
+still landing in MinIO from pods not yet restarted. Switch the
+\emph{public endpoint} last, after a final mirror pass, so download
+links are only ever signed for a host that has the object. Keys do not
+change, so the database needs no migration. Keep MinIO read-only for a
+week as a fallback, then decommission. The thing that breaks is
+addressing: virtual-host style becomes available, path-style keeps
+working, and any code that concatenated URLs by hand instead of asking
+the SDK is where you will find the bug.
+
+\subsection*{Q: Storage cost is growing every month. What do you do?}
+
+Measure by prefix first --- which assignments, which years. Then use the
+store's own tools rather than application logic: a lifecycle rule that
+transitions objects older than a term to an infrequent-access tier, and
+older than the retention policy to archive or deletion; an abort rule
+for incomplete multipart uploads, which are invisible and billed; and
+versioning off, or with expiry, unless a compliance need says otherwise.
+In the application, stop storing what you can regenerate (thumbnails,
+transcodes) and deduplicate by content hash if students upload the same
+template. On this project the numbers are small --- 250 uploads of
+20\,MB fill the 5\,GB claim --- but the same rule set is what keeps an
+S3 bill flat at a thousand times the size.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Two beans, \code{S3Client} and \code{S3Presigner}, share
+  credentials and region and differ in one line. Name the line, and
+  explain what goes wrong if the presigner used the internal endpoint.
+  \item A colleague suggests keeping one endpoint and having the gateway
+  rewrite \code{minio:9000} to the public host in the JSON response.
+  Using the structure of a Version 4 signature, explain why the rewritten
+  link returns 403.
+  \item In \code{SubmissionService.submit}, the upload happens inside a
+  \code{@Transactional} method. State what the transaction does and does
+  not cover, and describe the artifact left behind by a failed
+  \code{save}.
+  \item The key layout is \code{submissions/\{assignment\}/\{student\}/\{uuid\}-\{name\}}.
+  Give one operation the layout makes cheap and one it makes expensive,
+  and say why the UUID makes bucket versioning unnecessary for safety.
+  \item MinIO goes down at 3\,a.m. Which of these still succeed:
+  submitting a text answer, listing submissions, opening a download
+  link, restarting course-service? Explain each in one clause.
+  \item In the presigned-PUT flow, an attacker obtains a valid upload
+  URL from their own session and tries to attach that object to another
+  student's submission. Identify the two checks that stop them.
+\end{enumerate}
+\end{quiz}

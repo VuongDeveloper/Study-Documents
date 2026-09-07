@@ -1,0 +1,673 @@
+\chapter{Deep Dive: The Browser Meets the Gateway --- Token Storage, Refresh Flow, and CORS}
+\label{ch:dd-frontend-auth}
+
+Chapter~26 put the React application on the same origin as the API and
+noted, almost in passing, that CORS ``is simply never consulted''.
+Chapter~28 pushed the token design from the server's side. This deep
+dive takes the other end of the wire: the browser, which is the one
+runtime in the system that you do not control, that runs code injected
+by anyone who can get a script tag onto your page, and that will
+happily send a cookie to an attacker's form. Every decision about where
+a token lives is a decision about which of those threats you accept.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{Where does the token live} in the browser, and which
+  attack does each home expose it to?
+  \item \textbf{What happens at expiry} --- how the refresh flow runs,
+  and why ten tabs must produce one refresh call?
+  \item \textbf{What is CORS protecting}, what does it cost per
+  request, and why does one origin make it vanish?
+\end{enumerate}
+
+\section{Why this, and what it solves}
+
+The server issues two credentials (Chapter~5): a 15-minute JWT access
+token and a 7-day opaque refresh token. The browser must keep both
+across page reloads, attach the first to every API call, and exchange
+the second for a fresh first when it expires --- without the user
+noticing. The project's answer is a Zustand store with the
+\code{persist} middleware and an axios interceptor. Read the store
+first:
+
+\begin{lstlisting}
+export const useAuthStore = create<AuthState>()(
+  persist(                                            (*@\co{1}@*)
+    (set) => ({
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      isAuthenticated: false,
+      setTokens: (accessToken, refreshToken) =>
+        set({ accessToken, refreshToken, isAuthenticated: true }),
+      setUser: (user) => set({ user }),
+      logout: () =>
+        set({ accessToken: null, refreshToken: null,
+              user: null, isAuthenticated: false }),
+    }),
+    { name: 'auth-storage' }                          (*@\co{2}@*)
+  )
+);
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{persist} writes the whole state to storage on
+  every change and rehydrates it on page load. That is what survives a
+  reload; without it every refresh of the page would be a logout.
+  \item[\co{2}] The storage key. The default backend is
+  \code{localStorage}, so open DevTools, Application, Local Storage,
+  and there they are: both tokens, in clear text, under
+  \code{auth-storage}. Any script running on the page can read them
+  with one line.
+\end{description}
+
+\begin{decision}[localStorage, for a first version]
+The project stores both tokens in \code{localStorage} because it is the
+simplest thing that survives a reload, works identically on
+\code{localhost:3000} and \code{ts.local}, needs no cookie
+configuration on the server, and sidesteps CSRF entirely --- a token
+that JavaScript attaches by hand is never sent by the browser on its
+own. The price is that the tokens are exactly as safe as every script
+on the page. That was acceptable while the page loads only its own
+bundle. It stops being acceptable the day a third-party script (an
+analytics tag, a chat widget, a compromised npm dependency) runs on the
+same origin: any of them can read \code{auth-storage} and ship a 7-day
+refresh token elsewhere. The upgrade in Section~\ref{sec:fe-enhance}
+moves the refresh token into an \code{HttpOnly} cookie and keeps the
+access token in memory --- more moving parts, but a script can no
+longer steal the long-lived credential.
+\end{decision}
+
+\section{The refresh flow, as written}
+
+\subsection{The interceptor}
+
+Every API call goes through one axios instance:
+
+\begin{lstlisting}
+const apiClient = axios.create({ baseURL: '/api' });   (*@\co{1}@*)
+
+apiClient.interceptors.request.use((config) => {
+  const token = useAuthStore.getState().accessToken;
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;                                        (*@\co{2}@*)
+});
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+    if (error.response?.status === 401
+        && !originalRequest._retry) {                   (*@\co{3}@*)
+      originalRequest._retry = true;
+      const refreshToken = useAuthStore.getState().refreshToken;
+      if (refreshToken) {
+        try {
+          const { data } = await axios.post(            (*@\co{4}@*)
+              '/api/auth/refresh', { refreshToken });
+          useAuthStore.getState()
+              .setTokens(data.accessToken, data.refreshToken);
+          originalRequest.headers.Authorization =
+              `Bearer ${data.accessToken}`;
+          return apiClient(originalRequest);            (*@\co{5}@*)
+        } catch {
+          useAuthStore.getState().logout();
+          window.location.href = '/login';
+        }
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A relative base URL. In development Vite's proxy
+  forwards \code{/api} to \code{localhost:8080}; in the cluster Traefik
+  does (Chapter~26). The browser never sees a second origin.
+  \item[\co{2}] The bearer header is attached by code on every request.
+  This is the CSRF immunity mentioned above: a form on
+  \code{evil.example} cannot make the browser add this header.
+  \item[\co{3}] A 401 from the gateway --- the JSON body ``Invalid or
+  expired token'' from \code{JwtAuthenticationFilter} --- triggers one
+  retry per request, flagged on the config object so a second 401
+  falls through to the caller.
+  \item[\co{4}] The refresh call deliberately uses the \emph{bare}
+  \code{axios}, not \code{apiClient}: otherwise a 401 from
+  \code{/refresh} itself would re-enter this interceptor and loop.
+  \item[\co{5}] The original request is replayed with the new token.
+  The caller's \code{await} resolves as if nothing happened.
+\end{description}
+
+This is correct for one request. It is wrong for a page.
+
+\subsection{The single-flight problem}
+
+\code{DashboardPage} mounts and TanStack Query fires its queries in
+parallel: courses, assignments, the user profile, dictionary counts.
+If the access token expired while the laptop was closed, all of them
+return 401 within the same few milliseconds, and each one runs the
+interceptor independently. Four requests, four calls to
+\code{/api/auth/refresh}, four new access tokens, and --- because
+\code{setTokens} runs four times --- whichever response lands last
+wins. Today that is harmless because auth-service returns the same
+refresh token every time (Chapter~28 called this out as the missing
+rotation). Add rotation, which you should, and the race becomes fatal:
+the first refresh invalidates the token the other three are about to
+present, they fail, and the user is logged out by the very mechanism
+meant to keep them in.
+
+The fix is a \emph{single-flight} refresh: the first 401 starts one
+refresh and stores its promise; every concurrent 401 awaits the same
+promise instead of starting its own; when it resolves, all of them
+replay with the same new token. Section~\ref{sec:fe-enhance} has the
+complete code. Interviewers ask this as ``ten tabs hit 401 at once ---
+how many refresh calls?'' and the senior answer is ``one per tab
+without coordination, one in total with a lock across tabs'', followed
+by naming the tool for the cross-tab case: the \code{Web Locks} API or
+a \code{BroadcastChannel}, since each tab has its own JavaScript heap
+and cannot see another tab's pending promise.
+
+\subsection{Logout and the OAuth callback}
+
+\code{Header.handleLogout} posts the refresh token to
+\code{/api/auth/logout}, which deletes its row, then clears the store
+and navigates to \code{/login}. That revokes the 7-day credential
+immediately. The 15-minute access token is not revoked --- it cannot
+be, per Chapter~28 --- so a copy taken before logout keeps working
+until it expires. ``How do you log a user out everywhere?'' has the
+same answer with one more step: delete \emph{all} of the user's
+refresh-token rows, not just the one this browser holds, and accept
+the 15-minute window or add the \code{jti} deny-list.
+
+The Google login lands on \code{OAuthCallbackPage} with both tokens as
+query parameters --- \code{OAuth2LoginSuccessHandler} builds the
+redirect that way. The page reads them, stores them, and navigates
+with \code{replace: true} so the URL with the tokens does not stay in
+history. That last detail matters more than it looks: a URL is copied
+into the browser history, into the \code{Referer} header of any
+resource the page loads next, and into server access logs. The
+\code{replace} shortens the exposure; it does not remove it from the
+gateway's and auth-service's access logs, which now contain a valid
+refresh token in plain text.
+
+\section{CORS: the policy you are not using}
+
+Same-origin policy is the browser's rule that a script loaded from
+origin A may not \emph{read} responses from origin B. CORS is the
+protocol by which B can relax that rule per origin. The project's
+gateway has a \code{CorsConfig} that lists \code{localhost:3000} and
+\code{localhost:5173}, allows all methods and headers, and sets
+\code{allowCredentials(true)}. Read it against the two ways the app is
+actually served:
+
+\begin{itemize}
+  \item \textbf{Development.} Vite serves the page on \code{:3000} and
+  \emph{proxies} \code{/api} to \code{:8080}. The browser sends
+  requests to \code{:3000}; Vite forwards them server-side. No
+  cross-origin request exists, so no preflight, so \code{CorsConfig}
+  is never exercised.
+  \item \textbf{Cluster.} Traefik routes \code{/api} to the gateway
+  and everything else to nginx on the same host (Chapter~26). Same
+  origin again.
+\end{itemize}
+
+\code{CorsConfig} therefore serves exactly one scenario: someone
+running the built bundle from a different origin --- say, opening
+\code{dist/index.html} through a static server on \code{:5173} without
+the proxy. It is a safety net, and a permissive one:
+\code{addAllowedHeader("*")} plus credentials is the widest policy
+Spring will accept without throwing.
+
+What CORS would cost if it were active is worth knowing for the
+interview. A request with a JSON body and an \code{Authorization}
+header is not a ``simple request'', so the browser first sends an
+\code{OPTIONS} preflight asking whether the method and headers are
+allowed. That is one extra round trip per distinct request, cacheable
+by \code{Access-Control-Max-Age}, which the project's config does not
+set --- so every call would preflight. On a 40\,ms link, every API
+call becomes 80\,ms before any work happens. One origin removes that
+cost entirely, which is the performance argument for Chapter~26's
+design on top of the security one.
+
+\section{Pros and cons}
+
+\begin{center}
+\begin{tabular}{@{}p{0.30\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+ & \textbf{localStorage + bearer (today)} & \textbf{HttpOnly cookie} \\
+\midrule
+XSS steals the token & yes, both tokens, one line of JS & no --- script
+cannot read the cookie \\
+CSRF & immune: header is attached by code & exposed unless
+\code{SameSite} + CSRF token or custom-header check \\
+Survives reload & yes, via \code{persist} & yes, the browser keeps it \\
+Multi-tab & each tab reads storage; refresh races & same cookie in every
+tab; refresh races still \\
+Works cross-origin & yes & needs \code{Allow-Credentials} and an exact
+origin list \\
+Server changes & none & set-cookie on login, read-cookie on refresh \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The honest summary a senior engineer gives: bearer-in-storage trades a
+CSRF problem you can solve for an XSS problem you cannot. Any injected
+script defeats it completely. Cookies trade the other way, and their
+problem has known, mechanical fixes.
+
+\section{What breaks}
+
+\begin{pitfall}[four refreshes, one winner]
+Symptom: after leaving the app open overnight, the first click works,
+then the user is sent to \code{/login} even though nothing is wrong
+with their account. Cause: parallel 401s each ran the interceptor;
+with refresh-token rotation on the server, the second refresh
+presented a token the first had just invalidated, and the
+\code{catch} branch logged the user out. Fix: the single-flight
+interceptor in Section~\ref{sec:fe-enhance}. Without rotation the
+symptom is only wasted calls --- which is why the race is invisible
+today.
+\end{pitfall}
+
+\begin{pitfall}[the token in the URL]
+Symptom: a refresh token appears in the gateway's access log, in
+Traefik's log, and in the browser history of a shared computer. Cause:
+\code{OAuth2LoginSuccessHandler} passes both tokens as query
+parameters of the redirect to \code{/oauth/callback}. Fix: put the
+tokens in the URL \emph{fragment} (\code{\#accessToken=...}) --- the
+fragment is never sent to any server --- or better, return only a
+one-time code that the page exchanges for tokens with a POST. The
+cookie design below removes the refresh token from the URL entirely.
+\end{pitfall}
+
+\begin{pitfall}[a 401 that is not about the token]
+Symptom: a wrong password on the login page briefly flashes the app
+shell, then returns to \code{/login}. Cause: auth-service answers a
+bad login with 401; the interceptor treats \emph{every} 401 as ``token
+expired'' and, if a stale refresh token exists in storage from an
+earlier session, tries to refresh, fails, and runs \code{logout()} plus
+a hard redirect. Fix: exempt the auth endpoints from the refresh path
+(\code{originalRequest.url} starting with \code{/auth/}), and clear the
+store on the login page's mount.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+Three failures that only the client sees.
+
+\begin{itemize}
+  \item \textbf{The laptop closed for eight days.} On return the
+  access token is long dead and the refresh token expired yesterday.
+  The first request gets 401, the refresh gets 401 (auth-service
+  deletes the expired row and throws), the interceptor logs the user
+  out. Correct behaviour --- but every in-flight query on the page
+  fails first, and TanStack Query may retry them three times each
+  before the redirect lands. Set \code{retry: false} for 401s in the
+  query client's default options, or the user watches spinners for
+  ten seconds before being sent to login.
+  \item \textbf{Client clock skew.} The project never checks
+  \code{exp} on the client, and that is right: the client's clock is
+  not trustworthy and the gateway decides. A ``smart'' client that
+  pre-emptively refreshes when \code{exp} is near will, on a machine
+  whose clock is 20 minutes fast, refresh on every request --- or, 20
+  minutes slow, never refresh and get 401 anyway. Let the server's 401
+  be the signal.
+  \item \textbf{CORS misconfigured in production only.} The symptom is
+  a console error, ``No Access-Control-Allow-Origin header'', on a
+  request that returns 200 in the network tab. The browser got the
+  response and refused to hand it to the script. It happens when the
+  page and API are on different origins in production (a CDN for the
+  bundle, the gateway on another host) and the gateway's allowed list
+  still says \code{localhost}. The check is always the same: compare
+  the \code{Origin} request header with the \code{allowedOrigins}
+  list, character for character, scheme and port included. And note
+  the shape of the error: it is never visible to the server, whose
+  logs show a successful request.
+\end{itemize}
+
+\section{Enhancing the resolution}
+\label{sec:fe-enhance}
+
+The target design: the access token lives only in JavaScript memory
+(lost on reload, restored by a silent refresh); the refresh token lives
+in an \code{HttpOnly} cookie that JavaScript cannot read and the
+browser sends only to the refresh endpoint.
+
+\textbf{1. Auth-service sets the cookie.} On login, 2FA verification,
+and refresh, the controller returns the access token in the body and
+the refresh token in a cookie:
+
+\begin{lstlisting}[language=Java]
+private ResponseCookie refreshCookie(String value, long maxAgeSec) {
+    return ResponseCookie.from("refresh_token", value)
+            .httpOnly(true)       // no document.cookie access
+            .secure(true)         // HTTPS only; false on plain localhost
+            .sameSite("Strict")   // never sent from another site
+            .path("/api/auth/refresh")   // only this endpoint sees it
+            .maxAge(maxAgeSec)
+            .build();
+}
+
+@PostMapping("/login")
+public ResponseEntity<LoginResponse> login(
+        @Valid @RequestBody LoginRequest request) {
+    LoginResponse r = authService.login(request);
+    if (r.refreshToken() == null) {          // 2FA or password change
+        return ResponseEntity.ok(r);
+    }
+    return ResponseEntity.ok()
+            .header(HttpHeaders.SET_COOKIE, refreshCookie(
+                    r.refreshToken(),
+                    jwtService.getRefreshTokenExpiryMs() / 1000).toString())
+            .body(new LoginResponse(r.accessToken(), null,
+                    false, false, null));    // token not in the body
+}
+
+@PostMapping("/refresh")
+public ResponseEntity<LoginResponse> refresh(
+        @CookieValue(name = "refresh_token", required = false)
+        String cookie) {
+    if (cookie == null) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+    }
+    LoginResponse r = authService.refreshToken(
+            new TokenRefreshRequest(cookie));
+    return ResponseEntity.ok()
+            .header(HttpHeaders.SET_COOKIE, refreshCookie(
+                    r.refreshToken(),
+                    jwtService.getRefreshTokenExpiryMs() / 1000).toString())
+            .body(new LoginResponse(r.accessToken(), null,
+                    false, false, null));
+}
+
+@PostMapping("/logout")
+public ResponseEntity<Void> logout(
+        @CookieValue(name = "refresh_token", required = false)
+        String cookie) {
+    if (cookie != null) authService.logout(cookie);
+    return ResponseEntity.noContent()
+            .header(HttpHeaders.SET_COOKIE,
+                    refreshCookie("", 0).toString())   // delete it
+            .build();
+}
+\end{lstlisting}
+
+The cookie's \code{path} is the strongest of the four attributes: even
+if some other endpoint were vulnerable, the browser never attaches this
+cookie to it. Note the path is the \emph{gateway's} view
+(\code{/api/auth/refresh}), because the browser talks to the gateway;
+the gateway strips the prefix afterwards. \code{SameSite=Strict} is
+the CSRF defence: a cross-site form POST does not carry the cookie at
+all. The JSON body requirement on \code{/refresh} is a second layer ---
+a plain HTML form cannot send \code{application/json} without a
+preflight, which the same-origin design would not grant to another
+site.
+
+\textbf{2. The client keeps the access token in memory.} The store
+drops \code{persist} and the refresh token entirely:
+
+\begin{lstlisting}
+export const useAuthStore = create<AuthState>()((set) => ({
+  accessToken: null,          // memory only: gone on reload, by design
+  user: null,
+  isAuthenticated: false,
+  setAccessToken: (accessToken) =>
+    set({ accessToken, isAuthenticated: true }),
+  setUser: (user) => set({ user }),
+  logout: () =>
+    set({ accessToken: null, user: null, isAuthenticated: false }),
+}));
+\end{lstlisting}
+
+On page load nothing is in memory; the app performs one silent refresh
+before rendering protected routes. A reload therefore costs one
+round-trip to \code{/api/auth/refresh}, and if the cookie is gone the
+user is at \code{/login} --- the same behaviour as an expired session.
+
+\textbf{3. Single-flight refresh with replay.} The interceptor keeps
+one pending promise and a queue of requests waiting on it:
+
+\begin{lstlisting}
+let refreshing: Promise<string> | null = null;   // module-level lock
+
+async function refreshAccessToken(): Promise<string> {
+  if (!refreshing) {                              // first 401 starts it
+    refreshing = axios
+      .post('/api/auth/refresh', null, { withCredentials: true })
+      .then(({ data }) => {
+        useAuthStore.getState().setAccessToken(data.accessToken);
+        return data.accessToken as string;
+      })
+      .finally(() => { refreshing = null; });     // release the lock
+  }
+  return refreshing;                              // others await it
+}
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const original = error.config;
+    const isAuthCall = original.url?.startsWith('/auth/');
+    if (error.response?.status !== 401 || original._retry
+        || isAuthCall) {
+      return Promise.reject(error);
+    }
+    original._retry = true;
+    try {
+      const token = await refreshAccessToken();    // shared promise
+      original.headers.Authorization = `Bearer ${token}`;
+      return apiClient(original);                  // replay
+    } catch {
+      useAuthStore.getState().logout();
+      window.location.href = '/login';
+      return Promise.reject(error);
+    }
+  }
+);
+\end{lstlisting}
+
+Ten concurrent 401s now produce one POST; the other nine
+\code{await} the same promise and replay with the token it resolves
+to. \code{withCredentials: true} is what makes axios send the cookie
+--- and what makes the request \emph{credentialed} for CORS purposes.
+For cross-tab coordination, wrap the body of
+\code{refreshAccessToken} in \code{navigator.locks.request('refresh',
+...)}: the Web Locks API is process-wide, so tabs take turns, and the
+second tab's refresh finds a rotated cookie already set by the first
+and simply succeeds.
+
+\textbf{4. The gateway, if a second origin ever appears.} Credentialed
+requests forbid the wildcard; the origin must be listed exactly and the
+preflight cached:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowed-origins:
+              - https://app.teachersupporter.example   # exact, with scheme
+            allowed-methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+            allowed-headers: [Authorization, Content-Type]
+            allow-credentials: true                   # cookies cross-origin
+            max-age: 3600                             # cache the preflight
+\end{lstlisting}
+
+With \code{SameSite=Strict} the cookie would still not travel to a
+different site, so a genuinely cross-site deployment needs
+\code{SameSite=None; Secure} and accepts the CSRF exposure that comes
+with it --- the reason the same-origin design of Chapter~26 is the one
+to keep.
+
+\begin{handson}[watch the cookie do its job]
+After deploying the cookie version, log in through the UI, then inspect
+what the browser holds and what it sends:
+\begin{lstlisting}[language=bash]
+$ curl -si -c jar.txt -X POST http://localhost:8080/api/auth/login \
+    -H 'Content-Type: application/json' \
+    -d '{"email":"teacher@ts.local","password":"secret"}' | grep -i set-cookie
+Set-Cookie: refresh_token=3f9c...; Path=/api/auth/refresh; Max-Age=604800;
+  HttpOnly; SameSite=Strict
+$ curl -s -b jar.txt -X POST http://localhost:8080/api/auth/refresh \
+    | jq .accessToken
+"eyJhbGciOiJIUzI1NiJ9..."
+$ curl -s -b jar.txt -o /dev/null -w '%{http_code}\n' \
+    http://localhost:8080/api/courses
+401
+\end{lstlisting}
+The last line is the \code{path} attribute at work: the cookie exists
+in the jar but curl, like a browser, does not send it to
+\code{/api/courses}. In DevTools the same cookie shows a padlock in the
+HttpOnly column and \code{document.cookie} returns an empty string.
+\end{handson}
+
+\section{Outside the project}
+
+The pattern above --- access token in memory, refresh token in an
+\code{HttpOnly} cookie, silent refresh on load --- is what Auth0's
+SPA SDK, Okta's, and most bank web apps implement, usually with refresh
+rotation and reuse detection on the server. The alternative that
+removes the browser from token handling altogether is the
+\emph{backend-for-frontend}: a small server (or the gateway itself)
+holds the tokens in a server-side session, and the browser carries only
+an ordinary session cookie; Spring Cloud Gateway supports this with its
+\code{TokenRelay} filter and an OIDC login. Interviewers ask ``where
+do you store the JWT in the browser?'' hoping for ``nowhere that a
+script can read it, and the refresh token never in the URL'' followed
+by the trade-off table above. ``What about XSS?'' has one answer that
+is not about storage at all: a Content Security Policy that stops
+foreign scripts from running in the first place, which is the defence
+every storage choice still depends on.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: Where do you store the JWT in the browser, and why?}
+
+Start by separating the two tokens, because they have different
+lifetimes and different blast radii. The 15-minute access token can
+live in JavaScript memory: losing it on reload costs one silent refresh,
+and a script that steals it has fifteen minutes. The refresh token is
+the credential that matters --- seven days here --- and it belongs in an
+\code{HttpOnly}, \code{Secure}, \code{SameSite=Strict} cookie scoped by
+\code{Path} to the refresh endpoint, so no script can read it and the
+browser only ever sends it to one URL. \code{localStorage}, which this
+project uses today, is defensible for a first version and indefensible
+once any third-party script runs on the page: one \code{JSON.parse}
+away from a week of access. The senior close is that storage is the
+second line; the first is a Content Security Policy that keeps
+injected scripts from executing at all.
+
+\subsection*{Q: Ten tabs get a 401 at the same moment. How many refresh calls happen?}
+
+With the interceptor as written, ten --- each tab has its own memory
+and its own pending request, and within a single tab each parallel
+query runs the interceptor separately, so it can be more than ten. With
+refresh-token rotation on the server that is not waste, it is an
+outage: the first refresh rotates the token, the other nine present the
+old one and are rejected, and the reuse detection that good servers
+implement revokes the whole family. Inside one tab the fix is a shared
+promise --- first 401 starts the refresh, later 401s await it, all
+replay with the result. Across tabs it is \code{navigator.locks}: tabs
+take the lock in turn, and the second finds the cookie already rotated
+and succeeds with a normal refresh. The follow-up worth volunteering is
+that the server should tolerate a short grace window on the previous
+token, a few seconds, because network reordering means the ``old''
+token can legitimately arrive after the rotation.
+
+\subsection*{Q: XSS versus CSRF --- which one does each storage choice expose you to?}
+
+Bearer tokens in storage: immune to CSRF, because the browser never
+attaches an \code{Authorization} header on its own, and fully exposed
+to XSS, because any script on the origin reads storage. Cookies: immune
+to XSS reading when \code{HttpOnly}, and exposed to CSRF because the
+browser attaches cookies to any request to that host, including one
+from an attacker's page --- unless \code{SameSite=Strict} or
+\code{Lax} stops it, and a custom-header or token check backs that up
+for older clients. So the real choice is between a problem with a
+mechanical fix (CSRF) and one without (XSS). A senior engineer adds
+that XSS on a page with an \code{HttpOnly} cookie can still \emph{use}
+the session while the page is open --- it just cannot exfiltrate the
+credential --- which is why short access tokens and server-side
+revocation still matter.
+
+\subsection*{Q: A user closes the laptop for eight days and comes back. What happens?}
+
+Both credentials are dead: the access token by fifteen minutes, the
+refresh token by a day. The first API call gets 401, the interceptor
+calls refresh, auth-service finds the row expired, deletes it and
+answers 401, and the client logs out and redirects to
+\code{/login}. That is the correct outcome; the quality question is
+what the user sees on the way. Every query that was in flight fails
+first, and if the query client retries failed requests three times
+with backoff --- TanStack Query's default --- the redirect is preceded
+by several seconds of spinners and repeated 401s in the log. Configure
+the query client not to retry on 401, run one refresh on app mount
+before rendering protected routes, and the eight-day return is a clean
+bounce to login with the intended route preserved for after.
+
+\subsection*{Q: How do you log a user out everywhere?}
+
+The refresh side is a database operation: delete every row in
+\code{refresh\_tokens} for that user, not only the one the current
+browser presented. Every other device fails its next refresh and lands
+on login within fifteen minutes. The access side is the Chapter~28
+problem --- a signed token cannot be recalled --- so state the window
+honestly and name the two ways to close it: a \code{jti} deny-list in
+Redis checked by the gateway, or shorter access tokens. In this project
+the concrete change is one repository method,
+\code{deleteAllByUser(user)}, called from a new
+\code{/auth/logout-all} endpoint and from the admin's disable-user
+action. Mention the interview trap: a client-side ``logout'' that only
+clears storage revokes nothing --- the token is still valid in whoever
+copied it.
+
+\subsection*{Q: A CORS error appears in production but never in development. What do you check?}
+
+First, whether the request is cross-origin at all in production and not
+in development --- in this project Vite's proxy and Traefik both keep
+the page and the API on one origin, so a CORS error in production means
+the deployment split them: a CDN for the bundle, a different host or
+port for the gateway. Then compare the \code{Origin} header the browser
+sent, byte for byte including scheme and port, against the gateway's
+allowed list; \code{https://app.example} and
+\code{https://app.example:443} are different strings to Spring. Then
+the credentials rule: with cookies or \code{withCredentials}, the
+wildcard origin is rejected by the browser even if the server sends it,
+and \code{Access-Control-Allow-Credentials: true} must be present. Then
+the preflight: an \code{OPTIONS} that hits a route which strips the
+prefix and forwards to a service returns that service's 401 instead of
+the CORS headers, so CORS must be answered at the gateway before
+routing --- which \code{CorsWebFilter} does. Last, look at the server
+logs and expect to find nothing: the request succeeded there; the
+browser is the one refusing, and that is the shape of every CORS
+problem.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Open DevTools on the running app and name the storage key that
+  holds both tokens. Write the one-line JavaScript expression an
+  injected script would use to read the refresh token, and say what it
+  can do with it for the next seven days.
+  \item The interceptor calls bare \code{axios} for the refresh
+  instead of \code{apiClient}. Explain the loop that would otherwise
+  occur, step by step, starting from a 401 on \code{/refresh}.
+  \item With refresh-token rotation enabled on the server, trace four
+  parallel 401s through the interceptor as written and state at which
+  step the user is logged out. Then explain why the single-flight
+  version avoids it.
+  \item The cookie design sets \code{Path=/api/auth/refresh}. Give two
+  distinct attacks this attribute blunts, and explain why the path is
+  written from the gateway's point of view rather than
+  auth-service's.
+  \item \code{CorsConfig} lists two origins and allows credentials. In
+  which of the project's two deployment modes is it consulted, and what
+  single change to the deployment would make it matter?
+  \item A user reports a CORS error; the gateway log shows the request
+  returned 200. Explain why both observations are true at once, and
+  list the three header values you would compare first.
+\end{enumerate}
+\end{quiz}

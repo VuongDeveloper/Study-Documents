@@ -1,0 +1,628 @@
+\chapter{Deep Dive: The Dictionary on MongoDB --- Document Modeling, Regex Search, and Honest Trade-offs}
+\label{ch:dd-mongo}
+
+Chapter~8 made the case for the dictionary as the project's document
+service: an entry is read as a unit, written as a unit, and naturally
+nested. That case is sound. This chapter tests it the way a skeptical
+senior engineer would --- by reading the queries the service actually
+runs, asking what each one costs at ten thousand words per user, and
+admitting where a relational database would have done as well. The goal
+is not to reverse the decision but to let you defend either side of it
+in an interview, with the code in front of you.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{What does the document model buy here}, and what would
+  Postgres with \code{jsonb} have cost instead?
+  \item \textbf{How does the search query actually execute} --- which
+  part touches an index, which part scans, and where does the page get
+  built?
+  \item \textbf{What breaks when a dictionary gets big} --- and which of
+  those breaks are Mongo's fault, and which are the code's?
+\end{enumerate}
+
+\section{Why MongoDB here, and what it solves}
+
+Open \code{WordDefinition}. It is the whole schema of the service:
+
+\begin{lstlisting}[language=Java]
+@Document(collection = "word_definitions")
+public class WordDefinition {
+    @Id private String id;
+    private String word;
+    private String createdByUserId;                       (*@\co{1}@*)
+    private String meaning;
+    private String usage;
+    private String notes;
+    private List<String> examples;
+    private List<String> tags;                            (*@\co{2}@*)
+    /** Image attachments stored inline as base64 data URLs. */
+    private List<String> images;                          (*@\co{3}@*)
+    private Map<String, Object> extra;                    (*@\co{4}@*)
+    @CreatedDate private Instant createdAt;
+    @LastModifiedDate private Instant updatedAt;
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Every query in the service is scoped by this field. It
+  is the tenant fence and, as we will see, the only thing the index
+  helps with.
+  \item[\co{2}] Two arrays embedded in the document. In Postgres these
+  are two child tables or two \code{text[]} columns; here they are part
+  of the entry and cost nothing to fetch with it.
+  \item[\co{3}] Images as inline base64 strings. This is Chapter~35's
+  ``bytes in the database'' in document clothing, with a hard ceiling
+  attached: a BSON document may not exceed 16\,MB. A dozen phone photos
+  and a word cannot be saved at all.
+  \item[\co{4}] A free-form map. The document model's escape hatch:
+  fields the code does not know about yet. Also the reason
+  ``schemaless'' needs discipline (Chapter~8).
+\end{description}
+
+What the model buys: one read returns everything the page needs, no
+joins, no N+1 across tables; adding a field is a code change, not a
+migration; and the shape on the wire is the shape on disk, which makes
+the service almost entirely glue. What it costs: relationships between
+entries (\code{WordLink}) are not part of the document and must be
+traversed by hand; every array field is un-indexable-by-prefix for
+substring search; and nothing stops a document from growing without
+bound.
+
+\begin{decision}[MongoDB, and the case for having chosen Postgres]
+The dictionary is a per-user notebook with nested, optional, evolving
+fields --- the document model's home turf --- and it shares nothing
+with the relational services, so isolation costs nothing. That is a
+good reason. The honest counter: Postgres has \code{jsonb} for the
+nested parts, \code{text[]} with a GIN index for tags,
+\code{pg\_trgm} for exactly the substring search this service runs, and
+recursive CTEs for the word graph, all in a database the team already
+operates twice. A senior answer to ``why Mongo?'' is therefore not
+``because documents''; it is ``because the data is document-shaped
+\emph{and} we accepted a second database to keep the service
+independently deployable and to learn polyglot persistence --- and here
+is what it cost us''. What would flip it: a requirement to join words
+to courses or users, or an operations team unwilling to run a second
+engine.
+\end{decision}
+
+\section{Reading the search path}
+
+The endpoint everyone uses is search. It runs through three pieces of
+code. The repository query:
+
+\begin{lstlisting}[language=Java]
+@Query("{ 'createdByUserId': ?0, '$or': [ "
+        + "{ 'word': { '$regex': ?1, '$options': 'i' } }, "
+        + "{ 'tags': { '$regex': ?1, '$options': 'i' } } ] }")
+List<WordDefinition> searchByWordOrTag(String userId, String regex);
+\end{lstlisting}
+
+The index that exists, from \code{MongoIndexConfig}:
+
+\begin{lstlisting}[language=Java]
+mongoTemplate.indexOps("word_definitions")
+        .ensureIndex(new Index().on("createdByUserId", Sort.Direction.ASC));
+\end{lstlisting}
+
+And the service method that turns the list into a page:
+
+\begin{lstlisting}[language=Java]
+List<WordDefinitionResponse> responses = wordDefinitionRepository
+        .searchByWordOrTag(userId, escapeRegex(query.trim()))   (*@\co{1}@*)
+        .stream()
+        .map(w -> toResponse(w, userId))                        (*@\co{2}@*)
+        .sorted(Comparator.comparing(WordDefinitionResponse::word,
+                String.CASE_INSENSITIVE_ORDER))                 (*@\co{3}@*)
+        .toList();
+int start = (int) pageable.getOffset();
+int end = Math.min(start + pageable.getPageSize(), responses.size());
+List<WordDefinitionResponse> pageContent = start < responses.size()
+        ? responses.subList(start, end) : List.of();            (*@\co{4}@*)
+return new PageImpl<>(pageContent, pageable, responses.size());
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The user's text is spliced into a regular expression.
+  \code{escapeRegex} backslashes every metacharacter first, so
+  \code{a.*} matches the three literal characters and \code{(} does not
+  crash the server with a parse error. Skip this and you have regex
+  injection: at best wrong results, at worst a catastrophic pattern
+  that pins a CPU core.
+  \item[\co{2}] \code{toResponse} runs two more queries per word ---
+  parents and children from \code{word\_links} --- so a search that
+  matches $n$ words issues $2n + 1$ round trips. This is the N+1
+  problem, reborn in a database that was supposed to avoid it.
+  \item[\co{3}] Sorting happens in the JVM, on \emph{every} match, not
+  on the page.
+  \item[\co{4}] So does paging. Mongo returned all matches; the service
+  keeps twenty and discards the rest. Page 50 costs exactly what page 1
+  costs, plus the copying.
+\end{description}
+
+\subsection{How the server executes it}
+
+Ask Mongo itself. With the stack running:
+
+\begin{handson}[read the plan]
+\begin{lstlisting}[language=bash]
+$ docker compose exec mongodb mongosh ts_dictionary --quiet --eval '
+  db.word_definitions.find({ createdByUserId: "1", $or: [
+    { word: { $regex: "clou", $options: "i" } },
+    { tags: { $regex: "clou", $options: "i" } } ] })
+  .explain("executionStats").executionStats'
+\end{lstlisting}
+Trimmed, the answer looks like this:
+\begin{lstlisting}
+{ nReturned: 3,
+  totalKeysExamined: 412,
+  totalDocsExamined: 412,
+  executionStages: {
+    stage: "FETCH",
+    filter: { $or: [ { word: { $regex: "clou", $options: "i" } },
+                     { tags: { $regex: "clou", $options: "i" } } ] },
+    inputStage: {
+      stage: "IXSCAN",
+      indexName: "createdByUserId_1",
+      indexBounds: { createdByUserId: [ "[\"1\", \"1\"]" ] } } } }
+\end{lstlisting}
+Three lines tell the story: \code{IXSCAN} on \code{createdByUserId}
+narrows to this user's 412 documents; \code{FETCH} then loads every one
+of them from disk; the \code{filter} runs both regexes against each. The
+ratio \code{totalDocsExamined / nReturned} is 137 --- for each word
+returned, 137 were read and rejected.
+\end{handson}
+
+Why the regex cannot use an index: a B-tree orders strings by their
+leading characters. \code{\^{}clou} (anchored, case-sensitive) maps to a
+key range and Mongo will use an index on \code{word} for it. \code{clou}
+unanchored can appear anywhere in the string, and \code{i} means the
+index's byte order does not even match the comparison; there is no range
+to seek to. Mongo's planner is explicit about this: a case-insensitive
+or unanchored \code{\$regex} is a full scan of whatever the other
+predicates left. Here that is the user's slice, which is why the
+\code{createdByUserId} index is doing all the useful work and the
+compound index proposed later does not change the regex part --- it
+changes what happens \emph{after} it.
+
+\subsection{The array predicate}
+
+\code{tags} is an array. A scalar condition on an array field matches if
+\emph{any} element matches --- there is no \code{\$elemMatch} needed for
+a single condition. That is a genuine convenience over SQL, where the
+same predicate is an \code{EXISTS} against a child table. It is also
+why the regex is run once per tag per document: a document with eight
+tags costs eight pattern evaluations on top of the one for \code{word}.
+
+\section{The graph}
+
+\code{WordLink} is an adjacency list: one document per edge with
+\code{parentWordId}, \code{childWordId}, \code{position}. The indexes
+on both ends are right --- ``children of X'' and ``parents of X'' are
+each one index lookup. The cost is in the traversal:
+
+\begin{lstlisting}[language=Java]
+private WordGraphResponse buildGraphNode(String wordId, String userId,
+                                         Set<String> visited) {
+    if (visited.contains(wordId)) return null;
+    visited.add(wordId);
+    WordDefinition word = wordDefinitionRepository
+            .findByIdAndCreatedByUserId(wordId, userId).orElse(null); (*@\co{1}@*)
+    if (word == null) return null;
+    List<WordLink> childLinks = wordLinkRepository
+            .findByParentWordIdOrderByPosition(wordId);              (*@\co{2}@*)
+    List<WordGraphResponse> children = childLinks.stream()
+            .map(link -> buildGraphNode(link.getChildWordId(), userId,
+                    visited))
+            .filter(Objects::nonNull).toList();
+    return new WordGraphResponse(word.getId(), word.getWord(),
+            word.getMeaning(), children);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] One query per node.
+  \item[\co{2}] One more per node. A graph of 2{,}000 words costs
+  4{,}000 round trips, sequentially, on the request thread. Each is
+  sub-millisecond on the same host; on a network hop it is a
+  multi-second page. Embedding \code{childIds} in the parent document
+  would make it two queries total (\code{find} all words for the user,
+  build in memory) --- at the price of updating two documents per link,
+  without a transaction to hold them together.
+\end{description}
+
+Mongo does have a graph operator, \code{\$graphLookup}, that walks
+\code{word\_links} recursively server-side in one aggregation. It
+returns the flattened set of reachable nodes with a depth field, and
+the tree is rebuilt in memory. The project's \code{visited} set is doing
+by hand what \code{\$graphLookup} does with \code{maxDepth}; the
+difference is $2n$ round trips versus one.
+
+\section{Transactions and consistency, honestly}
+
+Mongo supports multi-document ACID transactions since 4.0 --- on a
+replica set. The project runs a single \code{mongod} (Compose and
+StatefulSet alike), and a standalone node cannot start a transaction at
+all. So \code{deleteWord} is two independent writes: delete the
+definition, then \code{deleteByParentWordIdOrChildWordId}. A crash
+between them leaves edges pointing to a missing word; the traversal
+tolerates it (\code{orElse(null)}, then filtered), which is the right
+defensive posture, but it is a hidden data-integrity contract. The
+fix that costs nothing in code and one line in operations is to run a
+single-node replica set (\code{--replSet rs0} plus an initiate call):
+transactions become available, and so does the change stream you will
+want for the outbox pattern of Chapter~11.
+
+Write concern and read preference matter the moment there is a second
+node. The default \code{w: majority} means an acknowledged write is on a
+majority of nodes; reading from a secondary can return an older state.
+For a single-user notebook, read-your-own-writes on the primary is what
+users expect, and it is the default --- state that in an interview, and
+that you would revisit it before adding read replicas.
+
+\section{Pros and cons, candidly}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.62\linewidth}@{}}
+\toprule
+\textbf{Strength} & \textbf{Where the project pays for it} \\
+\midrule
+One document, one read, no joins &
+  Links are separate; the graph is $2n$ queries \\
+Arrays are first-class (\code{tags}, \code{examples}) &
+  Substring search over them is a scan per element \\
+No migrations for new fields &
+  \code{extra} and \code{images} grow unchecked toward 16\,MB \\
+Regex search works out of the box &
+  It cannot use an index unless anchored and case-sensitive \\
+Paging is one \code{skip/limit} away &
+  The search path pages in Java after loading everything \\
+Independent database, independent deploy &
+  No auth on \code{mongod} in Compose \emph{or} the cluster \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The last row is not a Mongo trait but a project fact worth knowing
+before someone asks: the official image enables authentication only when
+root credentials are set, and neither manifest sets them. Inside a
+ClusterIP-only network that is a considered risk, documented in
+\code{mongodb.yaml}; it is the first thing to change if the service ever
+shares a cluster with anything untrusted.
+
+\section{What breaks}
+
+\begin{pitfall}[search gets slower with every word, then times out]
+Symptom: search latency grows linearly with a user's dictionary; at a
+few thousand words the frontend's timeout fires and the page shows
+nothing. Cause: three multipliers stacked on the same request --- the
+regex scans every document in the user's slice; \code{toResponse} then
+issues two queries per match; and sorting and paging happen after both.
+The database is doing what it was asked. Fix in order of payoff: page in
+the database (below), batch the link lookups into one \code{\$in} query
+per page, and anchor or replace the regex.
+\end{pitfall}
+
+\begin{pitfall}[document too large]
+Symptom: saving a word fails with
+\code{BsonMaximumSizeExceededException: ... exceeds 16793600 bytes}.
+Cause: \code{images} holds base64 data URLs, and base64 inflates by a
+third; five 3\,MB photos and the document is over the limit. Fix: store
+images in MinIO under a \code{dictionary/\{userId\}/\{wordId\}/} prefix
+and keep the keys in the document --- Chapter~35's rule, applied here.
+Until then, cap the array in \code{WordDefinitionRequest} validation.
+\end{pitfall}
+
+\begin{pitfall}[the regex that never returns]
+Symptom: one request pins a core at 100\,\% and the rest of the
+service's queries queue behind it. Cause: a pattern like
+\code{(a+)+\$} against a long string --- catastrophic backtracking.
+\code{escapeRegex} prevents users from sending one; the risk returns
+the day someone adds a ``power search'' that passes raw patterns, or
+forgets the escape on a new endpoint. Defense in depth: a
+\code{maxTimeMS} on the query (Spring Data's \code{@Meta(maxExecutionTimeMs)})
+so a runaway pattern is killed server-side after a second.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+The MongoDB StatefulSet's node reboots; the pod is pending for four
+minutes while the claim reattaches.
+
+\begin{itemize}
+  \item \textbf{dictionary-service} returns 500 on every endpoint. Its
+  readiness probe (Chapter~17) does not include a database check, so
+  the gateway keeps routing to it. Users see errors instead of a
+  ``service unavailable'' page.
+  \item \textbf{Everything else} is untouched. No other service holds a
+  Mongo connection, no other service calls dictionary-service, and no
+  Kafka topic depends on it. This is database-per-service working as
+  designed: the blast radius of the outage is exactly one feature.
+  \item \textbf{When the pod returns}, the driver's connection pool
+  reconnects on its own; there is no restart needed and no cache to
+  warm. Mongo's create-on-write means a \emph{wrong} claim would come up
+  empty and silent (Chapter~8's pitfall) --- check \code{show dbs}
+  before believing a ``data loss'' report.
+\end{itemize}
+
+The other 3\,a.m. is slower: the 5\,GB claim fills. Mongo does not fail
+a single write cleanly at that point; it stalls, journals fail, and the
+process may exit. Because documents can grow (images, \code{extra}),
+there is no cap in the schema to prevent it. The alarm belongs on the
+PVC's usage, not on the application.
+
+\section{Enhancing the resolution}
+
+Four changes, each complete, in the order they pay off.
+
+\subsection{Page in the database}
+
+Replace the list-returning query with a page-returning one. Spring Data
+Mongo needs a separate count query for \code{@Query} pages:
+
+\begin{lstlisting}[language=Java]
+@Query(value = "{ 'createdByUserId': ?0, '$or': [ "
+        + "{ 'word': { '$regex': ?1, '$options': 'i' } }, "
+        + "{ 'tags': { '$regex': ?1, '$options': 'i' } } ] }",
+       count = true)
+long countByWordOrTag(String userId, String regex);
+
+@Query("{ 'createdByUserId': ?0, '$or': [ "
+        + "{ 'word': { '$regex': ?1, '$options': 'i' } }, "
+        + "{ 'tags': { '$regex': ?1, '$options': 'i' } } ] }")
+Page<WordDefinition> searchByWordOrTag(String userId, String regex,
+                                       Pageable pageable);          (*@\co{1}@*)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Java]
+public Page<WordDefinitionResponse> searchWords(String userId,
+        String query, Pageable pageable) {
+    Pageable sorted = PageRequest.of(pageable.getPageNumber(),
+            pageable.getPageSize(),
+            Sort.by("word").ascending());                            (*@\co{2}@*)
+    Page<WordDefinition> page = (query == null || query.isBlank())
+            ? wordDefinitionRepository.findByCreatedByUserId(userId, sorted)
+            : wordDefinitionRepository.searchByWordOrTag(userId,
+                    escapeRegex(query.trim()), sorted);
+    return toResponses(page, userId);                                (*@\co{3}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Spring Data appends \code{skip}, \code{limit} and
+  \code{sort} to the query. The regex still scans the user's slice, but
+  only twenty documents are fetched, serialized and mapped.
+  \item[\co{2}] Sorting moves to the server. Case-insensitive order
+  needs a collation on the query or the collection
+  (\code{\{locale: "en", strength: 2\}}); add it to the index below so
+  the sort can use it.
+  \item[\co{3}] The link lookups become one batch per page, next.
+\end{description}
+
+\subsection{Batch the links}
+
+\begin{lstlisting}[language=Java]
+private Page<WordDefinitionResponse> toResponses(Page<WordDefinition> page,
+                                                 String userId) {
+    List<String> ids = page.map(WordDefinition::getId).toList();
+    Map<String, List<String>> parents = new HashMap<>();
+    Map<String, List<String>> children = new HashMap<>();
+    for (WordLink l : wordLinkRepository.findByChildWordIdIn(ids)) {   (*@\co{1}@*)
+        parents.computeIfAbsent(l.getChildWordId(), k -> new ArrayList<>())
+               .add(l.getParentWordId());
+    }
+    for (WordLink l : wordLinkRepository
+            .findByParentWordIdInOrderByPosition(ids)) {
+        children.computeIfAbsent(l.getParentWordId(), k -> new ArrayList<>())
+                .add(l.getChildWordId());
+    }
+    return page.map(w -> toResponse(w,
+            parents.getOrDefault(w.getId(), List.of()),
+            children.getOrDefault(w.getId(), List.of())));
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Two \code{\$in} queries per page instead of two per
+  word: $2n + 1$ becomes $3$. Both use the existing indexes on
+  \code{childWordId} and \code{parentWordId}.
+\end{description}
+
+\subsection{Index for the sort, and anchored search}
+
+\begin{lstlisting}[language=Java]
+// MongoIndexConfig
+mongoTemplate.indexOps("word_definitions").ensureIndex(
+        new CompoundIndexDefinition(
+                new Document("createdByUserId", 1).append("word", 1))
+        .collation(Collation.of("en").strength(2)));               (*@\co{1}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] With this index, ``this user's words in alphabetical
+  order'' is an index walk, so the unfiltered listing and every sorted
+  page avoid an in-memory sort. And a \emph{prefix} search ---
+  \code{\{word: \{\$regex: "\^{}clou"\}\}} with the same collation ---
+  becomes a range seek on the same index. For a dictionary, prefix is
+  usually what users mean when they type.
+\end{description}
+
+\subsection{A text index for word-anywhere search}
+
+When substring-anywhere is genuinely required, stop using regex:
+
+\begin{lstlisting}[language=Java]
+// MongoIndexConfig: one text index per collection, weighted
+mongoTemplate.indexOps("word_definitions").ensureIndex(
+        new TextIndexDefinition.TextIndexDefinitionBuilder()
+                .onField("word", 10F)                                (*@\co{1}@*)
+                .onField("tags", 5F)
+                .onField("meaning", 1F)
+                .build());
+\end{lstlisting}
+
+\begin{lstlisting}[language=Java]
+// DictionaryService
+public Page<WordDefinitionResponse> textSearch(String userId,
+        String terms, Pageable pageable) {
+    TextCriteria text = TextCriteria.forDefaultLanguage()
+            .matchingAny(terms.split("\\s+"));                       (*@\co{2}@*)
+    Query q = TextQuery.queryText(text).sortByScore()
+            .addCriteria(Criteria.where("createdByUserId").is(userId))
+            .with(pageable);
+    List<WordDefinition> hits = mongoTemplate.find(q, WordDefinition.class);
+    long total = mongoTemplate.count(Query.of(q).skip(0).limit(0),
+            WordDefinition.class);
+    return toResponses(new PageImpl<>(hits, pageable, total), userId);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A text index tokenizes and stems; \code{cloud} matches
+  \code{clouds} and \code{clouded}, and a hit in \code{word} outranks
+  the same hit in \code{meaning}. It does not match \emph{inside} a
+  token (\code{lou} will not find \code{cloud}) --- that is the trade.
+  \item[\co{2}] No regex, no escaping, no backtracking. The index is
+  consulted first; \code{createdByUserId} filters the hits.
+\end{description}
+
+\begin{decision}[anchored prefix versus full text]
+Prefix-anchored regex on the compound index answers ``words starting
+with\ldots'' in microseconds and needs no new index type; it is the
+right default for a type-ahead box. A text index answers ``entries about
+\ldots'' with ranking and stemming, at the cost of a larger index and
+no infix matching. Unanchored case-insensitive regex --- what the
+project has --- answers ``anything containing\ldots'' and pays a scan
+for it. The recommendation is prefix for the search box, text search
+behind a separate ``search everywhere'' action, and regex retired.
+Atlas Search (Lucene under Mongo's API) would give both at once, but
+only on Atlas; on a self-hosted \code{mongod}, these two are the tools.
+\end{decision}
+
+\section{Outside the project}
+
+Every document database has this chapter's shape: DynamoDB with its
+partition-key-first access patterns and no substring search at all;
+Couchbase with N1QL and a full-text index; Elasticsearch as the sidecar
+that document stores grow when search becomes the product. Postgres's
+\code{jsonb} plus \code{pg\_trgm} is the answer most teams should
+consider before any of them --- it turns exactly this service's
+\code{ILIKE '\%clou\%'} into a GIN index seek. The senior framing of
+``SQL or NoSQL?'' is never the engine; it is the access patterns
+written down first, then the engine whose indexes match them.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: Dictionary search is slow. What do you check first?}
+
+The plan, before anything else: \code{explain("executionStats")} on
+the exact query the service sends, and two numbers from it ---
+\code{totalDocsExamined} against \code{nReturned}, and which stage
+carries the \code{filter}. In this service that shows an \code{IXSCAN}
+on \code{createdByUserId} followed by a \code{FETCH} that examines
+hundreds of documents per hit, because an unanchored case-insensitive
+regex cannot use any index. Then look at what happens \emph{after} the
+query: here, two link lookups per match and in-memory sorting and
+paging. I would fix in that order --- page in the database, batch the
+links with \code{\$in}, anchor the regex to a prefix on a compound
+\code{\{createdByUserId, word\}} index with a case-insensitive collation
+--- and re-read the plan after each step. If ``anywhere in the word''
+is a real requirement, that is a text index, not a faster regex.
+
+\subsection*{Q: When would you not pick MongoDB?}
+
+When the access patterns are relational: data read in different
+groupings than it is written, invariants that span entities
+(a submission needs its assignment and its student to exist), or
+reporting that joins across the domain. When the team already runs
+Postgres well and the ``document'' is just a \code{jsonb} column away.
+When multi-document transactions are routine rather than exceptional
+--- Mongo has them, but on a replica set, with retry semantics you have
+to code for. And when the data will be searched by substring at scale:
+\code{pg\_trgm} is a one-line index; Mongo needs Atlas Search or an
+external engine. The project's dictionary passes those tests because it
+is per-user, nested, and joins nothing; the course domain fails all of
+them, which is why it is in Postgres.
+
+\subsection*{Q: Paginate a hundred thousand results without loading them.}
+
+Never with \code{skip} at depth --- \code{skip(90000)} still walks
+ninety thousand index entries. Use \emph{keyset} pagination: sort on an
+indexed, unique-ish key (\code{word}, tie-broken by \code{\_id}) and
+ask for \code{\{word: \{\$gt: lastWord\}\}} with \code{limit(20)}; each
+page is an index seek regardless of depth. Return the last key as an
+opaque cursor instead of a page number. Keep a count query only if the
+UI truly needs a total, and cache it, because counting a filtered
+regex is the same scan again. The project's \code{subList} paging is
+the opposite of all this: it loads everything and returns twenty.
+
+\subsection*{Q: One service uses Mongo, another Postgres. How do you keep their data consistent?}
+
+You do not, transactionally --- there is no two-phase commit across
+them and you should not want one. You keep them \emph{eventually}
+consistent through events (Chapter~11): the owning service commits its
+change and publishes a fact, the other consumes and updates its own
+copy, and an outbox table in the owner makes ``committed'' and
+``published'' the same thing. Where the project needs this today is the
+user id: dictionary-service stores \code{createdByUserId} as a string
+that auth-service issued, and never needs to join on it, so no
+synchronization is required. If it ever needed the user's display name,
+the answer is a \code{UserRegistered} consumer writing a tiny
+\code{users} collection --- not a Feign call per word, and not a shared
+database.
+
+\subsection*{Q: The document shape changed. Migrate without downtime.}
+
+Expand, migrate, contract. Deploy code that reads both shapes and
+writes the new one (a \code{@Field} alias or a converter handles the
+rename); run a background job that rewrites old documents in batches
+with \code{updateMany} on a bounded \code{\_id} range, throttled,
+idempotent, resumable; then, when a count of the old shape reaches
+zero, deploy code that reads only the new shape. Mongo makes the first
+step easy because nothing enforces the schema, and dangerous for the
+same reason --- add a JSON Schema validator on the collection at the
+end so the old shape cannot come back. For the \code{images} field in
+this project the migration is also a data move: rewrite each data URL
+into a MinIO object and replace the array element with its key.
+
+\subsection*{Q: Model the word graph --- embed or reference, and what does traversal cost?}
+
+Reference, as the project does, when edges have their own attributes
+(\code{position}) and both directions are queried; embed a
+\code{childIds} array when the graph is shallow, mostly read, and
+parent-to-child is the only direction that matters. Traversal cost is
+the honest part: with references and naive recursion it is two round
+trips per node --- 4{,}000 for a 2{,}000-word graph --- which is what
+\code{buildGraphNode} does. The fixes are, in order, loading all edges
+for the user in one query and walking in memory; or a single
+\code{\$graphLookup} with \code{maxDepth}; or embedding. Cycles need a
+visited set either way; the project has one. And say the trade-off out
+loud: embedding turns one link creation into two document writes with
+no transaction on a standalone node.
+
+\begin{quiz}
+\begin{enumerate}
+  \item From the \code{explain} output, \code{totalDocsExamined} is 412
+  and \code{nReturned} is 3. Name the stage doing the rejecting, say
+  why the \code{createdByUserId} index cannot help it, and state the
+  one change to the pattern that would let an index on \code{word}
+  serve it.
+  \item \code{searchWords} with \code{page=50\&size=20} on a user with
+  3{,}000 words: how many documents does Mongo return, how many
+  \code{word\_links} queries run, and where is the page built?
+  \item \code{deleteWord} issues two writes with no transaction.
+  Explain why a transaction is unavailable on this deployment, what a
+  crash between the writes leaves behind, and which line of
+  \code{buildGraphNode} tolerates it.
+  \item A user attaches six photos to a word and the save fails. Give
+  the exception, the arithmetic that produced it, and the storage rule
+  from Chapter~35 that fixes it.
+  \item With a text index on \code{word}, \code{tags} and
+  \code{meaning}, the query ``lou'' returns nothing although
+  ``cloud'' exists. Explain, and say which index type answers it.
+  \item MongoDB is down for four minutes at 3\,a.m. List what fails,
+  what does not, and the one probe change that would turn 500s into a
+  clean ``not ready''.
+\end{enumerate}
+\end{quiz}

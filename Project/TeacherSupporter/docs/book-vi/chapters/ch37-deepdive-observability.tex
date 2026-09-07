@@ -1,0 +1,687 @@
+\chapter{Đào sâu: Khả năng quan sát --- trace xuyên Feign và Kafka, lấy mẫu, và những cảnh báo đáng giá}
+\label{ch:dd-observability}
+
+Chương~24 dạy bạn debug stack từ ngoài vào trong --- \code{describe}
+trước \code{logs} --- và Chương~27 gọi tên bộ ba tiếp theo: metric,
+trace, cảnh báo. Chương đào sâu này mở toang phần dây nối đã có sẵn
+trong mọi service và hỏi nó thực sự làm gì. Câu trả lời ít hơn cấu hình
+gợi ý: dependency tracing nằm trên mọi classpath, mẫu log in ra trace
+id, cụm lấy mẫu ở mức không, và endpoint Prometheus mà Chương~27 trông
+cậy thì chưa tồn tại. Đọc lý do vì sao là con đường nhanh nhất để hiểu
+truy vết phân tán hoạt động thế nào.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Một trace bắt đầu ở đâu, và sống sót thế nào} qua các
+  chặng trình duyệt $\rightarrow$ gateway $\rightarrow$ Feign
+  $\rightarrow$ Kafka $\rightarrow$ consumer --- và ở đâu trong dự án
+  này nó lặng lẽ chết?
+  \item \textbf{Lấy mẫu tốn gì} ở 1.0, ở 0.0, và ở những con số hệ
+  thống production thực sự dùng?
+  \item \textbf{Tín hiệu nào xứng đáng một cảnh báo}, và phải thêm gì
+  trước khi bất kỳ cảnh báo nào nổ được?
+\end{enumerate}
+
+\section{Vì sao chọn nó, và nó giải quyết gì}
+
+Log trả lời ``tiến trình này đã nói gì?'' Metric trả lời ``hệ thống
+đang ra sao, tính gộp, theo thời gian?'' Trace trả lời câu hỏi hai thứ
+kia không thể: ``chuyện gì đã xảy ra với \emph{đúng một request này}
+khi nó đi qua năm service và một message broker?'' Trong monolith,
+một stack trace chính là một trace. Trong dự án này, một cú click
+``tạo bài tập'' chạm tới gateway, course-service, auth-service (qua
+Feign), Kafka, và notification-service; không file log đơn lẻ nào
+thấy hết.
+
+Dự án chọn Micrometer Tracing với cầu nối Brave, báo cáo về Zipkin.
+\code{pom.xml} của mỗi service mang cùng một cặp:
+
+\begin{lstlisting}[language=yaml]
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-tracing-bridge-brave</artifactId>   (*@\co{1}@*)
+</dependency>
+<dependency>
+  <groupId>io.zipkin.reporter2</groupId>
+  <artifactId>zipkin-reporter-brave</artifactId>             (*@\co{2}@*)
+</dependency>
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Micrometer Tracing là \emph{facade} mà Spring Boot~3
+  instrument lên; Brave (tracer của dự án Zipkin) là một trong hai
+  hiện thực, cái còn lại là OpenTelemetry. Cầu nối là thứ biến các
+  \emph{observation} của Spring --- Micrometer Observation API mà mọi
+  starter Boot~3 phát ra --- thành span.
+  \item[\co{2}] Reporter gửi các span đã hoàn tất tới Zipkin qua HTTP.
+  Đổi đúng một artifact này lấy \code{opentelemetry-exporter-otlp} là
+  cùng các span đó trỏ sang Tempo, Jaeger, hay một vendor.
+\end{description}
+
+\begin{decision}[Brave và Zipkin, không phải OpenTelemetry]
+Brave cộng Zipkin là con đường ngắn nhất từ số không tới một màn hình
+trace hoạt động: một container, không collector, không thương lượng
+giao thức, và auto-configuration của Spring Boot biết cả hai rất rõ.
+Đó là lựa chọn đúng để học cơ chế và cho một homelab. Điều sẽ lật nó:
+một ngôn ngữ thứ hai trong stack (SDK OpenTelemetry phủ tất cả với một
+giao thức đường truyền), một backend vendor (Datadog, Honeycomb,
+Grafana Cloud đều nói OTLP bản địa), hoặc nhu cầu lấy mẫu theo đuôi
+(tail-based), thứ đòi một collector đứng giữa ứng dụng và kho. Việc
+chuyển đổi là cơ học --- đổi hai dependency, đổi thuộc tính endpoint
+--- vì code chưa bao giờ chạm trực tiếp vào Brave. Người phỏng vấn hỏi
+``Zipkin hay Jaeger hay Tempo?'' và mong đợi đúng câu trả lời này:
+backend thay được, chuẩn instrumentation mới là quyết định tồn tại lâu.
+\end{decision}
+
+\section{Một trace đi qua dự án này như thế nào}
+
+\subsection{Cấu hình, trong mọi service}
+
+Năm tài liệu service trong config-server đều kết thúc giống nhau:
+
+\begin{lstlisting}[language=yaml]
+management:
+  tracing:
+    sampling:
+      probability: 1.0                                   (*@\co{1}@*)
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans       (*@\co{2}@*)
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus          (*@\co{3}@*)
+logging:
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"  (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Mọi request đều được trace. Ổn trên laptop; xem
+  Mục~\ref{sec:sampling} để biết nó tốn gì ở nơi khác. Trong cụm, mọi
+  Deployment ghi đè thành \code{0.0} với chú thích ``Zipkin chưa có
+  trong cụm''.
+  \item[\co{2}] Compose ghi đè host thành \code{zipkin:9411}; reporter
+  POST các lô JSON tới đây.
+  \item[\co{3}] Exposure là một \emph{danh sách tên}. Nêu tên
+  \code{prometheus} không tạo ra endpoint; endpoint chỉ tồn tại khi
+  \code{micrometer-registry-prometheus} nằm trên classpath, và không
+  \code{pom.xml} nào trong repository có nó. Hôm nay
+  \code{/actuator/prometheus} trả 404 trên mọi service --- kế hoạch ở
+  Chương~27 giả định một endpoint vẫn còn phải thêm vào.
+  \item[\co{4}] Mẫu log đọc hai khóa MDC mà cầu nối tracing điền vào.
+  Khi không có span đang hoạt động, giá trị dự phòng \code{-} in ra
+  rỗng, và chính điều đó là dấu hiệu chẩn đoán: trace id rỗng trong
+  một dòng log nghĩa là code chạy ngoài mọi ngữ cảnh được trace.
+\end{description}
+
+\subsection{Từng chặng một}
+
+Theo dõi một \code{POST /api/courses/7/assignments} từ trình duyệt.
+
+\textbf{Trình duyệt $\rightarrow$ gateway.} Trình duyệt không gửi
+header trace nào; \code{axios} không biết gì về tracing. Gateway là ứng
+dụng WebFlux và Spring Cloud Gateway được instrument qua Observation
+API, nên observation phía server của request đi vào \emph{khởi tạo}
+một trace mới: một trace id ngẫu nhiên 128 bit và một span gốc. Khi
+gateway chuyển tiếp tới course-service, \code{WebClient} reactive nó
+dùng cũng được instrument, và propagator ghi ngữ cảnh vào request đi
+ra. Mặc định của Spring Boot~3 quan trọng ở đây: Brave được cấu hình
+để \emph{phát} W3C Trace Context
+(\code{traceparent: 00-<traceId>-<spanId>-01}) và \emph{đọc} cả W3C
+\emph{lẫn} hai định dạng B3. Vậy dự án này nói W3C trên đường truyền
+và vẫn hiểu một bên gọi B3 cũ hơn.
+
+\textbf{Gateway $\rightarrow$ course-service.} Course-service là
+servlet MVC. Observation phía server của nó đọc \code{traceparent},
+tiếp tục cùng trace, và mở một span con. Mọi thứ log bên trong
+controller giờ mang trace id đó --- mẫu ở \co{4} phía trên in nó ra.
+
+\textbf{course-service $\rightarrow$ auth-service qua Feign.}
+\code{AuthServiceClient} là một client Spring Cloud OpenFeign. OpenFeign
+kèm sẵn một capability Micrometer, bật mặc định, bọc mỗi lời gọi trong
+một observation; propagator của Brave tiêm \code{traceparent} vào
+request Feign. Auth-service tiếp tục trace. Trong Zipkin, lời gọi Feign
+hiện ra như một span client trong course-service lồng dưới span
+controller, cùng một span server khớp trong auth-service. Nếu circuit
+breaker của Resilience4j ngắt lời gọi (Chương~6), không span client
+nào được tạo --- fallback đã chạy, đường truyền không hề bị chạm, và
+trace hiện ra khoảng trống.
+
+\textbf{course-service $\rightarrow$ Kafka.} Ở đây trace chết. Đọc
+producer của dự án:
+
+\begin{lstlisting}[language=Java]
+@Bean
+public ProducerFactory<String, Object> producerFactory() {
+    Map<String, Object> configProps = new HashMap<>();
+    configProps.put(BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+    configProps.put(KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    configProps.put(VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+    return new DefaultKafkaProducerFactory<>(configProps);
+}
+
+@Bean
+public KafkaTemplate<String, Object> kafkaTemplate() {
+    return new KafkaTemplate<>(producerFactory());       (*@\co{1}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một \code{KafkaTemplate} dựng tay. Spring Kafka
+  \emph{có thể} lan truyền ngữ cảnh trace --- nó ghi \code{traceparent}
+  vào header của record và mở một span producer --- nhưng chỉ khi
+  \code{setObservationEnabled(true)} được gọi trên template, hoặc
+  \code{spring.kafka.template.observation-enabled=true} được đặt cho
+  bean tự cấu hình. Bean này không làm cả hai, và thuộc tính vắng mặt
+  trong mọi tài liệu cấu hình. Record rời đi không có header. Phía tiêu
+  thụ, \code{@KafkaListener} trong notification-service sẽ cần
+  \code{spring.kafka.listener.observation-enabled=true} để đọc một
+  header. Cả hai nửa đều tắt. E-mail sinh ra từ cú click, với Zipkin,
+  là một sự kiện không liên quan.
+\end{description}
+
+\code{UserRegisteredPublisher} của auth-service dùng template tự cấu
+hình và có cùng khoảng trống vì cùng lý do: thứ thiếu là thuộc tính,
+không phải bean.
+
+\textbf{Ranh giới scheduler.} \code{CourseLifecycleScheduler} chạy
+\code{@Scheduled} lúc 01:00. Không gì instrument một trigger cron; dòng
+log ``Auto-archived 3 course(s)'' của nó in ra với trace id và span id
+rỗng. Điều tương tự đúng với mọi phương thức \code{@Async} trừ khi
+executor được bọc bằng một decorator lan truyền ngữ cảnh. Trace là
+thuộc tính của một \emph{request}; công việc không do request nào khởi
+đầu thì không có trace trừ khi bạn trao cho nó một cái.
+
+\subsection{Đối chiếu log}
+
+Với mẫu ở \co{4}, một lệnh grep xuyên log của cả năm service theo một
+trace id ghép lại câu chuyện Zipkin vẽ --- hữu ích đúng lúc Zipkin
+chết hoặc bị lấy mẫu bỏ qua:
+
+\begin{lstlisting}[language=bash]
+$ docker compose logs --no-color api-gateway course-service \
+    auth-service | grep 6f2c1a9e4b3d8e10
+api-gateway     | INFO [api-gateway,6f2c1a9e4b3d8e10,9a1b...] ...
+course-service  | INFO [course-service,6f2c1a9e4b3d8e10,c04d...] ...
+auth-service    | INFO [auth-service,6f2c1a9e4b3d8e10,e77f...] ...
+\end{lstlisting}
+
+Để ý thứ vắng mặt: không có dòng \code{notification-service}, vì không
+trace id nào vượt qua Kafka. Lệnh grep cho thấy lỗ hổng đúng như Zipkin
+sẽ cho thấy.
+
+\section{Lấy mẫu}
+\label{sec:sampling}
+
+\code{probability: 1.0} nghĩa là mọi trace được ghi và mọi span được
+gửi. Chi phí tuyến tính theo lưu lượng: mỗi span là vài trăm byte JSON,
+được gom lô và POST bởi một thread nền, rồi được Zipkin đánh index và
+lưu. Ở lưu lượng của dự án, chẳng đáng gì. Ở 1.000 request mỗi giây
+với sáu span mỗi request, đó là 6.000 span mỗi giây, cỡ 2\,MB/s dữ liệu
+vào và hàng chục gigabyte lưu trữ mỗi ngày --- phần lớn ghi lại những
+request thành công trong 20\,ms mà không ai sẽ nhìn tới.
+
+Lấy mẫu \emph{theo đầu} (head-based) --- thứ \code{probability} cấu
+hình --- quyết định tại span gốc có giữ trace hay không, và lan truyền
+quyết định trong cờ của \code{traceparent} để mọi service phía sau đồng
+ý. Nó rẻ và nhất quán, và nó mù: ở 0.01 nó giữ 1\% trace chọn ngẫu
+nhiên, nên request duy nhất thất bại lúc 3 giờ sáng được giữ với xác
+suất 0.01. Lấy mẫu \emph{theo đuôi} (tail-based) hoãn quyết định tới
+khi biết toàn bộ trace và giữ mọi trace có lỗi hoặc vượt ngân sách độ
+trễ, cộng một mẫu ngẫu nhiên phần còn lại. Nó cần một thành phần đệm
+trọn trace trước kho --- một OpenTelemetry Collector --- và đó là lý do
+nó ngoài tầm với của dây nối trực tiếp Brave-tới-Zipkin.
+
+\begin{decision}[tỷ lệ lấy mẫu]
+Laptop và Compose: \code{1.0}, vì bạn đang debug và lưu lượng chính là
+bạn. Cụm hôm nay: \code{0.0}, thành thật về việc chưa có pod Zipkin ---
+lấy mẫu ở mức không cũng tắt cả chi phí tạo span, không chỉ chi phí
+gửi. Cụm có Zipkin: bắt đầu ở \code{0.1}; hạ xuống \code{0.01} khi kho
+lớn nhanh hơn tốc độ bạn đọc nó. Câu trả lời senior cho ``tỷ lệ lấy mẫu
+bao nhiêu?'' là ``head-based 1--10\% làm nền, tail-based cho lỗi và
+request chậm khi đã có collector'' --- và câu tiếp theo luôn là ``mà
+trace lỗi mới là thứ bạn thực sự muốn, nên hãy tính ngân sách cho
+collector''.
+\end{decision}
+
+\section{Metric: cái gì có và cái gì chưa}
+
+\code{/actuator/metrics} của Actuator đã tồn tại trên mọi service và
+liệt kê vài trăm meter: bộ nhớ JVM và GC, request HTTP server gắn tag
+\code{uri}, \code{status} và \code{method}, metric client Kafka, trạng
+thái pool HikariCP, và trạng thái circuit breaker của Resilience4j
+trong course-service. Nó trả lời từng meter một, theo tên, qua HTTP ---
+một công cụ debug, không phải công cụ giám sát. Giám sát nghĩa là một
+hệ thống \emph{kéo} tất cả chúng mỗi 15 giây, lưu thành chuỗi thời
+gian, và đánh giá quy tắc. Hệ thống đó là Prometheus, và endpoint của
+nó đang thiếu (xem \co{3} ở trên).
+
+Hai bộ từ vựng mang vào phỏng vấn. \textbf{RED} dành cho service theo
+request: Rate, Errors, Duration --- ba thứ mà timer
+\code{http.server.requests} đã cung cấp. \textbf{USE} dành cho tài
+nguyên: Utilization, Saturation, Errors --- CPU, heap, pool Hikari,
+consumer lag của Kafka. Một dashboard mỗi service nên hiện RED ở trên
+và USE bên dưới; cảnh báo nên nổ trên một triệu chứng RED mà người
+dùng cảm nhận được, và các panel USE giải thích vì sao.
+
+\section{Ưu và nhược}
+
+\begin{center}
+\begin{tabular}{@{}p{0.47\linewidth}p{0.47\linewidth}@{}}
+\toprule
+\textbf{Điểm mạnh} & \textbf{Điểm yếu, hôm nay} \\
+\midrule
+Không đổi code: mọi chặng được các starter instrument, và mẫu log chỉ
+một dòng. &
+Lan truyền qua Kafka tắt ở cả producer lẫn consumer; con đường thú vị
+nhất của hệ thống là con đường vô hình. \\
+Facade trung lập vendor: Brave và Zipkin đổi được sang OTLP mà không
+chạm mã nguồn. &
+Không registry Prometheus trên classpath nào; \code{prometheus} trong
+danh sách exposure chỉ là ước vọng. \\
+\code{traceparent} W3C trên đường truyền, chấp nhận B3 --- tương tác
+được với mọi thứ hiện đại. &
+Chỉ lấy mẫu head-based; một lỗi ở mức 1\% được giữ 1\% số lần. \\
+Đối chiếu log hoạt động cả khi không có Zipkin. &
+Zipkin chạy \code{:latest} không volume: trace bốc hơi mỗi lần
+\code{compose down}. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cái gì gãy}
+
+\begin{pitfall}[trace kết thúc ở Kafka]
+Triệu chứng: trong Zipkin, trace \code{POST /assignments} kết thúc ở
+span controller; thông báo theo sau là một trace một-span riêng biệt,
+hoặc không có. Nguyên nhân: cả \code{spring.kafka.template.\allowbreak
+observation-enabled} lẫn \code{spring.kafka.listener.\allowbreak
+observation-enabled} đều không được đặt, nên không header
+\code{traceparent} nào được ghi vào hay đọc từ record. Cách sửa: cả
+hai thuộc tính, trong tài liệu cấu hình của cả hai service
+(course-service và auth-service phát; notification-service tiêu thụ)
+--- và template dựng tay trong \code{KafkaProducerConfig} phải gọi
+\code{setObservationEnabled(true)} vì thuộc tính chỉ cấu hình bean tự
+cấu hình. Listing ở Mục~\ref{sec:enhance} làm cả ba việc.
+\end{pitfall}
+
+\begin{pitfall}[tag có số lượng giá trị không giới hạn]
+Triệu chứng: heap của một service leo dần suốt nhiều ngày và
+\code{/actuator/metrics} mất vài giây để trả lời; cuối cùng
+\code{OOMKilled}. Nguyên nhân: một tag có tập giá trị không bị chặn.
+Kinh điển là một handler ánh xạ \code{/courses/\{id\}} bị ai đó viết
+lại để dựng đường dẫn bằng tay --- tag \code{uri} khi đó mang
+\code{/courses/42}, \code{/courses/43}, \ldots, mỗi cái một chuỗi thời
+gian, mãi mãi. Chuyện tương tự xảy ra khi span được gắn tag bằng user
+id hay e-mail. Cách sửa: gắn tag bằng \emph{mẫu} (\code{/courses/\{id\}}),
+không bao giờ bằng giá trị; đặt định danh vào log annotation của span
+hay dòng log, những thứ không được đánh index theo giá trị. Tag
+\code{uri} mặc định của Spring là mẫu đường dẫn chính để tránh điều
+này.
+\end{pitfall}
+
+\begin{pitfall}[một 401 không có trace]
+Triệu chứng: người dùng báo ``tôi bị đăng xuất'' và không có trace nào
+cho request của họ. Nguyên nhân: \code{JwtAuthenticationFilter} của
+gateway từ chối ở thứ tự \code{-1}, trước khi định tuyến; observation
+phía server vẫn ghi request, nhưng với lấy mẫu ở 0.0 trong cụm thì
+không gì được xuất đi đâu cả. Cách sửa không phải tracing: đây là câu
+hỏi \emph{metric}. Đếm \code{http.server.requests} với
+\code{status=401} tại gateway và cảnh báo khi tăng vọt --- một lần
+deploy sai \code{JWT\_SECRET} hiện ra như một vách đá trên bộ đếm đó
+trong vòng 15 giây.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Zipkin chết lúc 3 giờ sáng; các service vẫn chạy.
+
+\begin{itemize}
+  \item \textbf{Độ trễ request: không đổi.} Reporter là bất đồng bộ.
+  Span hoàn tất đi vào một hàng đợi trong bộ nhớ; một thread nền rút nó
+  ra theo lô qua HTTP. Thread request không bao giờ chờ Zipkin. Đây là
+  tính chất cần nói đầu tiên trong phỏng vấn, vì nỗi sợ ``tracing làm
+  chậm service của tôi'' là phản đối phổ biến.
+  \item \textbf{Bộ nhớ: bị chặn.} Hàng đợi có dung lượng cố định
+  (\code{queuedMaxSpans}, mặc định 10.000). Khi đầy, span mới bị
+  \emph{bỏ}, được đếm, và một cảnh báo được log --- reporter không
+  phình heap để giữ chúng. Bạn mất tầm nhìn, không mất service.
+  \item \textbf{Log: vẫn đối chiếu được.} Trace id được sinh cục bộ;
+  mẫu MDC vẫn in chúng. Lệnh grep ở mục đối chiếu hoạt động đúng như
+  trước. Đây là lý lẽ cho việc luôn có mẫu log, bất kể backend trace.
+  \item \textbf{Hồi phục: tự động.} Reporter thử lại mỗi lô ở lần rút
+  kế tiếp; khi Zipkin trở lại, span mới chảy tiếp. Các span bị bỏ trong
+  lúc sự cố mất luôn --- không có replay.
+\end{itemize}
+
+Giờ theo chiều ngược lại: \emph{lưu lượng} tăng vọt lúc 3 giờ sáng với
+lấy mẫu ở 1.0. Hàng đợi đầy, span bị bỏ, và chính dòng log cảnh báo
+trở thành tiếng ồn ở hàng trăm dòng mỗi giây. Đó là hình hài cụ thể của
+đánh đổi lấy mẫu --- và lý do đặt tỷ lệ trước cơn tăng vọt, không phải
+trong lúc đó.
+
+\section{Nâng cấp giải pháp}
+\label{sec:enhance}
+
+Bốn bổ sung biến dây nối thành một hệ thống giám sát. Mỗi cái đều trọn
+vẹn; thêm theo thứ tự.
+
+\textbf{1. Endpoint Prometheus.} Một dependency mỗi service (BOM Boot
+của parent quản lý phiên bản):
+
+\begin{lstlisting}[language=yaml]
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+\end{lstlisting}
+
+Có nó trên classpath, danh sách exposure hiện có làm
+\code{/actuator/prometheus} thành thật. Thêm các công tắc tracing đang
+thiếu, và một tag chung để mọi chuỗi nói rõ nó đến từ service nào:
+
+\begin{lstlisting}[language=yaml]
+management:
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}   # every series, one tag
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLE:0.1}          # env-overridable
+spring:
+  kafka:
+    template:
+      observation-enabled: true    # producer span + traceparent header
+    listener:
+      observation-enabled: true    # consumer span, continues the trace
+\end{lstlisting}
+
+Và template dựng tay trong course-service, thứ bỏ qua thuộc tính:
+
+\begin{lstlisting}[language=Java]
+@Bean
+public KafkaTemplate<String, Object> kafkaTemplate() {
+    KafkaTemplate<String, Object> template =
+            new KafkaTemplate<>(producerFactory());
+    // Properties configure only the auto-configured template; a
+    // hand-built one must opt in explicitly or traces end here.
+    template.setObservationEnabled(true);
+    return template;
+}
+\end{lstlisting}
+
+\textbf{2. Scrape trong cụm.} Với \code{kube-prometheus-stack} đã cài
+(Chương~27), một \code{ServiceMonitor} bảo operator của nó scrape
+Service nào. Một object phủ cả năm, theo label:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ts-services
+  namespace: ts
+  labels:
+    release: kube-prometheus-stack   # the selector the chart installs
+spec:
+  selector:
+    matchLabels:
+      monitoring: actuator           # add this label to each Service
+  endpoints:
+    - port: http                     # the Service port *name*
+      path: /actuator/prometheus
+      interval: 15s
+\end{lstlisting}
+
+Service của auth-service và course-service phải cho phép
+\code{/actuator/prometheus} trong SecurityConfig của chúng để việc này
+chạy --- cùng phép cho phép mà Chương~17 cần cho probe. Hạn chế nó
+trong mạng pod bằng NetworkPolicy thay vì để mở ra Ingress.
+
+\textbf{3. Log có cấu trúc.} Grep xuyên container hoạt động trên
+laptop; trong cụm, Loki hay Elasticsearch parse JSON đáng tin hơn nhiều
+so với một mẫu ngoặc vuông. Bộ mã hóa JSON của Logback là một dependency
+cộng một \code{logback-spring.xml}:
+
+\begin{lstlisting}[language=yaml]
+<dependency>
+  <groupId>net.logstash.logback</groupId>
+  <artifactId>logstash-logback-encoder</artifactId>
+  <version>8.0</version>
+</dependency>
+\end{lstlisting}
+
+\begin{lstlisting}
+<configuration>
+  <springProperty name="app" source="spring.application.name"/>
+  <appender name="JSON"
+            class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <customFields>{"application":"${app}"}</customFields>
+      <!-- traceId and spanId come from the MDC automatically -->
+      <includeMdcKeyName>traceId</includeMdcKeyName>
+      <includeMdcKeyName>spanId</includeMdcKeyName>
+    </encoder>
+  </appender>
+  <springProfile name="!local">
+    <root level="INFO"><appender-ref ref="JSON"/></root>
+  </springProfile>
+  <springProfile name="local">
+    <include resource="org/springframework/boot/logging/logback/base.xml"/>
+  </springProfile>
+</configuration>
+\end{lstlisting}
+
+Việc tách theo profile giữ mẫu đọc-được-bằng-mắt trên laptop và phát
+một object JSON mỗi dòng ở mọi nơi khác. Mỗi dòng giờ mang
+\code{traceId} như một trường; truy vấn log theo trace id là một lượt
+tra index, không phải quét.
+
+\textbf{4. Hai cảnh báo gắn với điều người dùng cảm nhận.} Quy tắc
+Prometheus, trong kind \code{PrometheusRule} của operator:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ts-slo
+  namespace: ts
+  labels: { release: kube-prometheus-stack }
+spec:
+  groups:
+    - name: ts.slo
+      rules:
+        - alert: GatewayErrorBudgetBurn
+          expr: |
+            sum(rate(http_server_requests_seconds_count{
+                  application="api-gateway", status=~"5.."}[5m]))
+            /
+            sum(rate(http_server_requests_seconds_count{
+                  application="api-gateway"}[5m])) > 0.02
+          for: 10m
+          labels: { severity: page }
+          annotations:
+            summary: "Gateway 5xx ratio above 2% for 10 minutes"
+        - alert: NotificationConsumerLag
+          expr: |
+            sum by (topic) (
+              kafka_consumer_fetch_manager_records_lag_max{
+                application="notification-service"}) > 500
+          for: 15m
+          labels: { severity: ticket }
+          annotations:
+            summary: "notification-group is {{ $value }} records behind"
+\end{lstlisting}
+
+Cái đầu là cảnh báo \emph{triệu chứng} trên tỷ lệ ``errors'' của RED
+tại nơi duy nhất mọi request đi qua; 2\% trong mười phút là ngân sách
+khởi điểm, không phải luật. Cái thứ hai là câu trả lời của Chương~27
+cho ``metric Kafka nào trước'': lag tăng suốt 15 phút nghĩa là mail
+không đi ra, bất kể sức khỏe của pod nói gì. Để ý tên meter: Spring
+Kafka đăng ký \code{records-lag-max} của chính client theo cách đặt tên
+của Micrometer, và registry Prometheus hiển thị nó bằng gạch dưới.
+
+\begin{handson}[chứng minh trace vượt qua Kafka]
+Sau khi thêm hai thuộc tính \code{observation-enabled} và dòng
+template, khởi động lại course-service và notification-service dưới
+Compose, tạo một bài tập qua UI, rồi hỏi Zipkin về trace theo id in
+trong log của course-service:
+\begin{lstlisting}[language=bash]
+$ curl -s "http://localhost:9411/api/v2/trace/6f2c1a9e4b3d8e10" \
+    | jq -r '.[] | "\(.localEndpoint.serviceName)  \(.name)"'
+api-gateway            http post
+course-service         http post /courses/{id}/assignments
+course-service         http get                   # Feign to auth
+auth-service           http get /users/{id}
+course-service         ts.assignment.created send
+notification-service   ts.assignment.created process
+\end{lstlisting}
+Trước thay đổi, hai dòng cuối không tồn tại. Span consumer có cha là
+span producer; e-mail giờ quy được về cú click đã gây ra nó.
+\end{handson}
+
+\section{Ngoài dự án}
+
+Các stack production hội tụ về cùng một hình dạng với những cái tên
+khác nhau. Instrumentation: SDK OpenTelemetry hoặc Java agent, thứ tự
+instrument mà không cần cả starter. Thu thập: một OpenTelemetry
+Collector mỗi node hay mỗi cụm, nơi lấy mẫu tail-based, che dữ liệu,
+và phân phối tới nhiều backend cư trú. Lưu trữ: Tempo cho trace, Loki
+cho log, Prometheus hay Mimir cho metric --- bộ ba Grafana --- hoặc
+Jaeger, Elasticsearch và Thanos; hoặc một vendor nhận OTLP và tính tiền
+theo dung lượng. Mạch phỏng vấn chạy xuyên tất cả: ``làm sao tìm một
+request chậm xuyên các service?'' được trả lời bằng trace id trong log
+và một kho trace; ``làm sao biết trước khi người dùng báo?'' bằng cảnh
+báo RED ở biên; ``tracing tốn gì?'' bằng thảo luận lấy mẫu ở trên ---
+và phiên bản senior của mọi câu trả lời gọi tên thành phần ở lại
+(instrumentation và trace id trong mọi dòng log) và những thành phần
+thay được (mọi thứ phía sau exporter).
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Độ trễ p99 tăng gấp đôi đêm qua. Hãy dẫn tôi qua cách tìm nguyên nhân.}
+
+Bắt đầu từ metric, không phải log: histogram
+\code{http\_server\_requests} tại gateway, tách theo \code{uri}, cho
+bạn biết trong một truy vấn liệu \emph{mọi} route đều chậm (hạ tầng
+--- node, mạng, GC) hay chỉ một route (một nhánh code hoặc một
+downstream). Rồi lấy một trace chậm từ khung giờ đó --- với lấy mẫu
+head-based ở 1\% sẽ có vài trăm --- và đọc thác span: span chậm hoặc là
+một span con (một lời gọi downstream, chẳng hạn chặng Feign tới
+auth-service mất 800\,ms thay vì 8) hoặc là khoảng trống giữa các span
+con (chính service đó, thường là một lời gọi cơ sở dữ liệu hay một
+lock, hiện ra như thời gian trong span cha không được span con nào phủ).
+Nếu là khoảng trống, trace id đưa bạn tới log của service đó đúng phút
+ấy; layout JSON làm việc đó thành một lượt tra index. Chi tiết senior
+là thứ tự --- tổng hợp, rồi một mẫu đại diện, rồi log của nó --- và gọi
+tên thứ bạn ước có: một liên kết exemplar từ bucket histogram thẳng tới
+một trace, thứ các stack gốc OpenTelemetry cung cấp còn Zipkin thì
+không.
+
+\subsection*{Q: Bạn không thể trace 100\%. Bạn lấy mẫu gì, và không bao giờ bỏ gì?}
+
+Lấy mẫu head-based 1--10\% cho trạng thái ổn định, quyết định tại
+gateway và lan truyền trong cờ của \code{traceparent} để các service
+phía sau không bao giờ bất đồng. Không bao giờ bỏ lỗi và không bao giờ
+bỏ phần đuôi chậm --- điều lấy mẫu head-based không thể hứa, vì span
+gốc được lấy mẫu trước khi ai biết request sẽ thất bại. Nên câu trả lời
+thật có hai tầng: một collector lấy mẫu tail-based giữ mọi trace có 5xx
+hoặc vượt ngân sách độ trễ, cộng một nền ngẫu nhiên 1\% cho hình dáng
+lưu lượng bình thường. Nói thẳng về chi phí: lấy mẫu tail-based đệm
+trọn trace trong bộ nhớ collector suốt cửa sổ quyết định, thường
+10--30\,s, nên collector được định cỡ theo lưu lượng, không theo thứ
+bạn giữ. Trong dự án này đó là bước từ \code{zipkin-reporter-brave}
+sang một exporter OTLP cộng một collector; code ứng dụng không đổi.
+
+\subsection*{Q: Một request biến mất khỏi trace ở Kafka. Vì sao, và sửa thế nào?}
+
+Vì ngữ cảnh trace chỉ vượt qua Kafka dưới dạng header của record, và
+không gì ghi chúng trừ khi template được bảo. Trong Spring Kafka hai
+thuộc tính làm việc đó, cả hai mặc định false trong Boot~3: phía
+producer, \code{template.observation-enabled}; phía consumer,
+\code{listener.observation-enabled} (cả hai dưới \code{spring.kafka}).
+Điểm tinh tế đáng nói to: thuộc tính chỉ cấu hình template tự cấu hình,
+nên một bean \code{KafkaTemplate} dựng tay --- đúng thứ
+\code{KafkaProducerConfig} của course-service làm --- cần
+\code{setObservationEnabled(true)} trong code. Sau khi sửa, span
+consumer có cha là span producer và toàn bộ đường e-mail treo dưới
+request HTTP gốc. Câu tiếp theo người phỏng vấn muốn: span consumer là
+\emph{con}, nhưng nó có thể chạy vài giây hay vài giờ sau khi request
+kết thúc, nên màn hình trace sắp theo thời gian sẽ hiện một khoảng
+trống dài --- khoảng trống đó là độ trễ hàng đợi, và bản thân nó là
+metric cần theo dõi.
+
+\subsection*{Q: Bạn sẽ đánh thức người trực vì cái gì với stack này?}
+
+Triệu chứng người dùng cảm nhận, diễn đạt thành SLO, không bao giờ là
+tài nguyên thô. Hai cảnh báo gọi người: tỷ lệ 5xx của gateway vượt ngân
+sách lỗi suốt mười phút --- điểm duy nhất mọi request đi qua --- và độ
+trễ p99 tại gateway vượt mục tiêu trong cùng cửa sổ. Một cảnh báo mức
+ticket: consumer lag của notification tăng suốt mười lăm phút, vì đó là
+``mail không đi ra'' ở dạng duy nhất hệ thống diễn đạt được. Mọi thứ
+khác --- CPU, heap, pod khởi động lại, pool Hikari cạn --- là panel
+dashboard giải thích một cảnh báo, không phải bản thân cảnh báo; cảnh
+báo CPU 80\% đánh thức người vì một hệ thống đang hoạt động. Khung
+senior là ngân sách lỗi: ở mục tiêu sẵn sàng 99,9\% bạn được đốt 43
+phút lỗi mỗi tháng, và cảnh báo nổ trên \emph{tốc độ đốt}, đó là lý do
+tỷ lệ được đo trong một cửa sổ chứ không trên một request thất bại
+đơn lẻ.
+
+\subsection*{Q: Request của một người dùng chạm năm service. Làm sao tìm năm dòng log đó?}
+
+Bằng trace id, thứ mọi service đều in vì mẫu log có
+\code{\%X\{traceId\}} và cầu nối tracing điền MDC ở mọi chặng. Trên
+laptop đó là grep xuyên log container; trong cụm là truy vấn trên một
+kho log đánh index trường đó, và đó là lý do log được gửi dưới dạng
+JSON thay vì parse bằng regex. Hai chi tiết tách một câu trả lời
+senior: thứ nhất, trace id phải được \emph{trả về cho người dùng} ---
+một header phản hồi \code{X-Trace-Id} từ gateway --- để một ticket hỗ
+trợ trích dẫn được nó thay vì ``khoảng 3 giờ chiều''; thứ hai, bất kỳ
+thứ gì chạy ngoài request (\code{@Scheduled}, \code{@Async}, một
+consumer Kafka không lan truyền) log ra id rỗng, và bạn nên biết những
+nhánh code nào của mình thuộc loại đó trước sự cố.
+
+\subsection*{Q: Zipkin chết. Production có chậm đi không?}
+
+Không, và bạn nên nói được vì sao từ thiết kế của reporter: span được
+trao cho một hàng đợi trong bộ nhớ và một thread nền POST chúng theo
+lô, nên không thread request nào chờ Zipkin; hàng đợi bị chặn ở 10.000
+span và bỏ khi tràn, nên bộ nhớ có trần; các lô thất bại được log và
+thử lại ở lần rút kế tiếp, nên hồi phục là tự động. Thứ bạn mất là span
+trong cửa sổ sự cố --- không có replay. Cái bẫy trong câu hỏi là trường
+hợp ngược lại: một exporter \emph{đồng bộ}, hay một hàng đợi không
+giới hạn, sẽ biến sự cố giám sát thành sự cố ứng dụng, và đó là tính
+chất cần kiểm tra trước khi đưa vào bất kỳ agent hay exporter nào. Và
+cách giảm nhẹ cho các span bị mất cũng giống mọi thứ khác trong chương
+này: trace id vẫn nằm trong mọi dòng log, nên log mang sự đối chiếu
+ngay cả khi kho trace không thể.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Nêu chính xác thuộc tính hay lời gọi phương thức đang thiếu ở
+  mỗi trong hai nửa phía Kafka của dự án, và giải thích vì sao chỉ đặt
+  thuộc tính sẽ sửa được auth-service nhưng không sửa được
+  course-service.
+  \item Một request tới gateway mang \code{X-B3-TraceId} từ một proxy
+  upstream cũ. Dự án tiếp tục trace đó hay khởi tạo trace mới, và mặc
+  định nào của Boot~3 quyết định điều đó? Header nào rời gateway hướng
+  về course-service?
+  \item \code{/actuator/prometheus} nằm trong mọi danh sách exposure
+  mà vẫn trả 404. Giải thích, và nêu tên đúng một artifact thay đổi câu
+  trả lời.
+  \item Zipkin chết một giờ dưới lưu lượng bình thường. Cho biết chuyện
+  gì xảy ra với độ trễ request, với heap, và với các span sinh ra trong
+  giờ đó --- và cái nào trong ba thứ sẽ đổi nếu reporter là đồng bộ.
+  \item Ở \code{probability: 0.01}, tỷ lệ request \emph{thất bại} có
+  trace là bao nhiêu, và thành phần kiến trúc nào cần có để đưa tỷ lệ
+  đó lên 1.0 mà không trace mọi request thành công?
+  \item Một đồng nghiệp thêm \code{span.tag("email", user.getEmail())}
+  vào span đăng nhập. Dự đoán sự cố trong những tuần tiếp theo và nêu
+  quy tắc ngăn nó.
+\end{enumerate}
+\end{quiz}

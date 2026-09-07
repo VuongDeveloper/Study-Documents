@@ -1,0 +1,559 @@
+\chapter{Đào sâu: Bảo đảm giao nhận Kafka --- ít nhất một lần, consumer lũy đẳng và dead letter}
+\label{ch:dd-kafka}
+
+Chương~10 đưa ra quy tắc ngón tay cái --- Kafka là ít-nhất-một-lần, nên
+hãy làm consumer lũy đẳng --- và Chương~11 cho thấy phòng thủ poison
+pill. Chương đào sâu này đọc các thiết lập producer và consumer mà dự
+án thực sự chạy, phần lớn nó chưa từng viết ra, và đi theo một thông
+điệp qua mọi nơi nó có thể bị nhân đôi hoặc mất. Rồi bổ sung hai thứ mà
+một consumer production cần và dự án còn thiếu: một bản ghi khử trùng
+và một đường thử lại kết thúc ở dead-letter topic thay vì một dòng log.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Dự án đứng ở đâu} trên thang nhiều-nhất-một-lần /
+  ít-nhất-một-lần / đúng-một-lần --- không phải theo ý định, mà theo
+  các mặc định nó thừa hưởng?
+  \item \textbf{Chính xác khi nào một thông điệp được giao hai lần}, và
+  consumer phải làm gì để điều đó vô hại?
+  \item \textbf{Chuyện gì xảy ra với một thông điệp không xử lý được},
+  và nó nên đi đâu thay vì đi vào hư không?
+\end{enumerate}
+
+\section{Vì sao chọn nó, và nó giải quyết gì}
+
+Dự án dùng Kafka cho một việc: tách một lần ghi nghiệp vụ khỏi các hiệu
+ứng phụ của nó. Một user đăng ký; một mail phải đi; một dòng học viên
+phải xuất hiện trong cơ sở dữ liệu khác. Làm những việc đó inline sẽ
+khiến đăng ký chậm và mong manh như SMTP và một Postgres thứ hai. Làm
+qua một log khiến chúng \emph{cuối cùng} xảy ra, sống sót qua khởi động
+lại consumer, và phát lại được. Chương~6 đã nói về tách đồng bộ/bất
+đồng bộ; điều nó chưa nói là ``cuối cùng'' có nghĩa chính xác trong
+Kafka, gồm năm hay sáu thiết lập, và mặc định của các thiết lập đó là
+thứ dự án đang chạy hôm nay.
+
+\begin{decision}[sự kiện, không phải lệnh --- và khi nào một lời gọi mới đúng]
+\code{ts.user.registered} nói ``việc này đã xảy ra''; nó không nói
+``hãy gửi e-mail''. Notification-service tự quyết đăng ký nghĩa là gì
+với nó, và course-service bỏ qua topic này hoàn toàn. Đó là phong cách
+sự kiện, và là lý do một consumer thứ tư có thể thêm vào mà không đụng
+auth-service. Phong cách lệnh --- một thông điệp \code{SendEmail} gửi
+đích danh cho một handler --- ghép bên gửi vào sự tồn tại của bên nhận
+và thường là dấu hiệu rằng người ta thực ra muốn một lời gọi đồng bộ.
+Và đôi khi đúng là thế: khi bên gọi cần \emph{kết quả} ngay (user này có
+tồn tại không? file này đã quét chưa?), một lời gọi Feign với circuit
+breaker là thiết kế trung thực, và khoác cho nó cái áo request-reply
+qua Kafka chỉ thêm hai chặng và một correlation id. Quy tắc của dự án:
+sự kiện cho các sự thật mà service khác phản ứng; lời gọi cho các câu
+hỏi bên gọi phải có đáp án trước khi tiếp tục.
+\end{decision}
+
+\section{Những thiết lập dự án chưa từng viết}
+
+\subsection{Producer}
+
+Course-service dựng producer bằng tay trong \code{KafkaProducerConfig}:
+
+\begin{lstlisting}[language=Java]
+Map<String, Object> configProps = new HashMap<>();
+configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+        StringSerializer.class);                              (*@\co{1}@*)
+configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+        JsonSerializer.class);
+return new DefaultKafkaProducerFactory<>(configProps);
+\end{lstlisting}
+
+Ba dòng --- và mọi thứ khác là mặc định của client Kafka~3.9. Từ
+Kafka~3.0 các mặc định đó là những giá trị an toàn:
+
+\begin{lstlisting}[language=properties]
+acks=all
+enable.idempotence=true
+retries=2147483647
+max.in.flight.requests.per.connection=5
+delivery.timeout.ms=120000
+max.block.ms=60000
+linger.ms=0
+\end{lstlisting}
+
+Auth-service và notification-service dùng factory tự cấu hình của
+Spring Boot từ YAML, thứ đặt cùng hai serializer và không gì khác, nên
+cả ba producer hành xử giống nhau.
+
+\begin{description}
+  \item[\co{1}] Key serializer quan trọng hơn vẻ ngoài. Mọi publisher
+  trong dự án đều truyền key: \code{event.userId()} trong
+  \code{UserRegisteredPublisher} và \code{UserActivatedPublisher},
+  \code{assignmentId} trong \code{AssignmentCreatedPublisher}. Kafka
+  băm key để chọn partition; key bằng nhau, partition bằng nhau, và
+  broker giữ thứ tự trong một partition. Đó là toàn bộ bảo đảm thứ tự
+  theo user, và nó là một chuỗi ký tự.
+\end{description}
+
+Các mặc định nghĩa là gì, từng cái một:
+
+\begin{itemize}
+  \item \textbf{\code{acks=all}}: leader chờ mọi replica đồng bộ trước
+  khi xác nhận. Với \code{replicas: 1} trong \code{kafka-topics.yaml} và
+  một broker duy nhất trong Compose, ``all'' là một --- độ bền bằng một
+  cái đĩa. Trong production nó đi cùng \code{replication.factor=3} và
+  \code{min.insync.replicas=2}: một lần ghi sống sót khi một broker
+  chết, và nếu hai broker chết producer nhận \code{NotEnoughReplicas}
+  thay vì một lần ghi bản-sao-đơn âm thầm.
+  \item \textbf{Producer lũy đẳng}: mỗi producer nhận một id và đánh số
+  thông điệp theo partition; một lần thử lại sau khi mất ack được broker
+  nhận ra và không nối thêm lần hai. Điều này khép lại bản sao \emph{phía
+  producer} của Chương~10. Nó không làm gì cho phía consumer.
+  \item \textbf{\code{retries} không giới hạn, bị chặn bởi
+  \code{delivery.timeout.ms}}: producer thử lại lỗi tạm thời tới hai
+  phút, rồi làm future thất bại. \code{send()} đã trả về từ lâu; không
+  ai trong dự án đọc future đó.
+\end{itemize}
+
+\begin{pitfall}[YAML không làm gì cả]
+Triệu chứng: bạn thêm \code{spring.kafka.producer.acks: 1} vào
+\code{course-service.yml} để tăng tốc một bài load test, và không gì
+thay đổi. Nguyên nhân: \code{KafkaProducerConfig} khai báo bean
+\code{ProducerFactory} riêng, việc đó tắt auto-configuration của Boot
+cho factory ấy --- khối producer trong YAML không được ai đọc trong
+course-service. Auth-service, không có bean như vậy, \emph{sẽ} tuân
+theo nó. Hai service, một quy ước YAML, hai hành vi. Cách sửa: xóa bean
+viết tay (factory của Boot làm y hệt) hoặc chuyển mọi thuộc tính vào
+đó; không bao giờ cả hai.
+\end{pitfall}
+
+\subsection{Consumer}
+
+YAML consumer trong \code{notification-service.yml} và
+\code{course-service.yml} đặt tên group, \code{auto-offset-reset:
+earliest}, và các deserializer xử lý lỗi. Mọi thứ về \emph{commit} lại
+là mặc định, lần này của Spring Kafka:
+
+\begin{itemize}
+  \item \code{enable.auto.commit=false}. Spring tắt commit theo hẹn giờ
+  của client và tự commit.
+  \item \code{AckMode.BATCH}. Sau khi listener trả về cho \emph{mọi}
+  record của một \code{poll()}, Spring commit offset cao nhất của lô.
+  Xử lý và commit cách nhau bằng thời gian xử lý của lô.
+  \item \code{DefaultErrorHandler} với \code{FixedBackOff(0, 9)}: một
+  listener ném ngoại lệ được thử lại thêm chín lần không chờ, rồi
+  record được \emph{log và bỏ qua}. Không gửi đi đâu. Không đếm ở đâu
+  mà dự án đọc.
+  \item \code{max.poll.records=500}, \code{max.poll.interval.ms=300000}:
+  một lô tới 500 record phải xử lý xong trong năm phút, nếu không
+  consumer bị coi là đã chết.
+\end{itemize}
+
+Ghép bốn thứ đó lại và vị trí của dự án là: ít-nhất-một-lần, với bản
+sao khả dĩ ở mọi lần crash hay rebalance, và với mất mát âm thầm sau
+mười lần thử thất bại. Cả thứ tự lẫn mất mát đều không được viết trong
+file nào bạn có thể \code{grep}.
+
+\section{Chính xác khi nào xảy ra bản sao}
+
+Dòng thời gian tạo ra một bản sao, với \code{notification-group} chạy
+hai instance A và B trên một topic có hai partition:
+
+\begin{lstlisting}
+t0   A polls partition 0, gets offsets 40..49   (committed: 40)
+t1   A processes 40..47: eight e-mails sent
+t2   A is killed (rolling update, OOMKilled, SIGKILL)
+     -- offset 40 is still the committed position --
+t3   group rebalances; partition 0 is assigned to B
+t4   B polls from the committed offset: 40
+t5   B processes 40..49: ten e-mails sent
+     -- users 40..47 receive their activation mail twice --
+\end{lstlisting}
+
+Không gì ở đây là lỗi. Nó là hợp đồng: Kafka hứa offset sẽ không tiến
+qua một record bạn chưa xử lý xong; cái giá là một record bạn \emph{đã}
+xử lý xong nhưng chưa commit sẽ quay lại. Mọi consumer làm bất cứ điều
+gì không đảo ngược được --- gửi mail, chèn dòng, trừ tiền thẻ --- phải
+được viết cho \code{t5}.
+
+Hai biến thể quan trọng với dự án này. \code{AckMode.RECORD} commit sau
+mỗi record thay vì mỗi lô: ít bản sao hơn khi crash (một thay vì tới
+500), nhiều lượt commit hơn. Và biến thể \emph{consumer chậm} không cần
+crash nào: nếu xử lý một lô lâu hơn \code{max.poll.interval.ms}, broker
+loại consumer khỏi group, instance khác nhận partition từ commit cuối,
+và \emph{cả hai} cuối cùng xử lý cùng những record --- cái đầu chưa
+nhận ra mình đã bị đuổi.
+
+\begin{pitfall}[một bài tập, một cơn bão e-mail trùng]
+Triệu chứng: giáo viên tạo bài tập trong khóa có 300 học viên; một số
+học viên nhận thông báo ba lần; log consumer hiện \code{Member ... has
+left the group} và một rebalance. Nguyên nhân:
+\code{AssignmentCreatedListener} lặp qua \code{enrolledStudentEmails} và
+gọi \code{javaMailSender.send()} cho từng địa chỉ, đồng bộ, trên luồng
+poll. Một giây mỗi vòng SMTP, 300 e-mail là năm phút --- đúng bằng
+\code{max.poll.interval.ms}. Consumer bị đuổi giữa vòng lặp, partition
+được gán lại, và chủ mới bắt đầu vòng lặp lại từ học viên đầu tiên.
+Cách sửa, theo chi phí: tăng \code{max.poll.interval.ms} (vá tạm), phát
+một record \code{ts.notification.email} cho mỗi người nhận để mỗi mail
+là một đơn vị công việc riêng (hình dạng đúng), và làm việc gửi lũy
+đẳng theo người nhận (Mục~\ref{sec:enhancing-kafka}).
+\end{pitfall}
+
+\section{Ưu và nhược, thẳng thắn}
+
+\begin{center}
+\begin{tabular}{@{}p{0.28\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+ & Dự án hôm nay & Nền production \\
+\midrule
+Độ bền producer & \code{acks=all}, 1 replica & 3 replica, \code{min.insync}=2 \\
+Bản sao producer & không (lũy đẳng) & không (lũy đẳng) \\
+Bản sao consumer & có thể, chưa xử lý & có thể, đã khử trùng \\
+Record thất bại & log và bỏ sau 10 lần & topic thử lại, rồi DLT \\
+Thứ tự & theo key, 1 partition & theo key, N partition \\
+Việc chậm & trên luồng poll & tách ra, hoặc bất đồng bộ \\
+Quan sát & không có lag & cảnh báo lag, cảnh báo DLT \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Điểm yếu trung thực của dự án: mất mát âm thầm sau mười lần thử; fan-out
+e-mail trên luồng poll; không khử trùng nơi hiệu ứng phụ không tự nhiên
+lũy đẳng (mail); không có metric lag nào ai nhìn; và topic một partition,
+khiến thứ tự tầm thường và song song bất khả.
+
+\section{Nâng cấp giải pháp}
+\label{sec:enhancing-kafka}
+
+\subsection{Một consumer lũy đẳng có sổ ghi những gì đã thấy}
+
+\code{UserActivatedListener} đã lũy đẳng theo khóa tự nhiên --- giao
+lại lần hai tìm thấy học viên và trả về. Nơi không có khóa tự nhiên, ghi
+lại id sự kiện. Outbox của Chương~33 đặt một header \code{eventId} duy
+nhất lên mọi thông điệp; consumer giữ một bảng các id nó đã xử lý xong,
+và ghi dòng đó \emph{trong cùng transaction} với thay đổi nghiệp vụ.
+Flyway \code{V3\_\_create\_processed\_events.sql} trong course-service:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE processed_events (
+    event_id     UUID PRIMARY KEY,
+    consumer     VARCHAR(64) NOT NULL,     -- listener name
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- retention: rows older than the topic's retention are useless
+CREATE INDEX idx_processed_events_at ON processed_events (processed_at);
+\end{lstlisting}
+
+Listener, viết lại để đọc header và giành id trước:
+
+\begin{lstlisting}[language=Java]
+@KafkaListener(topics = "ts.user.activated", groupId = "course-group")
+@Transactional                                              (*@\co{1}@*)
+public void onUserActivated(
+        UserActivatedEvent event,
+        @Header("eventId") String eventId) {
+
+    int claimed = jdbc.update("""
+        INSERT INTO processed_events (event_id, consumer)
+        VALUES (?::uuid, 'UserActivatedListener')
+        ON CONFLICT (event_id) DO NOTHING""", eventId);      (*@\co{2}@*)
+    if (claimed == 0) {
+        log.info("duplicate event {} ignored", eventId);
+        return;                                             (*@\co{3}@*)
+    }
+    if (!ROLE_STUDENT.equalsIgnoreCase(event.role())) {
+        return;
+    }
+    Long userId = Long.parseLong(event.userId());
+    Student student = studentRepository.findByUserId(userId)
+            .orElseGet(() -> Student.builder().userId(userId).build());
+    student.setFirstName(event.firstName());               (*@\co{4}@*)
+    student.setLastName(event.lastName());
+    student.setEmail(event.email());
+    studentRepository.save(student);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một transaction cơ sở dữ liệu bao quanh việc giành và
+  việc thay đổi. Nếu \code{save()} thất bại, lượt giành cũng rollback,
+  và lần thử lại có thể giành lại. Nếu JVM chết sau commit nhưng trước
+  khi commit offset Kafka, lần giao lại rơi vào \co{3}.
+  \item[\co{2}] \code{ON CONFLICT DO NOTHING} là toàn bộ thuật toán khử
+  trùng: một insert-nếu-chưa-có nguyên tử. Không có race đọc-rồi-ghi
+  giữa hai instance consumer cùng nhận một record sau rebalance.
+  \item[\co{3}] Trả về bình thường, không ném ngoại lệ: offset phải tiến
+  qua một bản sao.
+  \item[\co{4}] Nhân tiện, upsert thay vì insert-nếu-thiếu, để cùng
+  listener này phục vụ luôn sự kiện \code{ts.user.updated} mà Chương~33
+  thêm vào.
+\end{description}
+
+Notification-service không có cơ sở dữ liệu, và mail là hiệu ứng phụ
+duy nhất bạn không thể thu hồi. Các lựa chọn, thẳng thắn về chi phí:
+chấp nhận thỉnh thoảng một mail trùng (điều dự án ngầm làm); hoặc cho
+service một kho nhỏ --- Redis \code{SET eventId 1 NX EX 604800} trước
+khi gửi, cùng lượt giành đó trong một lệnh; hoặc làm chính mail lũy đẳng
+bằng cách đặt id sự kiện vào header \code{Message-ID}, để hộp thư khử
+trùng thứ consumer không làm được.
+
+\subsection{Topic thử lại và dead-letter topic}
+
+Thay ``thử lại mười lần trong một mili giây, rồi quên'' bằng thử lại có
+chờ, và một đích đến cho thứ vẫn thất bại. \code{@RetryableTopic} của
+Spring Kafka làm điều này bằng topic thay vì thread, nên một record kẹt
+không chặn partition phía sau nó:
+
+\begin{lstlisting}[language=Java]
+@RetryableTopic(
+        attempts = "4",                                     (*@\co{1}@*)
+        backoff = @Backoff(delay = 2_000, multiplier = 3),  (*@\co{2}@*)
+        include = { MailSendException.class,
+                    MailAuthenticationException.class },    (*@\co{3}@*)
+        dltStrategy = DltStrategy.FAIL_ON_ERROR)
+@KafkaListener(topics = "ts.user.registered",
+               groupId = "notification-group")
+public void onUserRegistered(UserRegisteredEvent event) {
+    emailService.sendActivationEmail(
+            event.email(), event.firstName(), event.activationCode());
+}
+
+@DltHandler                                                 (*@\co{4}@*)
+public void onDeadLetter(UserRegisteredEvent event,
+        @Header(KafkaHeaders.EXCEPTION_MESSAGE) String reason,
+        @Header(KafkaHeaders.ORIGINAL_OFFSET) long offset) {
+    log.error("DLT ts.user.registered offset={} user={} reason={}",
+            offset, event.userId(), reason);
+    meter.counter("kafka.dlt", "topic", "ts.user.registered")
+         .increment();                                      (*@\co{5}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một lần thử trên topic chính, ba lần trên các topic thử
+  lại.
+  \item[\co{2}] Độ trễ 2, 6 và 18 giây --- khoảng nửa phút để MailDev
+  hay một SMTP relay quay lại. Spring tạo các topic
+  \code{ts.user.registered-retry-2000}, \code{-retry-6000},
+  \code{-retry-18000} và \code{ts.user.registered-dlt}; dưới Strimzi
+  (Chương~25) hãy khai báo chúng là object \code{KafkaTopic} hoặc để
+  auto-creation bật.
+  \item[\co{3}] Chỉ thử lại thứ mà chờ đợi sửa được. Lỗi giải tuần tự
+  hay \code{NullPointerException} đi thẳng tới DLT; thử lại nó ba lần là
+  diễn kịch.
+  \item[\co{4}] Handler dead-letter là một listener bình thường trên
+  topic \code{-dlt}. Nó \emph{không được} ném ngoại lệ.
+  \item[\co{5}] Một counter, để ``DLT không rỗng'' là một cảnh báo (khả
+  năng quan sát của Chương~27) thay vì một phát hiện tình cờ.
+\end{description}
+
+Làm gì với một dead letter là quyết định vận hành, không phải code: một
+cảnh báo bắn; ai đó đọc header \code{EXCEPTION\_MESSAGE}; bản sửa được
+đưa lên; và các record được \emph{phát lại} --- chép từ DLT về topic
+chính bằng một công cụ admin nhỏ hoặc Kafka UI --- nơi consumer lũy đẳng
+bảo đảm những cái đã thành công bị bỏ qua.
+
+\begin{handson}[xem bậc thang thử lại và dead letter]
+Làm hỏng SMTP, đăng ký một user, và đọc các topic:
+\begin{lstlisting}[language=bash]
+$ docker compose stop maildev
+$ curl -s -X POST localhost:8080/api/auth/register -H \
+  'Content-Type: application/json' -d '{"email":"dlt@test.io", \
+  "password":"Passw0rd!","firstName":"D","lastName":"L", \
+  "activationMethod":"EMAIL"}'
+$ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:19092 --list | grep registered
+ts.user.registered
+ts.user.registered-dlt
+ts.user.registered-retry-18000
+ts.user.registered-retry-2000
+ts.user.registered-retry-6000
+\end{lstlisting}
+Khoảng 26 giây sau request, notification-service log
+\code{DLT ts.user.registered offset=0 user=... reason=Mail server
+connection failed}. Khởi động lại MailDev, chép record từ DLT sang
+\code{ts.user.registered} trong Kafka UI (\code{localhost:9090}), và
+mail kích hoạt tới nơi.
+\end{handson}
+
+\subsection{Đúng một lần, và những gì nó không bao phủ}
+
+Transaction của Kafka cho đúng-một-lần với một hình dạng cụ thể: tiêu
+thụ từ topic A, sản xuất sang topic B, commit cả offset lẫn đầu ra một
+cách nguyên tử (\code{isolation.level=read\_committed} ở bên đọc). Các
+bộ xử lý luồng cần nó; dự án không có giai đoạn nào như vậy. Transaction
+\emph{không} trải qua Kafka và Postgres, hay Kafka và SMTP --- khoảnh
+khắc hiệu ứng phụ rời khỏi broker, bạn quay về ít-nhất-một-lần cộng lũy
+đẳng. Người phỏng vấn hỏi ``có thể đạt đúng-một-lần không?'' muốn đúng
+sự phân biệt đó: có bên trong Kafka, không xuyên hệ thống, và outbox
+cộng một bảng khử trùng là cách bạn đạt hiệu quả đó xuyên hệ thống dù
+sao đi nữa.
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+\begin{itemize}
+  \item \textbf{notification-service chết bốn giờ.} Không gì mất: record
+  tích lại trên topic, retention là 168 giờ trong Compose và mặc định
+  bảy ngày của Strimzi. Consumer lag --- khoảng cách giữa offset cuối
+  của partition và offset đã commit của group --- lớn lên vài nghìn.
+  Khi khởi động lại service tiêu thụ chúng ở tốc độ SMTP; mọi mail kích
+  hoạt đến trễ, không cái nào thiếu. Điều \emph{sẽ} làm mất chúng: một
+  sự cố dài hơn retention, hoặc một lần triển khai lại dưới group id
+  \emph{mới}, bắt đầu từ \code{earliest} và gửi lại mọi mail trong bảy
+  ngày lịch sử.
+  \item \textbf{Broker chết.} Producer chặn trong \code{max.block.ms}
+  ở lần lấy metadata đầu, rồi ném ngoại lệ --- sự cố đăng ký sáu mươi
+  giây của Chương~33. Producer đã kết nối sẵn đệm tới
+  \code{buffer.memory} (32\,MB) và thử lại trong
+  \code{delivery.timeout.ms}; sau hai phút future thất bại và, vì không
+  ai đọc nó, sự kiện biến mất. Consumer đơn giản là poll không được gì.
+  Outbox biến tất cả chuyện này thành một cột \code{attempts} tăng dần.
+  \item \textbf{Phát lại từ hôm qua.} Vận hành reset \code{course-group}
+  về một mốc thời gian bằng
+  \code{kafka-consumer-groups.sh --reset-offsets --to-datetime}. Mọi sự
+  kiện từ đó được giao lại; với lượt giành \code{processed\_events} mỗi
+  cái tốn một insert thất bại. Không có nó, mail đi hai lần và dòng học
+  viên được thử tạo hai lần (chỉ được cứu bởi ràng buộc
+  \code{UNIQUE(user\_id)}).
+  \item \textbf{Một key nóng.} Mọi sự kiện cho một khóa học rất lớn rơi
+  vào một partition; thêm partition không giúp gì vì key chọn partition.
+  Đổi key --- theo người nhận thay vì theo bài tập --- hoặc chấp nhận
+  thông lượng của một key là thông lượng của một consumer.
+\end{itemize}
+
+\section{Ngoài dự án}
+
+Mọi Kafka được quản lý --- Confluent Cloud, AWS MSK, Aiven --- đều giao
+\code{acks=all}, ba replica và \code{min.insync.replicas=2} làm điểm
+khởi đầu, và bán dashboard lag như thứ đầu tiên bạn nhìn. Topic thử lại
+và DLT chuẩn tới mức Parallel Consumer của Confluent, consumer proxy
+của Uber và \code{@RetryableTopic} của Spring đều cài cùng bậc thang;
+khác biệt ở cách chúng giữ thứ tự theo key qua các lần thử lại (Spring
+mặc định không giữ --- một record thử lại có thể được xử lý sau một
+record muộn hơn cùng key, ổn cho mail và không ổn cho bút toán sổ cái).
+RabbitMQ và SQS cho bạn ack theo từng thông điệp và dead-letter queue
+như tính năng của broker thay vì mẫu thư viện; thứ chúng không thể cho
+là phát lại, chính là lý do một log được chọn ngay từ đầu.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Làm sao tăng số thông điệp Kafka xử lý được trong một đơn vị thời gian?}
+
+Tôi bắt đầu từ consumer, vì đó là nơi giới hạn của dự án nằm. Partition
+là đơn vị song song: một group không thể có nhiều consumer hoạt động
+hơn số partition của topic, và mọi topic trong \code{kafka-topics.yaml}
+đều có một. Nên thay đổi đầu tiên là số partition --- 6 hoặc 12, chọn
+dư vì partition thêm được nhưng không bao giờ bớt được, và thêm sau này
+làm đổi phép băm key-sang-partition, phá thứ tự theo key với dữ liệu
+đang bay. Rồi khớp consumer với partition:
+\code{spring.kafka.listener.concurrency=3} mỗi pod nhân hai replica cho
+sáu thread trên sáu partition. Kế đến, đưa việc chậm ra khỏi luồng
+poll: một \code{AssignmentCreated} gửi 300 e-mail đồng bộ là một lô năm
+phút làm sập \code{max.poll.interval.ms}; thay vào đó phát một record
+cho mỗi người nhận, để thông lượng tăng theo partition. Phía producer,
+gom lô: \code{linger.ms=5--20} và \code{batch.size=64--256\,KB} cho
+client gửi hàng trăm record mỗi request, và \code{compression.type=lz4}
+hoặc \code{zstd} cắt byte trên đường truyền ba đến năm lần với JSON.
+\code{acks=1} tăng thông lượng producer chừng gấp đôi với cái giá mất
+một lần ghi khi leader chết trước khi nhân bản --- tôi giữ
+\code{acks=all} cho bất cứ thứ gì không tái tạo được. Phía consumer,
+\code{max.poll.records} và \code{fetch.min.bytes} đổi độ trễ lấy ít vòng
+đi hơn, bị chặn bởi thứ vừa trong \code{max.poll.interval.ms}. Và tôi để
+ý key nóng: nếu một partition gánh 80\,\% tải vì chọn key dở, không gì ở
+trên giúp được và cách sửa là một key khác.
+
+\subsection*{Q: Consumer lag đang tăng. Bạn chẩn đoán thế nào?}
+
+Trước hết tôi xác định nó là một trong ba thứ: consumer chậm, consumer
+chết, hay producer nhanh lên. \code{kafka-consumer-groups.sh --describe
+--group notification-group} cho lag theo partition và member nào sở hữu
+mỗi cái; lag trên \emph{mọi} partition mà member vẫn có mặt nghĩa là xử
+lý chậm; lag trên \emph{một số} với member biến mất nghĩa là một
+instance chết hoặc kẹt trong rebalance; lag xuất hiện ở một thời điểm rõ
+ràng với tiêu thụ đều nghĩa là một đợt bùng nổ producer. Với xử lý chậm
+tôi nhìn thời gian mỗi record của listener --- trong dự án này là độ trễ
+SMTP --- và sự khuấy đảo rebalance trong log (\code{Member ... has
+left}), nghĩa là \code{max.poll.interval.ms} đang bị chạm và group đang
+quay cuồng. Cách sửa đi theo chẩn đoán: thêm partition và concurrency,
+đưa lời gọi chậm ra khỏi luồng, hoặc, nếu đợt bùng nổ là hợp lệ, để nó
+chảy hết và chỉ cảnh báo khi lag già hơn SLO tính bằng giây, không phải
+lớn hơn một số record. Metric để vẽ là lag theo \emph{thời gian}, không
+theo số lượng.
+
+\subsection*{Q: Một thông điệp bị xử lý hai lần. Vì sao, và làm sao cho an toàn?}
+
+Vì Kafka commit offset sau khi xử lý, và tiến trình chết, hoặc bị đuổi
+vì chậm, giữa hai việc đó. Đó là ít-nhất-một-lần hoạt động đúng thiết
+kế. Làm cho an toàn nghĩa là mọi consumer hoặc có khóa lũy đẳng tự
+nhiên --- \code{findByUserId} của \code{UserActivatedListener} --- hoặc
+giành một id sự kiện duy nhất trong cùng transaction với hiệu ứng phụ:
+\code{INSERT ... ON CONFLICT DO NOTHING} vào \code{processed\_events},
+trả về nếu không dòng nào. Id phải tới từ producer, đúc một lần và mang
+qua các lần thử lại, chính là thứ dòng outbox cho bạn. Với hiệu ứng phụ
+không có transaction --- e-mail --- tôi đặt id vào \code{Message-ID} của
+thư hoặc giành nó trong Redis bằng \code{SET NX}. Điều tôi không làm là
+chuyển sang \code{AckMode.RECORD} và gọi là đã sửa; việc đó thu hẹp cửa
+sổ từ một lô xuống một record và để nguyên lỗi tại chỗ.
+
+\subsection*{Q: Làm sao bảo đảm thứ tự cho một user?}
+
+Key mọi sự kiện về user đó theo id user, để phép băm đặt chúng vào một
+partition, và giữ một thread consumer cho mỗi partition. Đó là toàn bộ
+bảo đảm, và nó có ba cách vỡ: producer lũy đẳng bị tắt với
+\code{max.in.flight} trên một, cho phép một lô thử lại rơi sau lô muộn
+hơn; đổi số partition, làm băm lại key; và topic thử lại, chèn lại một
+record thất bại phía sau những record kế tiếp nó. Với dự án, key
+\code{userId} trên \code{ts.user.*} đã làm việc này. Nếu nghiệp vụ cần
+phát biểu mạnh hơn --- ``cập nhật được áp dụng sau tạo, luôn luôn'' ---
+tôi thêm số phiên bản vào sự kiện và để consumer từ chối bất cứ thứ gì
+cũ hơn cái nó có, điều biến thứ tự từ thuộc tính của broker thành bất
+biến của consumer.
+
+\subsection*{Q: Một broker chết. Producer làm gì?}
+
+Với ba broker và \code{replication.factor=3}, controller bầu leader mới
+từ các replica đồng bộ cho mỗi partition bị ảnh hưởng trong vài giây;
+producer nhận \code{NotLeaderOrFollower}, làm mới metadata, và thử lại
+--- vô hình với ứng dụng vì \code{retries} không giới hạn và
+\code{delivery.timeout.ms} là hai phút. Nếu broker chết kéo ISR xuống
+dưới \code{min.insync.replicas}, producer nhận \code{NotEnoughReplicas}
+và tiếp tục thử lại; với \code{acks=all} đó là sự từ chối đúng đắn việc
+ghi một bản sao duy nhất. Trên stack Compose một broker của dự án không
+có failover: các lần gửi được đệm, future thất bại sau hai phút, và dòng
+outbox là thứ cứu sự kiện. Điều duy nhất tôi kiểm tra khi review là có
+ai đọc future không --- trong dự án này không ai, nên lỗi phía producer
+là âm thầm.
+
+\subsection*{Q: Làm sao phát lại một topic từ hôm qua?}
+
+Dừng consumer group, reset offset của nó, khởi động lại:
+\code{kafka-consumer-groups.sh --reset-offsets --group course-group
+--topic ts.user.activated --to-datetime 2026-09-06T00:00:00.000
+--execute}. Group phải không hoạt động, nếu không lệnh từ chối. Trước
+khi chạy tôi trả lời hai câu hỏi: consumer có lũy đẳng với mọi thứ kể
+từ mốc đó không --- vì mọi record sẽ quay lại --- và dữ liệu còn đó
+không, phụ thuộc vào retention (\code{168h} ở đây) và topic có compact
+không. Với một record đơn lẻ tôi phát lại từ DLT thay vì reset cả group.
+Và tôi không bao giờ phát lại vào một group gửi e-mail mà chưa xác nhận
+đường khử trùng, vì ``chúng ta gửi lại 40\,000 mail kích hoạt'' là sự cố
+theo sau một lần reset tự tin.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Nêu tên các thiết lập producer khiến producer của dự án lũy
+  đẳng và bền vững, và giải thích vì sao \code{acks=all} trên stack
+  Compose yếu hơn nghe có vẻ.
+  \item Vẽ (bằng lời) dòng thời gian trong đó \code{notification-group}
+  gửi cùng một mail kích hoạt hai lần mà không có crash nào, và nêu tên
+  thiết lập mà giá trị của nó định nghĩa điểm kích hoạt.
+  \item Vì sao insert vào \code{processed\_events} và lần ghi nghiệp vụ
+  phải chung một transaction? Mô tả sự xen kẽ đi sai nếu insert commit
+  trước một mình.
+  \item Trong cấu hình \code{@RetryableTopic}, giải thích vì sao
+  \code{include} chỉ liệt kê ngoại lệ mail và chuyện gì xảy ra với một
+  \code{NullPointerException}.
+  \item Course-service khai báo bean \code{ProducerFactory} riêng. Nêu
+  hệ quả cho khối \code{spring.kafka.producer} trong YAML của nó, và
+  cách sửa một dòng.
+  \item Notification-service đã chết chín ngày. Nêu chuyện gì xảy ra
+  khi khởi động lại, thiết lập nào quyết định, và điều gì khác đi nếu nó
+  khởi động lại với \code{group-id: notification-v2}.
+\end{enumerate}
+\end{quiz}

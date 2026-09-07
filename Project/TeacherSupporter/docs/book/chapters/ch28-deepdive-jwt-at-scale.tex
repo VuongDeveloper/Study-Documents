@@ -1,0 +1,680 @@
+\chapter{Deep Dive: JWT at Scale --- Where to Verify, Fat Tokens, and Asymmetric Keys}
+\label{ch:jwt-scale}
+
+Chapter~5 taught the project's security design as it is: HS256 tokens,
+verified once at the gateway, identity forwarded as headers. That design
+is correct for a system with one gateway and five services. This chapter
+is the first of the book's \emph{deep dives}: it takes one design already
+in the project and pushes it until it breaks, the way an interviewer or a
+tenfold traffic increase would. The questions come from a widely shared
+Vietnamese article on JWT in
+microservices;\footnote{``Lột trần sự thật về JWT --- Phần 2: Trận chiến
+Microservices và nỗi ám ảnh Token béo phì'', viblo.asia, 2026.} the
+answers come from reading the project's code.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{Where should a token be verified} --- at the gateway
+  once, or in every service?
+  \item \textbf{What happens when the token gets fat} --- and what is the
+  \emph{phantom token} pattern that keeps it thin?
+  \item \textbf{What does a signature actually guarantee}, and why does
+  the choice between HS256 and RS256 decide who can be trusted with what?
+\end{enumerate}
+
+\section{Where to verify: gateway or every service?}
+\label{sec:where-to-verify}
+
+\subsection{Model 1: centralized verification (what the project does)}
+
+Re-read the two halves of the trusted-edge pattern. At the edge, in the
+gateway's \code{JwtAuthenticationFilter}:
+
+\begin{lstlisting}[language=Java]
+Claims claims = Jwts.parser()
+        .verifyWith(signingKey)                    (*@\co{1}@*)
+        .build()
+        .parseSignedClaims(token)
+        .getPayload();
+
+String userId = claims.getSubject();
+String role = claims.get(JwtConstants.CLAIM_ROLE, String.class);
+
+ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+        .header(JwtConstants.HEADER_USER_ID, userId)   (*@\co{2}@*)
+        .header(JwtConstants.HEADER_USER_ROLE, role)
+        .build();
+\end{lstlisting}
+
+And behind it, in every service's \code{GatewayHeaderAuthFilter}
+(course-service's copy shown):
+
+\begin{lstlisting}[language=Java]
+String userId = request.getHeader("X-User-Id");
+String userRole = request.getHeader("X-User-Role");
+
+if (userId != null && userRole != null) {               (*@\co{3}@*)
+    var authorities = List.of(
+            new SimpleGrantedAuthority("ROLE_" + userRole));
+    var authentication = new UsernamePasswordAuthenticationToken(
+            Long.valueOf(userId), null, authorities);
+    SecurityContextHolder.getContext().setAuthentication(authentication);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Cryptography happens exactly once, here. The key is the
+  same \code{app.jwt.secret} that auth-service signs with.
+  \item[\co{2}] Identity leaves the gateway as two plain HTTP headers.
+  Nothing downstream can tell whether the gateway wrote them or someone
+  else did.
+  \item[\co{3}] The service performs \emph{no} check. Two headers
+  present means authenticated. This is the whole contract.
+\end{description}
+
+The advantages are real: one place holds the secret, services stay free of
+JWT libraries and key handling, and the per-request CPU cost of signature
+checking is paid once. Most Spring Cloud tutorials stop here.
+
+\subsection{The ``trusted internal network'' fallacy}
+
+The pattern rests on one invariant --- \emph{every} path to a service
+passes through the gateway. In the project's Compose file that invariant
+is already false. \code{docker-compose.yml} publishes auth-service on
+\code{8081} and course-service on \code{8082} directly to the host, so
+that you can debug them. Anyone on the host can therefore skip the
+gateway:
+
+\begin{handson}[forge an identity in one line]
+With the stack running, ask course-service for a teacher's courses without
+ever presenting a token:
+\begin{lstlisting}[language=bash]
+$ curl -s -H "X-User-Id: 1" -H "X-User-Role: TEACHER" \
+       http://localhost:8082/courses | head -c 300
+\end{lstlisting}
+It answers. Now repeat through the gateway on \code{8080} with the same
+two headers and no \code{Authorization}:
+\begin{lstlisting}[language=bash]
+$ curl -s -H "X-User-Id: 1" -H "X-User-Role: TEACHER" \
+       http://localhost:8080/api/courses
+{"error":"Unauthorized","message":"Missing or invalid Authorization header"}
+\end{lstlisting}
+The difference between the two outputs is the entire security model.
+\end{handson}
+
+In Kubernetes the published ports go away (Chapter~18), but the flat pod
+network remains: any pod in the namespace can reach
+\code{course-service:8082}. The fallacy is assuming that ``inside'' means
+``trusted''. One compromised container --- a vulnerable image, a leaked
+kubeconfig, a supply-chain dependency --- and the attacker forges
+\code{X-User-Id: 1} to every service at once.
+
+\begin{pitfall}[identity headers survive public paths]
+Symptom: nothing visible, which is the problem. Look at the top of
+\code{JwtAuthenticationFilter.filter}: a request to a public path
+(\code{/api/auth/refresh}, \code{/actuator/**}) is forwarded
+\emph{unmodified} --- the gateway neither verifies a token nor touches
+headers. A client can therefore send \code{X-User-Id: 1} to a public path
+and the header arrives at the service intact. Today no public endpoint
+reads it, so nothing is exploitable; but the invariant ``only the gateway
+writes these headers'' is not enforced, it is merely true by luck. The fix
+is one default filter in \code{api-gateway.yml} that strips both headers
+from every \emph{incoming} request before the JWT filter sets them:
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - RemoveRequestHeader=X-User-Id
+        - RemoveRequestHeader=X-User-Role
+\end{lstlisting}
+Now the headers can only originate at the gateway. This closes the
+external door; it does nothing for the in-cluster one.
+\end{pitfall}
+
+\subsection{Model 2: zero trust --- every service verifies}
+
+The alternative removes the trust: every service parses and verifies the
+JWT itself, and ignores any identity header. A forged header is now
+worthless because the service never reads it; a forged token fails
+signature verification. The gateway may still verify --- rejecting bad
+tokens early is cheap --- but nothing downstream \emph{depends} on it.
+
+The cost appears immediately: every verifier needs the key. With HS256
+that means copying the \emph{signing} secret to every service, which is
+worse than the problem it solves (Section~\ref{sec:hs-vs-rs}). Zero trust
+at the application layer is only reasonable with asymmetric keys, which
+is why the two halves of this chapter belong together.
+
+\begin{decision}[gateway-verified headers, for now]
+The project keeps Model~1. It has exactly two key holders, no
+third-party services, and every service is deployed by the same
+pipeline --- the blast radius of the trusted-edge assumption is the
+single namespace. Three signals would flip the decision: a service
+written by another team, a service reachable by any caller other than
+the gateway (a Kafka consumer that also exposes HTTP, a batch job), or
+a compliance requirement that identity be verifiable at the point of
+use. At that moment the move is RS256 plus per-service verification,
+not more headers. Production systems usually take a third path: keep the
+headers, and make the \emph{transport} prove the sender with mutual TLS
+from a service mesh (Istio, Linkerd). The gateway then becomes a
+cryptographically identified peer instead of an unverifiable
+neighbor.
+\end{decision}
+
+\section{What a signature guarantees}
+
+A JWT is \code{base64url(header).base64url(payload).signature}. The first
+two parts are \emph{encoded}, not encrypted: paste any project token into
+a decoder and \code{sub}, \code{email}, \code{role} are readable. The
+signature adds exactly two properties:
+
+\begin{itemize}
+  \item \textbf{Integrity.} Change one byte of the payload
+  (\code{"role":"STUDENT"} to \code{"TEACHER"}) and verification fails.
+  \item \textbf{Authenticity.} The token was produced by a holder of the
+  signing key --- and by nobody else.
+\end{itemize}
+
+It adds no confidentiality. Both HS256 and RS256 compute the signature
+over the same string, \code{base64url(header) + "." +
+base64url(payload)}. They differ only in \emph{which key creates the
+signature and which key checks it}. That single difference decides the
+whole trust topology of a system.
+
+\section{HS256 versus RS256}
+\label{sec:hs-vs-rs}
+
+\subsection{HS256: one key, two roles}
+
+HS256 is HMAC-SHA256: a hash with a key mixed in. You do not need the
+construction (two nested SHA-256 passes with the key XORed against fixed
+pads); you need one property. \emph{The same key both creates and checks
+the signature.} Verifying means recomputing the HMAC with your copy of
+the key and comparing bytes. Without the key you cannot compute it, so you
+cannot forge. With the key you can compute it, so you \emph{can} forge.
+Verifier and signer are indistinguishable.
+
+The project's two copies of that key:
+
+\begin{lstlisting}[language=Java]
+// auth-service/.../service/JwtService.java
+this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+
+// api-gateway/.../filter/JwtAuthenticationFilter.java
+this.signingKey = Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8));
+\end{lstlisting}
+
+Both read \code{app.jwt.secret}; in the cluster both mount the same
+\code{jwt} Secret (Chapter~16). The gateway only ever needs to
+\emph{verify}, yet it holds a key that can \emph{mint} a token for any
+user with any role. Compromise the gateway pod and you own every identity
+in the system. Extend Model~2 naively --- copy the secret to five
+services --- and you have six such places.
+
+\subsection{RS256: two keys, one role each}
+
+RS256 is an RSA signature over a SHA-256 digest. RSA rests on an
+asymmetry in arithmetic: multiplying two large primes is instant;
+recovering them from the product is infeasible.
+
+Key generation, once:
+
+\begin{enumerate}
+  \item Pick two large primes $p$, $q$ (about 1024 bits each for a
+  2048-bit key). Compute $n = p \times q$.
+  \item Pick a public exponent $e$; in practice always $65537$. The pair
+  $(n, e)$ is the \textbf{public key}.
+  \item Compute $d$ such that $e \times d \equiv 1 \pmod{(p-1)(q-1)}$.
+  The pair $(n, d)$ is the \textbf{private key}. Computing $d$ requires
+  $p$ and $q$; knowing only $n$ does not give them.
+\end{enumerate}
+
+Signing and verifying:
+
+\begin{lstlisting}
+h = SHA256(header "." payload), padded (PKCS#1 v1.5)
+sign:    signature = h^d  mod n      -- needs d: only auth-service
+verify:  signature^e mod n == h ?    -- needs e, n: anyone
+\end{lstlisting}
+
+Because $e \times d \equiv 1$, raising to $d$ and then to $e$ returns
+$h$. Anyone with the public key can check a signature; nobody without $d$
+can produce one. That is the asymmetry HS256 lacks, and it changes who
+may hold what:
+
+\begin{figure}[htb]
+\centering
+\begin{tikzpicture}[node distance=6mm and 15mm]
+  \node[boxdark] (auth) {auth-service\\private key $(n,d)$};
+  \node[boxfill, right=of auth] (jwks) {JWKS endpoint\\public key $(n,e)$, \code{kid}};
+  \node[box, right=of jwks] (gw) {api-gateway\\verify only};
+  \node[box, above=of gw] (dict) {dictionary-service\\verify only};
+  \node[box, below=of gw] (course) {course-service\\verify only};
+  \draw[flow] (auth) -- node[lbl,above]{publishes} (jwks);
+  \draw[flowdash] (jwks.east) -- node[lbl,below,pos=0.55]{fetch, cache} (gw.west);
+  \draw[flowdash] (jwks.east) -- (dict.west);
+  \draw[flowdash] (jwks.east) -- (course.west);
+\end{tikzpicture}
+\caption{RS256 key topology: one signer, any number of verifiers. Leaking
+a verifier leaks nothing.}
+\label{fig:rs256-topology}
+\end{figure}
+
+\begin{itemize}
+  \item Auth-service holds the private key and is the \emph{only}
+  place a token can be issued.
+  \item Gateway and every service hold the public key. Leaking it is
+  harmless --- it is public by definition. You could print it in this
+  book.
+  \item Key distribution stops being a secret-management problem: publish
+  the public key at a well-known URL (a \emph{JWKS}, JSON Web Key Set),
+  and any verifier fetches it at startup and caches it.
+\end{itemize}
+
+You already consume this topology. The Google login of Chapter~5 returns
+an \code{id\_token} signed RS256; Spring's OAuth2 client verifies it
+against Google's JWKS at
+\code{https://www.googleapis.com/oauth2/v3/certs}. Google never hands you
+its private key, and you never need it.
+
+\subsection{The costs}
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & HS256 & RS256 (2048-bit) \\
+\midrule
+Key material & one secret, $\ge$ 32 bytes & private + public, $\approx$1.7\,KB PEM each \\
+Signature size & 32 bytes (43 chars) & 256 bytes (342 chars) \\
+Sign & microseconds & about 1\,ms \\
+Verify & microseconds & tens of microseconds \\
+Who can sign & any key holder & private-key holder only \\
+Who can verify & any key holder & anyone \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+RSA verification is far cheaper than signing because $e = 65537$ is tiny
+while $d$ is 2048 bits wide. That asymmetry fits the topology: one signer,
+many verifiers. If signature size matters, ES256 (ECDSA on curve P-256)
+gives 64-byte signatures and much smaller keys, and is the modern
+default for new identity providers.
+
+\begin{pitfall}[algorithm confusion]
+Symptom: a token that should be rejected is accepted --- and your logs
+show nothing wrong. Cause: older libraries read the \code{alg} field of
+the header to decide \emph{how} to verify. An attacker takes a legitimate
+RS256 token, rewrites the header to \code{"alg":"HS256"}, and signs it
+with HMAC using the \emph{public key bytes} as the secret --- bytes that
+are, by design, public. A naive verifier sees HS256, uses the public key
+it has as an HMAC secret, and the check passes. JJWT prevents this by
+letting the \emph{key type} choose the algorithm, not the header:
+\code{verifyWith(SecretKey)} rejects any asymmetric token and
+\code{verifyWith(PublicKey)} rejects any HMAC token. That is why
+\code{JwtAuthenticationFilter} is safe today, and why you must never
+verify with a method that accepts ``whatever the header says''.
+\end{pitfall}
+
+\subsection{Converting the project}
+
+The change is small enough to read in full. Generate the pair once:
+
+\begin{lstlisting}[language=bash]
+$ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+      -out jwt-private.pem
+$ openssl pkey -in jwt-private.pem -pubout -out jwt-public.pem
+\end{lstlisting}
+
+The private PEM goes only into auth-service's Secret; the public PEM can
+go into a ConfigMap, because it is not secret. \code{JwtService} signs
+with the private key:
+
+\begin{lstlisting}[language=Java]
+@Service
+public class JwtService {
+
+    private final PrivateKey privateKey;   // sign
+    private final PublicKey publicKey;     // self-verify where needed
+
+    public JwtService(@Value("${app.jwt.private-key-pem}") String privPem,
+                      @Value("${app.jwt.public-key-pem}") String pubPem)
+            throws GeneralSecurityException {
+        KeyFactory kf = KeyFactory.getInstance("RSA");
+        this.privateKey = kf.generatePrivate(
+                new PKCS8EncodedKeySpec(decodePem(privPem)));      (*@\co{1}@*)
+        this.publicKey = kf.generatePublic(
+                new X509EncodedKeySpec(decodePem(pubPem)));
+    }
+
+    public String generateAccessToken(User user) {
+        return Jwts.builder()
+                .header().keyId("2026-09-key1").and()             (*@\co{2}@*)
+                .subject(String.valueOf(user.getId()))
+                .claim("email", user.getEmail())
+                .claim("role", user.getRole().name())
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis()
+                        + accessTokenExpiryMs))
+                .signWith(privateKey, Jwts.SIG.RS256)             (*@\co{3}@*)
+                .compact();
+    }
+
+    private static byte[] decodePem(String pem) {
+        String body = pem.replaceAll("-----BEGIN [A-Z ]+-----", "")
+                         .replaceAll("-----END [A-Z ]+-----", "")
+                         .replaceAll("\\s", "");
+        return Base64.getDecoder().decode(body);
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] PKCS\#8 is the container format \code{openssl genpkey}
+  writes for private keys; X.509 \code{SubjectPublicKeyInfo} is what
+  \code{-pubout} writes. Strip the PEM armor, base64-decode, done.
+  \item[\co{2}] \code{kid} (key id) names the key that signed this token.
+  It costs a few bytes now and makes rotation possible later.
+  \item[\co{3}] JJWT infers RS256 from the key type; naming it
+  explicitly documents the intent.
+\end{description}
+
+The gateway --- and any service that wants to verify for itself ---
+holds only the public key:
+
+\begin{lstlisting}[language=Java]
+public JwtAuthenticationFilter(@Value("${app.jwt.public-key-pem}") String pubPem)
+        throws GeneralSecurityException {
+    this.publicKey = KeyFactory.getInstance("RSA")
+            .generatePublic(new X509EncodedKeySpec(decodePem(pubPem)));
+}
+
+Claims claims = Jwts.parser()
+        .verifyWith(publicKey)      // PublicKey: accepts RS/PS/ES only
+        .build()
+        .parseSignedClaims(token)
+        .getPayload();
+\end{lstlisting}
+
+Nothing else changes: same claims, same headers, same
+\code{GatewayHeaderAuthFilter}. The gateway can no longer mint tokens,
+and \code{api-gateway.yml} no longer needs \code{app.jwt.secret} at all.
+
+\subsection{Rotation, and what \code{kid} is for}
+
+Keys age: policy says rotate every 90 days, or a laptop with the PEM on it
+is lost. Rotation without logging every user out is a four-step ceremony:
+
+\begin{enumerate}
+  \item Generate a new pair; add its public key to the JWKS alongside the
+  old one, under a new \code{kid}.
+  \item Wait until every verifier has refreshed its cache (or restart
+  them).
+  \item Switch auth-service to sign with the new private key. New tokens
+  carry the new \code{kid}; old tokens, still in flight, carry the old
+  one --- and verifiers pick the matching public key by \code{kid}.
+  \item After the longest token lifetime has elapsed (here 15 minutes
+  for access tokens), remove the old key from the JWKS.
+\end{enumerate}
+
+Without \code{kid} a verifier would have to try every key it knows;
+with it, the lookup is exact and the old key can be retired with
+confidence. The project's static-PEM version above has no JWKS endpoint;
+the natural next step is to serve \code{/.well-known/jwks.json} from
+auth-service and have verifiers use Spring Security's
+\code{NimbusJwtDecoder.withJwkSetUri(...)}, which caches and refetches on
+an unknown \code{kid} automatically.
+
+\section{Payload bloat}
+\label{sec:payload-bloat}
+
+Statelessness is seductive: if the token carries everything a service
+needs, no service ever calls another to ask ``may this user do this?''
+Teams follow that logic until the token carries the user's roles,
+permissions, groups, feature flags, and profile --- and weighs 4\,KB. The
+arithmetic then turns against them. A dashboard page firing 20 parallel
+API calls ships 80\,KB of token before a single byte of business data.
+Multiply by tens of thousands of concurrent users and the authentication
+header is a measurable share of ingress bandwidth. Cookies, if that is
+where the token lives, have a 4\,KB ceiling; some proxies cap header size
+at 8\,KB; logs that record headers bloat in step.
+
+The project's access token is thin. \code{JwtService.generateAccessToken}
+writes \code{sub}, \code{email}, \code{role}, \code{iat}, \code{exp} ---
+about 200 bytes signed. Keep it that way by rule: \textbf{a token carries
+identity; entitlements are looked up.} The moment course-service needs to
+know ``which courses may this teacher edit?'', the temptation to add a
+\code{courseIds} claim appears. Resist it. That list changes when a
+course is created, which the token cannot know until it expires; and it
+grows without bound. The service already owns the enrollment data
+(Chapter~7) --- one indexed query answers the question correctly and
+currently.
+
+\section{The phantom token pattern}
+
+Suppose the fat token is unavoidable --- a legacy authorization model, a
+partner integration. The phantom token pattern keeps the \emph{external}
+token tiny while the \emph{internal} one stays self-contained:
+
+\begin{enumerate}
+  \item Auth-service creates the full JWT but does \emph{not} return it.
+  It stores the JWT in a fast store (Redis) under a random opaque
+  identifier, and returns only that identifier --- a UUID, 36 bytes.
+  \item The gateway receives the UUID, looks it up, and swaps in the real
+  JWT before forwarding. Internal services see a normal signed token.
+  \item Internal services verify it themselves (RS256, JWKS). Inside the
+  perimeter the system is stateless and zero-trust; outside, the client
+  carries a token with no readable content at all.
+\end{enumerate}
+
+Logout becomes trivial and \emph{immediate}: \code{DEL <uuid>} in Redis,
+and the next request with that identifier fails at the gateway with 401,
+no matter how long the inner JWT would have lived. This is the pattern's
+real prize --- it repairs JWT's one structural weakness, irrevocability.
+
+The project already runs half of it. Look at
+\code{JwtService.generateRefreshTokenValue}:
+
+\begin{lstlisting}[language=Java]
+public String generateRefreshTokenValue() {
+    return UUID.randomUUID().toString();
+}
+\end{lstlisting}
+
+The refresh token is not a JWT. It is an opaque identifier stored in the
+\code{refresh\_tokens} table (Flyway \code{V2}) and revoked by deleting
+the row --- \code{AuthService.logout} does exactly that. The access token
+remains a self-contained JWT. So the project's revocation latency is
+bounded by the access token's 15 minutes, and its revocation
+\emph{mechanism} is the phantom pattern applied to the long-lived
+credential only.
+
+\begin{pitfall}[refresh without rotation]
+Read \code{AuthService.refreshToken}: it returns the \emph{same} refresh
+token it was given. A refresh token stolen once is therefore valid for
+its full seven days, and the theft is undetectable. The industry
+practice is \emph{rotation}: every \code{/refresh} issues a new refresh
+token and invalidates the old one. If an old token is ever presented
+again, two parties hold copies --- revoke the whole family. The table
+already has the columns to do this; the change is a delete-and-insert in
+one transaction.
+\end{pitfall}
+
+\begin{decision}[three ways to revoke an access token]
+When an admin disables an account, the project's answer is ``within 15
+minutes''. The alternatives, in ascending cost:
+\begin{enumerate}
+  \item \textbf{Wait it out.} Short access tokens plus stateful refresh
+  tokens. Zero extra infrastructure; revocation lag equals access-token
+  lifetime. Acceptable for most applications, and what the project does.
+  \item \textbf{Deny-list.} Add a \code{jti} (token id) claim; on
+  logout or disable, write the \code{jti} to Redis with a TTL equal to
+  the token's remaining life; the gateway checks Redis on every request.
+  One fast lookup per request, and only revoked tokens are stored.
+  \item \textbf{Phantom token.} Opaque identifier outside, JWT inside,
+  Redis as the mapping. Immediate revocation and no readable token in
+  the browser --- but Redis is now in the critical path of \emph{every}
+  request. Redis down means every user is logged out at once.
+\end{enumerate}
+A senior engineer's objection to the article's enthusiasm: option~3
+trades ``cannot revoke'' for ``one new single point of failure''. Most
+teams should reach for option~2 first and treat option~3 as a fit for
+banking-grade requirements, where the article itself admits sessions may
+be the better tool anyway.
+\end{decision}
+
+\section{What breaks at 3\,a.m.}
+
+Failure analysis is the fastest way to tell the two key models apart.
+Auth-service goes down at 3\,a.m.; nothing else does.
+
+\begin{itemize}
+  \item \textbf{HS256, as deployed.} The gateway holds the secret and
+  verifies locally: every logged-in user keeps working until their
+  access token expires. Refresh calls fail (auth-service is the
+  \code{/refresh} endpoint), so sessions die within 15 minutes. New
+  logins fail. Recovery is instant when auth-service returns.
+  \item \textbf{RS256 with cached JWKS.} Identical for running
+  verifiers: they cached the public key at startup and need nothing from
+  auth-service. The new failure is a \emph{cold} verifier --- a gateway
+  pod restarted during the outage cannot fetch the JWKS, and depending on
+  its configuration either refuses all tokens (fail closed) or crashes
+  at boot. Mitigations: ship the current public key in configuration as
+  a fallback, or give the JWKS cache a long grace period.
+  \item \textbf{Phantom token.} Add Redis to the list of things that must
+  be up. Auth-service down has the same effects as above; Redis down is
+  a total outage of authenticated traffic.
+\end{itemize}
+
+The lesson generalizes: statelessness buys you independence from the
+issuer at request time. Every mechanism you add to regain control ---
+JWKS, deny-lists, opaque mappings --- reintroduces a dependency, and you
+should be able to name it and say what happens when it is unavailable.
+
+\section{When JWT is the wrong tool}
+
+The article closes with a warning worth repeating, because the project's
+own path (Chapter~27) includes a monolithic alternative. JWT earns its
+complexity when \emph{many independent parties} must answer ``who is
+calling?'' without sharing a session store: microservices, single
+sign-on across applications, OAuth2/OIDC federation. It is the wrong
+tool when the system is a single deployable with room for its sessions in
+memory, when permissions change often and must take effect immediately,
+or when a regulator requires that a session be terminable in
+milliseconds. In those cases a server-side session with a cookie is
+simpler, revocable, and boring --- and boring is a feature.
+
+\section{Outside the project}
+
+Keycloak, Auth0, Cognito, Okta and Entra ID all issue RS256 or ES256
+tokens and publish JWKS; every Spring resource server in the industry
+verifies with the one-line \code{jwk-set-uri} configuration shown in
+Chapter~5. Service meshes (Istio, Linkerd) implement the mTLS variant of
+zero trust so that application code keeps reading headers while the
+transport proves who wrote them. The phantom token pattern is
+productized by Curity and by API gateways such as Kong and Apigee under
+names like ``token introspection'' and ``opaque token exchange''. Knowing
+the hand-rolled version --- one HS256 secret, two holders --- is what
+makes those products legible.
+
+\section{Questions from real interviews}
+
+These are asked as open problems, not definitions. The answers below are
+what a senior engineer says in the first two minutes; the interviewer
+then digs into whichever trade-off you named.
+
+\subsection*{Q: How do you invalidate a JWT before it expires?}
+
+You do not; you bound the damage. Access tokens live minutes, not hours,
+so ``wait it out'' is the baseline. For immediate revocation add a
+\code{jti} claim and a deny-list in Redis with TTL equal to the token's
+remaining life --- one lookup per request, only revoked tokens stored,
+and Redis unavailability can fail open or closed by policy. Full
+opacity (phantom token) makes revocation instant but puts Redis on
+every request's critical path. In this project the refresh token is
+already opaque and database-backed, so ``log out everywhere'' is
+\code{DELETE FROM refresh\_tokens WHERE user\_id = ?} plus, at most, 15
+minutes of residual access.
+
+\subsection*{Q: Login traffic goes from 10 to 10\,000 per second. What breaks?}
+
+Signing first: RS256 signing is about 1\,ms of CPU per token, so ten
+thousand logins per second is ten cores of pure signing, while HS256
+would be negligible. Then password hashing, which is deliberately slow
+(bcrypt at cost 10 is roughly 100\,ms) --- that is the real wall, and
+the answer is horizontal scaling of auth-service plus rate limiting
+per IP and per account at the gateway. Verification is not the problem:
+RS256 verify is tens of microseconds and needs no network. Also check
+that the refresh-token insert is not on a single hot index and that
+the \code{refresh\_tokens} table is pruned of expired rows.
+
+\subsection*{Q: Two regions, one auth system. What has to be shared?}
+
+For HS256, the secret, which is a distribution problem you do not want
+across regions. For RS256, only the public key set, which is
+cacheable, public, and can lag safely for the length of the rotation
+overlap. Clocks matter more than keys: \code{exp} and \code{iat} are
+compared to the verifier's clock, so allow a small skew (JJWT's
+\code{clockSkewSeconds}, typically 30--60\,s) and run NTP everywhere.
+Refresh tokens are stateful, so either pin refresh to the issuing
+region or replicate the table; the project's single Postgres would be
+the first thing to change.
+
+\subsection*{Q: A token was stolen from a user's browser. What do you do?}
+
+Contain, then detect. Contain: revoke the user's refresh tokens; the
+access token dies within its lifetime. Detect: refresh-token rotation
+turns a replayed old token into a signal --- two parties presenting the
+same family means theft, revoke the family. Prevent: keep the refresh
+token in an \code{HttpOnly} cookie so injected scripts cannot read it,
+and keep the access token in memory rather than \code{localStorage}
+(Chapter~38). Add device or IP binding only if you accept the
+false-positive cost for mobile users.
+
+\subsection*{Q: Why not just check the database on every request?}
+
+You can, and monoliths do --- that is a session. The reason not to in
+a service architecture is that every service would need the user store
+or a call to the one that has it, which puts auth-service on the
+critical path of everything and couples every deploy to it. A signed
+token lets each hop answer ``who is this'' locally. The honest answer
+names the cost --- revocation lag --- and the price you paid to buy
+back control: short lifetimes, a stateful refresh token, optionally a
+deny-list.
+
+\subsection*{Q: What is in your token, and what is deliberately not?}
+
+Subject, role, issued-at, expiry, and here an e-mail --- identity, not
+entitlements. Not in it: permissions lists, group memberships, anything
+that changes more often than the token expires, anything another
+service owns, and anything secret (the payload is readable). If an
+interviewer pushes for ``put the permissions in so we skip a query'',
+the senior answer is the arithmetic of Section~\ref{sec:payload-bloat}:
+4\,KB times every request, and a stale authorization decision
+frozen for the token's lifetime.
+
+\begin{quiz}
+\begin{enumerate}
+  \item After the RS256 conversion, \code{api-gateway.yml} no longer
+  contains \code{app.jwt.secret}. If the entire config-server were
+  leaked, could the attacker forge a token? Explain which file would
+  have to leak instead.
+  \item Describe the 90-day rotation ceremony and state precisely which
+  problem \code{kid} solves in step~3.
+  \item Thirty services each verify RS256 tokens with a JWKS fetched at
+  startup. Auth-service dies at 3\,a.m. Which users are affected, when,
+  and which single event during the outage would make a verifier reject
+  \emph{all} traffic?
+  \item A colleague proposes adding a \code{courseIds} claim so that
+  course-service can authorize without a query. Give two reasons to
+  refuse that are independent of token size.
+  \item The gateway forwards a request to a public path without touching
+  headers. Explain why this is a latent rather than an active
+  vulnerability today, and name the one-line configuration that removes
+  the latency.
+  \item An admin disables a user who is logged in. Give the revocation
+  lag under the project's current design, and name the extra dependency
+  each of the two faster designs introduces.
+\end{enumerate}
+\end{quiz}

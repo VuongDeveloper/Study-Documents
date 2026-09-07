@@ -1,0 +1,654 @@
+\chapter{Deep Dive: Data Across Services --- Database-per-Service, Duplication, and the Outbox}
+\label{ch:dd-consistency}
+
+Chapter~7 established the rule: each service owns its database, and the
+only road to another service's data is its API or its events. The rule
+is easy to state and expensive to live with. This deep dive follows the
+one piece of data the project copies between services --- a student's
+name and e-mail --- from the moment it is written in auth-service's
+Postgres to the moment it appears in course-service's, and asks what can
+go wrong on the way. The answer is the dual-write problem, and the
+repair is the transactional outbox.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{What does database-per-service buy}, and what does it
+  forbid --- joins, foreign keys, transactions --- that a monolith takes
+  for granted?
+  \item \textbf{How does duplicated data stay correct}, and what is the
+  exact window in which the project is wrong today?
+  \item \textbf{Can ``save the row and publish the event'' be made
+  atomic} --- and if not, what is the closest thing to it?
+\end{enumerate}
+
+\section{Why this, and what it solves}
+
+Open \code{docker-compose.yml}: two Postgres~17 containers,
+\code{postgres-auth} holding \code{ts\_auth} and \code{postgres-course}
+holding \code{ts\_course}, on separate volumes and ports. Nothing in
+course-service knows the first one's address. The isolation buys four
+things:
+
+\begin{itemize}
+  \item \textbf{Schema ownership.} Auth-service can add a
+  \code{totp\_secret} column, rename \code{provider\_id}, or run a
+  destructive Flyway migration without coordinating with anyone.
+  Chapter~7's \code{V3} and \code{V4} migrations happened exactly that
+  way.
+  \item \textbf{Independent deploys.} A migration that locks
+  \code{users} for a minute stalls logins, not course listings.
+  \item \textbf{Independent scaling and tuning.} The course database
+  will grow with submissions; the auth database will not. They can sit
+  on different disks, get different connection pools, different backup
+  schedules.
+  \item \textbf{A hard stop on accidental coupling.} In a shared
+  database the first \code{JOIN users ON student.user\_id = users.id}
+  written under deadline pressure welds two teams' schemas together
+  forever. Here the join is impossible, so it is never written.
+\end{itemize}
+
+It forbids exactly as much:
+
+\begin{itemize}
+  \item \textbf{No cross-service joins.} ``List students in course~7
+  with their e-mails'' cannot be one query if e-mails live elsewhere.
+  \item \textbf{No cross-service foreign keys.} \code{student.user\_id}
+  in \code{V1\_\_create\_course\_tables.sql} is \code{BIGINT NOT NULL
+  UNIQUE} and nothing more --- Postgres cannot check that user~42 exists
+  in a database it cannot see.
+  \item \textbf{No cross-service transactions.} A business operation
+  that must change both databases cannot be rolled back as a unit.
+\end{itemize}
+
+\begin{decision}[copy the student, do not fetch the user]
+Course-service needs a student's name and e-mail on every course roster
+and in every assignment notification. Two designs were possible: call
+auth-service each time (there is even a Feign client for it,
+\code{AuthServiceClient.getUserById}, with a fallback that returns
+\code{null}), or keep a local copy in the \code{student} table. The
+project chose the copy, and the Feign client is dead code --- no class
+in course-service calls it. The reasoning: a roster is read far more
+often than a name changes; a synchronous call per row would make
+course-service's availability a product of auth-service's (Chapter~6);
+and the local copy can be indexed, joined, and paged with plain SQL. The
+cost is that the copy can be \emph{stale}, and the rest of this chapter
+is about how stale, and how to bound it. The decision flips when the
+data changes often or must be authoritative at read time --- an account
+balance, a permission --- where a call, or a cache with explicit
+invalidation, is the honest design.
+\end{decision}
+
+\section{How a student reaches course-service}
+
+Trace the real path. It starts in auth-service's \code{AuthService},
+which is annotated \code{@Transactional} at class level:
+
+\begin{lstlisting}[language=Java]
+public void activate(String code) {
+    User user = userRepository.findByActivationCode(code)
+            .orElseThrow(() ->
+                new IllegalArgumentException("Invalid activation code"));
+
+    user.setActivated(true);
+    user.setActivationCode(null);
+    userRepository.save(user);                       (*@\co{1}@*)
+
+    userActivatedPublisher.publish(user);            (*@\co{2}@*)
+}
+\end{lstlisting}
+
+\code{UserActivatedPublisher} builds a \code{UserActivatedEvent} record
+--- user id, e-mail, first and last name, role --- and calls
+\code{kafkaTemplate.send("ts.user.activated", event.userId(), event)}.
+On the other side, course-service's \code{UserActivatedListener}:
+
+\begin{lstlisting}[language=Java]
+@KafkaListener(topics = "ts.user.activated", groupId = "course-group")
+public void onUserActivated(UserActivatedEvent event) {
+    if (!ROLE_STUDENT.equalsIgnoreCase(event.role())) {
+        return;
+    }
+    Long userId = Long.parseLong(event.userId());
+    if (studentRepository.findByUserId(userId).isPresent()) { (*@\co{3}@*)
+        return;
+    }
+    Student student = Student.builder()
+            .userId(userId)
+            .firstName(event.firstName())
+            .lastName(event.lastName())
+            .email(event.email())
+            .build();
+    studentRepository.save(student);                       (*@\co{4}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The row is dirty inside a transaction that has not yet
+  committed. \code{save()} on a managed entity is a no-op until flush.
+  \item[\co{2}] The event is handed to the Kafka producer \emph{inside}
+  the same transaction, before the commit at method exit. Keep this line
+  in mind; it is the whole problem.
+  \item[\co{3}] The listener is idempotent by natural key: a second
+  delivery of the same event finds the row and returns. This is why the
+  project survives at-least-once delivery (Chapter~34) without a
+  dedup table --- here.
+  \item[\co{4}] The copy. From now on, course-service answers every
+  roster query from this row and never asks auth-service again.
+\end{description}
+
+The consistency window is therefore: from the commit in
+auth-service to the commit in course-service. On a quiet stack it is
+milliseconds. With notification-service and course-service both in the
+consumer path, and the broker on the same two-core box (Chapter~25), it
+can be seconds. A teacher who enrols a student ``immediately'' after the
+student activates may get \code{404 Student not found} from
+\code{EnrollmentService.enroll} --- correct behaviour, surprising UX.
+
+\subsection{What is not propagated at all}
+
+Now look for the second event. There is none. \code{ts.user.activated}
+fires once, at activation. A user who later changes their name or
+e-mail in auth-service is never reflected in \code{student}; the
+\code{DATABASE-DESIGN.md} note ``future: Kafka event propagates e-mail
+changes'' is the acknowledgement. Assignment notifications will keep
+going to the old address. This is the honest state of eventual
+consistency in the project: \emph{eventual} for creation, \emph{never}
+for updates. Section~\ref{sec:enhancing-outbox} adds the missing event.
+
+\section{Pros and cons, candidly}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.3\linewidth}p{0.3\linewidth}@{}}
+\toprule
+ & Shared database & Database-per-service (here) \\
+\midrule
+Cross-entity read & one \code{JOIN} & local copy, or two calls \\
+Integrity & foreign keys & application code + events \\
+Multi-entity write & one transaction & saga or outbox \\
+Schema change & coordinate all owners & owner decides \\
+Failure blast radius & one database, all services & one service \\
+Staleness & none & seconds (creation), unbounded (updates) today \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The project's real weak points, named:
+
+\begin{itemize}
+  \item Update events do not exist; copies drift permanently.
+  \item Save-and-publish is not atomic (next section).
+  \item The Feign fallback returns \code{null}, so if anyone ever wires
+  \code{AuthServiceClient} in, a circuit-open state will surface as a
+  \code{NullPointerException} rather than a clear degraded response.
+  \item No reporting path: ``how many activated students per course''
+  needs data from both databases and there is no read model for it.
+\end{itemize}
+
+\section{The dual-write problem}
+\label{sec:dual-write}
+
+Line \co{2} above writes to two systems --- Postgres and Kafka --- that
+share no transaction manager. Whatever order you put them in, one of
+two failures is possible:
+
+\begin{itemize}
+  \item \textbf{Commit, then lose the event.} \code{send()} is
+  asynchronous: it appends to a client-side buffer and returns a future.
+  The method exits, the transaction commits, and the JVM is killed
+  (\code{OOMKilled}, a rolling update, \code{kubectl delete pod}) before
+  the buffer flushes. The user is activated; course-service never hears
+  of it; the student cannot be enrolled, ever, and nothing logs an
+  error.
+  \item \textbf{Publish, then roll back.} The buffer flushes within
+  milliseconds; the broker acks; then the commit fails --- a unique
+  constraint, a connection dropped, a deadlock. Course-service creates a
+  student for a user that does not exist. A \emph{phantom} row.
+\end{itemize}
+
+Both are rare per request and certain over a year. The interviewer's
+version: ``you save an order and publish \code{OrderCreated}; how do you
+guarantee both happen?'' The junior answer is ``put it in a
+try/catch''. The senior answer starts with ``you cannot, with two
+resources'', then names the outbox.
+
+\begin{pitfall}[registration hangs for sixty seconds, then fails]
+Symptom: with Kafka down, \code{POST /api/auth/register} does not fail
+fast --- it hangs for a minute and returns 500. Cause: the producer must
+fetch topic metadata before its first send; with no broker reachable it
+blocks for \code{max.block.ms} (default 60\,000\,ms) and then throws.
+The exception propagates out of \code{register()}, the transaction
+rolls back, and the user is \emph{not} registered --- because the
+mail-notification broker was down. A dependency that should have been
+asynchronous has become a synchronous point of failure with a one-minute
+timeout. The outbox below turns this into ``registered; e-mail delayed''.
+\end{pitfall}
+
+\begin{pitfall}[the copy that outlives the original]
+Symptom: an assignment e-mail bounces from an address the user changed
+months ago. Cause: \code{student.email} was written once by
+\code{UserActivatedListener} and there is no \code{ts.user.updated}
+event. Fix: emit one, and let the listener upsert. Section~\ref
+{sec:enhancing-outbox} shows the emitter; the listener change is a
+\code{findByUserId().map(update).orElseGet(create)}.
+\end{pitfall}
+
+\section{Enhancing the resolution: the transactional outbox}
+\label{sec:enhancing-outbox}
+
+The idea is to write the event into the \emph{same database}, in the
+\emph{same transaction}, as the business row --- and let a separate
+process copy it to Kafka afterwards. Postgres guarantees the row and the
+event commit together or not at all; the relay guarantees the event
+eventually reaches Kafka; the consumer's idempotency guarantees a
+retried relay does no harm. Here is the full implementation for
+auth-service.
+
+The table, as Flyway migration \code{V5\_\_create\_outbox.sql}:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE outbox (
+    id             UUID PRIMARY KEY,
+    aggregate_type VARCHAR(64)  NOT NULL,   -- 'user'
+    aggregate_id   VARCHAR(64)  NOT NULL,   -- also the Kafka key
+    event_type     VARCHAR(64)  NOT NULL,   -- 'UserActivated'
+    topic          VARCHAR(128) NOT NULL,
+    payload        JSONB        NOT NULL,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    published_at   TIMESTAMPTZ,
+    attempts       INT          NOT NULL DEFAULT 0
+);
+-- the relay's only query: oldest unpublished first
+CREATE INDEX idx_outbox_unpublished
+    ON outbox (created_at) WHERE published_at IS NULL;
+\end{lstlisting}
+
+The entity is deliberately dumb --- a row, not a domain object:
+
+\begin{lstlisting}[language=Java]
+@Entity @Table(name = "outbox")
+@Getter @Setter @NoArgsConstructor
+public class OutboxEvent {
+    @Id private UUID id;
+    private String aggregateType;
+    private String aggregateId;
+    private String eventType;
+    private String topic;
+    @JdbcTypeCode(SqlTypes.JSON)
+    private String payload;                       // serialized event
+    private Instant createdAt;
+    private Instant publishedAt;
+    private int attempts;
+}
+
+public interface OutboxRepository extends JpaRepository<OutboxEvent, UUID> {
+    // SKIP LOCKED: two relay instances never pick the same row
+    @Query(value = """
+        SELECT * FROM outbox WHERE published_at IS NULL
+        ORDER BY created_at LIMIT :n FOR UPDATE SKIP LOCKED""",
+        nativeQuery = true)
+    List<OutboxEvent> lockUnpublished(@Param("n") int n);
+}
+\end{lstlisting}
+
+The publisher no longer touches Kafka. It writes a row, and because it
+is called from inside \code{AuthService}'s transaction, the row commits
+with the user:
+
+\begin{lstlisting}[language=Java]
+@Component
+@RequiredArgsConstructor
+public class UserActivatedPublisher {
+
+    private final OutboxRepository outbox;
+    private final ObjectMapper mapper;
+
+    public void publish(User user) {
+        UserActivatedEvent event = new UserActivatedEvent(
+                String.valueOf(user.getId()), user.getEmail(),
+                user.getFirstName(), user.getLastName(),
+                user.getRole().name());
+        OutboxEvent row = new OutboxEvent();
+        row.setId(UUID.randomUUID());               (*@\co{1}@*)
+        row.setAggregateType("user");
+        row.setAggregateId(event.userId());          (*@\co{2}@*)
+        row.setEventType("UserActivated");
+        row.setTopic("ts.user.activated");
+        row.setPayload(toJson(event));
+        row.setCreatedAt(Instant.now());
+        outbox.save(row);                            (*@\co{3}@*)
+    }
+
+    private String toJson(Object o) {
+        try { return mapper.writeValueAsString(o); }
+        catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+\end{lstlisting}
+
+The relay runs every second, takes a locked batch, sends each row
+\emph{synchronously}, and marks it:
+
+\begin{lstlisting}[language=Java]
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class OutboxRelay {
+
+    private final OutboxRepository outbox;
+    private final KafkaTemplate<String, String> kafka;
+
+    @Scheduled(fixedDelay = 1000)
+    @Transactional                                   (*@\co{4}@*)
+    public void relay() {
+        for (OutboxEvent row : outbox.lockUnpublished(100)) {
+            ProducerRecord<String, String> rec = new ProducerRecord<>(
+                    row.getTopic(), row.getAggregateId(), row.getPayload());
+            rec.headers().add("eventId",
+                    row.getId().toString().getBytes(UTF_8));    (*@\co{5}@*)
+            rec.headers().add("eventType",
+                    row.getEventType().getBytes(UTF_8));
+            try {
+                kafka.send(rec).get(10, TimeUnit.SECONDS);      (*@\co{6}@*)
+                row.setPublishedAt(Instant.now());
+            } catch (Exception e) {
+                row.setAttempts(row.getAttempts() + 1);
+                log.warn("outbox {} attempt {} failed: {}",
+                        row.getId(), row.getAttempts(), e.toString());
+                break;                                          (*@\co{7}@*)
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The event id is minted \emph{here}, once, and survives
+  every retry. It is the consumer's deduplication key (Chapter~34).
+  \item[\co{2}] The aggregate id becomes the Kafka key, so all events
+  about one user land on one partition, in order.
+  \item[\co{3}] A plain \code{INSERT}, in the caller's transaction. If
+  \code{activate()} rolls back, so does this row: no phantom events. If
+  it commits, the row is durable before any Kafka involvement: no lost
+  events.
+  \item[\co{4}] The relay's transaction holds the \code{FOR UPDATE SKIP
+  LOCKED} locks, so a second auth-service replica running the same
+  scheduler takes different rows.
+  \item[\co{5}] Headers carry identity and type without polluting the
+  JSON payload the DTO classes deserialize.
+  \item[\co{6}] The \emph{only} place in auth-service that waits on
+  Kafka, and it is a background thread. HTTP requests never block on
+  the broker again.
+  \item[\co{7}] On failure stop the batch, keep ordering (row~2 must not
+  be published before row~1 for the same key), and let the next tick
+  retry. \code{attempts} is what you alert on.
+\end{description}
+
+Add \code{@EnableScheduling} to \code{AuthServiceApplication} and
+change the \code{KafkaTemplate} to \code{<String, String>}, since the
+payload is already JSON. The consumer sees exactly what it saw before.
+
+Two rows of bookkeeping complete it: a nightly
+\code{DELETE FROM outbox WHERE published\_at < now() - interval '7 days'}
+keeps the table small, and the same \code{UserActivatedPublisher} shape
+gives you \code{ts.user.updated} for free --- call it from wherever
+profile changes are saved, with \code{eventType = "UserUpdated"}, and
+have \code{UserActivatedListener} upsert instead of insert.
+
+\begin{handson}[watch the outbox absorb a broker outage]
+With the outbox in place, stop Kafka, activate a user, and look:
+\begin{lstlisting}[language=bash]
+$ docker compose stop kafka
+$ curl -s -X POST localhost:8080/api/auth/activate?code=$CODE
+{"message":"Account activated"}          # instant, no 60s hang
+$ docker compose exec postgres-auth psql -U postgres ts_auth -c \
+  "select event_type, attempts, published_at from outbox"
+ event_type    | attempts | published_at
+ UserActivated |        3 |
+$ docker compose start kafka
+# ...a few seconds later
+ UserActivated |        3 | 2026-09-07 03:04:11.20+00
+\end{lstlisting}
+Then check course-service's log for \code{Provisioned student row}. The
+activation was never at risk, and the student appeared as soon as the
+broker did.
+\end{handson}
+
+\subsection{Change data capture: the industrial relay}
+
+A polling relay is simple and adds up to one second of latency plus one
+query per second per replica. At scale the relay is replaced by
+\emph{change data capture}: Debezium tails Postgres's write-ahead log,
+sees the \code{INSERT INTO outbox}, and publishes it to Kafka itself,
+with no application scheduler and sub-100\,ms latency. The application
+code is identical --- write the row --- which is why the outbox is worth
+adopting early: the relay is the only part that changes.
+
+\section{Sagas: when two services must both change}
+
+Enrollment today is local --- \code{course}, \code{student}, and
+\code{enrollment} are all in \code{ts\_course}, so
+\code{EnrollmentService.enroll} is one ordinary transaction. The first
+truly cross-service write the project will meet is \emph{account
+deletion}: auth-service must remove the user; course-service must remove
+the student, their enrollments, their submissions, and the submission
+files in MinIO (Chapter~9). There is no transaction spanning that.
+
+A \emph{saga} is a sequence of local transactions where each step
+publishes an event that triggers the next, and each step has a
+\emph{compensating} action if a later step fails:
+
+\begin{enumerate}
+  \item auth-service marks the user \code{DELETING} (not deleted) and
+  writes \code{UserDeletionRequested} to the outbox.
+  \item course-service deletes the student's data and files, then
+  publishes \code{StudentDataDeleted} --- or, on failure,
+  \code{StudentDataDeletionFailed}.
+  \item auth-service, on the success event, hard-deletes the user; on
+  the failure event, compensates by restoring \code{ACTIVE} and
+  notifying an operator.
+\end{enumerate}
+
+This is \emph{choreography}: no coordinator, each service reacts to
+events. It suits two or three steps. Past that --- deletion across
+five services, with ordering constraints --- the event graph becomes
+unreadable, and teams move to \emph{orchestration}: one component
+(a saga orchestrator, or a workflow engine such as Temporal) holds the
+state machine and sends \emph{commands} to each service. The trade is
+one more service to run against a flow you can actually read.
+
+Two properties every saga must have, and interviewers check for:
+\emph{semantic locks} --- the \code{DELETING} state stops a user logging
+in during the seconds the saga runs --- and \emph{idempotent steps}, so
+the at-least-once delivery of Chapter~34 cannot delete twice or
+compensate twice.
+
+\section{Reads across services}
+
+The remaining gap is reporting. ``Activated students per course, with
+last login'' needs auth data and course data, and no service has both.
+Three answers, in ascending cost:
+
+\begin{itemize}
+  \item \textbf{API composition.} The gateway or a small backend-for-
+  frontend calls both services and joins in memory. Fine for one page,
+  wrong for a nightly report over every course.
+  \item \textbf{A read model.} A dedicated \code{reporting} database
+  subscribes to \emph{every} domain event and maintains denormalized
+  tables shaped for the queries. This is CQRS: writes go to the owning
+  services, reads go to a model built from their events. The outbox
+  above is the prerequisite --- without reliable events the read model
+  drifts silently.
+  \item \textbf{A warehouse.} CDC from every service database into an
+  analytical store. The read model for people who are not you.
+\end{itemize}
+
+\section{What breaks at 3\,a.m.}
+
+\begin{itemize}
+  \item \textbf{postgres-course is down; users keep activating.}
+  Without the outbox nothing is lost on the auth side, but
+  \code{UserActivatedListener} throws on \code{save()}. Spring's default
+  error handler retries ten times in quick succession, then \emph{logs
+  and skips} the record (Chapter~34). The event is consumed, the
+  student is never created, and the log line is the only trace. With
+  the outbox the auth side is safe, but the consumer side still needs a
+  retry topic --- the outbox fixes the producer, not the consumer.
+  \item \textbf{An event is replayed.} Someone resets
+  \code{course-group}'s offsets to recover from the outage above. Every
+  \code{ts.user.activated} since retention start is redelivered.
+  \code{findByUserId().isPresent()} makes each one a no-op. Idempotency
+  by natural key is what makes replay a routine operation instead of an
+  incident.
+  \item \textbf{Ordering.} \code{UserActivated} and a future
+  \code{UserUpdated} for the same user are keyed by \code{userId} and so
+  share a partition; the update cannot overtake the activation. Events
+  for \emph{different} users may interleave freely, which is fine ---
+  there is no cross-user invariant. Change the key, or send from two
+  different producers, and this guarantee is gone.
+  \item \textbf{The relay stalls.} A poison row --- a payload the broker
+  rejects for size --- makes \co{7} break on every tick, and rows behind
+  it queue forever. Alert on \code{max(attempts)} and on
+  \code{count(*) where published\_at is null}; after N attempts, move
+  the row to a \code{outbox\_dead} table and let the queue drain.
+\end{itemize}
+
+\begin{decision}[when one database is the better call]
+\code{docs/PLAN-A} describes the same product as a modular monolith:
+one Spring Boot application, one \code{ts} database, and
+\code{student.user\_id} as a real foreign key. Every problem in this
+chapter --- the dual write, the drift, the saga, the read model ---
+disappears there, replaced by a \code{JOIN} and a transaction. That is
+not a small saving. The microservice layout (\code{PLAN-B}) earns its
+cost only when the forbidding things are the point: teams that must
+deploy without each other, data that must scale separately, or an
+organization large enough that a shared schema \emph{would} be joined
+across in anger. For a three-person team this project is deliberately
+over-built, and Chapter~27's road ahead is honest about it. The senior
+answer in an interview is not ``microservices'' or ``monolith''; it is
+``a modular monolith until a boundary has a reason to be a network
+boundary --- and when it does, the outbox from day one''.
+\end{decision}
+
+\section{Outside the project}
+
+The outbox is the pattern behind Debezium's ``outbox event router'',
+Axon's and Eventuate's transactional messaging, and the
+\code{TransactionalEventPublisher} shapes in every serious event-driven
+codebase. Sagas as orchestration are productized by Temporal, Camunda,
+and AWS Step Functions; as choreography they are simply ``events with
+compensations'' and a diagram someone must keep current. Netflix, Uber,
+and every bank you can name run some combination of the three ---
+outbox for reliability, sagas for multi-step writes, CQRS read models
+for queries that cross ownership lines. The one thing none of them do is
+what the project does today: call \code{send()} inside a transaction
+and hope.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: You need a report joining users and courses, and they live in two databases. How?}
+
+First I ask how fresh and how big. For one screen, API composition: a
+backend-for-frontend calls \code{/users?ids=} and \code{/courses}, joins
+in memory, and that is fine up to a few hundred rows. For a real report
+I build a read model: a \code{reporting} database that subscribes to
+\code{ts.user.activated}, \code{ts.user.updated}, and the course events,
+and maintains a denormalized \code{course\_roster} table shaped for the
+query. That is CQRS --- the owning services keep their writes, the read
+model answers cross-service reads. The prerequisite is reliable events,
+which is why I put the outbox in first; a read model fed by best-effort
+\code{send()} calls drifts and nobody notices until finance does. For
+analytics at company scale the same idea is CDC into a warehouse. What I
+refuse to do is give the reporting job a read replica of both databases
+and a cross-database join --- that is the shared-database coupling the
+architecture exists to prevent, back in through the side door.
+
+\subsection*{Q: Two services must both succeed or neither. How, without two-phase commit?}
+
+A saga. Each service does a local transaction and publishes an event;
+the next step reacts; every step has a compensating action. In the
+project, account deletion: auth-service sets \code{DELETING} and emits
+\code{UserDeletionRequested}; course-service deletes data and emits
+\code{StudentDataDeleted} or \code{...Failed}; auth-service either
+hard-deletes or restores \code{ACTIVE}. Two things make it correct
+rather than hopeful: a semantic lock --- the \code{DELETING} state
+blocks logins for the seconds the saga runs --- and idempotent steps,
+because Kafka will deliver at least once. I choose choreography for two
+or three steps and orchestration (Temporal, Camunda, or a hand-written
+state machine) once the event graph needs a diagram to follow. 2PC is
+off the table not because it is wrong but because Kafka and Postgres do
+not share a transaction coordinator, and holding locks across a network
+call is how you get the 3\,a.m. page.
+
+\subsection*{Q: An event was lost between the database commit and the Kafka send. How do you make that impossible?}
+
+By never sending from the request thread. The transactional outbox: the
+event is a row in an \code{outbox} table written in the same
+transaction as the business row, so Postgres guarantees both or
+neither. A relay --- a \code{@Scheduled} poller with \code{FOR UPDATE
+SKIP LOCKED}, or Debezium tailing the WAL --- publishes it afterwards
+and marks it. The relay is at-least-once, so the row carries an event id
+that the consumer deduplicates on. In this project that also removes a
+latent outage: today \code{kafkaTemplate.send()} inside
+\code{AuthService.register} blocks for \code{max.block.ms} when the
+broker is down, so a mail-broker outage makes registration fail after
+sixty seconds. With the outbox, registration commits in milliseconds and
+the e-mail is late instead of the signup being lost.
+
+\subsection*{Q: How do you migrate a shared database into database-per-service safely?}
+
+Strangler, not big bang. Step one: stop the bleeding --- find every
+cross-schema join and foreign key and route them through the owning
+service's API or a local copy, while the tables are still in one
+database. That is the hard part and it can take months; the physical
+split afterwards is a weekend. Step two: give each service its own
+credentials and schema, so an accidental join fails at compile time.
+Step three: dual-write or CDC the tables into the new database, verify
+counts and checksums, flip reads, then writes, keep the old tables
+read-only for a release, then drop. Throughout, the outbox goes in
+\emph{before} the split, because the moment the join is gone you are
+relying on events to keep copies correct. Chapter~7's ``two Postgres
+servers, not two schemas'' is the end state; you reach it by
+schema-per-service first.
+
+\subsection*{Q: You duplicated Student data into course-service. How do you keep it correct?}
+
+I accept that it will be stale and I bound the staleness. Creation
+arrives on \code{ts.user.activated}; updates need a
+\code{ts.user.updated} the project does not emit yet --- that is the
+first fix. Both are keyed by \code{userId}, so they share a partition and
+an update cannot overtake the creation. The listener upserts by natural
+key, which makes replay safe. The events come from an outbox, so none
+are lost; the consumer records processed event ids, so none are applied
+twice. Then I measure: a nightly job compares a sample of
+\code{student.email} against auth-service and alerts on drift, because
+every one of the mechanisms above has a bug I have not found yet. What I
+do not do is put the e-mail in the JWT --- that freezes it for the
+token's lifetime and couples the schemas through the token contract
+(Chapter~28).
+
+\begin{quiz}
+\begin{enumerate}
+  \item Read \code{AuthService.activate}. Describe the two distinct
+  failure orderings that leave auth-service and course-service
+  disagreeing, and say which one produces a row that should not exist.
+  \item Kafka is unreachable. Explain why \code{POST /register} today
+  takes about a minute to fail and does not create the user, naming the
+  producer setting responsible. What does the same request do after the
+  outbox is in place?
+  \item In the relay, why is \code{FOR UPDATE SKIP LOCKED} necessary,
+  and what would go wrong with two auth-service replicas if it were
+  replaced by a plain \code{SELECT}?
+  \item Why does \code{break} (not \code{continue}) follow a failed
+  send in the relay loop? Give the scenario the alternative corrupts.
+  \item A student's e-mail changes in auth-service. State what
+  course-service knows about it today, and list the three code changes
+  that close the gap.
+  \item Design account deletion across auth-service, course-service,
+  and MinIO as a choreographed saga: name the states, the events, and
+  the compensating action, and explain what the \code{DELETING} state
+  protects against.
+\end{enumerate}
+\end{quiz}

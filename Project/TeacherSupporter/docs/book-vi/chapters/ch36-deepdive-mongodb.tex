@@ -1,0 +1,623 @@
+\chapter{Đào sâu: Từ điển trên MongoDB --- mô hình document, tìm kiếm regex và những đánh đổi thẳng thắn}
+\label{ch:dd-mongo}
+
+Chương~8 lập luận cho từ điển là service document của dự án: một mục từ
+được đọc như một khối, ghi như một khối, và lồng nhau tự nhiên. Lập luận
+đó vững. Chương này thử nó theo cách một kỹ sư senior hoài nghi sẽ làm
+--- đọc các truy vấn service thực sự chạy, hỏi mỗi truy vấn tốn gì ở
+mười nghìn từ mỗi người dùng, và thừa nhận nơi một cơ sở dữ liệu quan
+hệ cũng làm tốt không kém. Mục tiêu không phải đảo ngược quyết định mà
+để bạn bảo vệ được cả hai phía của nó trong phỏng vấn, với code ngay
+trước mặt.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Mô hình document mua được gì ở đây}, và Postgres với
+  \code{jsonb} sẽ tốn gì thay vào đó?
+  \item \textbf{Truy vấn tìm kiếm thực sự thực thi thế nào} --- phần nào
+  chạm index, phần nào quét, và trang được dựng ở đâu?
+  \item \textbf{Chuyện gì gãy khi từ điển lớn lên} --- và trong số đó,
+  cái nào là lỗi của Mongo, cái nào là lỗi của code?
+\end{enumerate}
+
+\section{Vì sao MongoDB ở đây, và nó giải quyết gì}
+
+Mở \code{WordDefinition}. Nó là toàn bộ schema của service:
+
+\begin{lstlisting}[language=Java]
+@Document(collection = "word_definitions")
+public class WordDefinition {
+    @Id private String id;
+    private String word;
+    private String createdByUserId;                       (*@\co{1}@*)
+    private String meaning;
+    private String usage;
+    private String notes;
+    private List<String> examples;
+    private List<String> tags;                            (*@\co{2}@*)
+    /** Image attachments stored inline as base64 data URLs. */
+    private List<String> images;                          (*@\co{3}@*)
+    private Map<String, Object> extra;                    (*@\co{4}@*)
+    @CreatedDate private Instant createdAt;
+    @LastModifiedDate private Instant updatedAt;
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Mọi truy vấn trong service đều giới hạn theo trường
+  này. Nó là hàng rào tenant và, như sẽ thấy, là thứ duy nhất index
+  giúp được.
+  \item[\co{2}] Hai mảng nhúng trong document. Trong Postgres đây là
+  hai bảng con hoặc hai cột \code{text[]}; ở đây chúng là một phần của
+  mục từ và không tốn gì để lấy cùng.
+  \item[\co{3}] Ảnh dưới dạng chuỗi base64 inline. Đây là ``byte trong
+  cơ sở dữ liệu'' của Chương~35 khoác áo document, kèm một trần cứng:
+  một document BSON không được vượt 16\,MB. Một tá ảnh điện thoại và
+  từ đó không lưu được nữa.
+  \item[\co{4}] Một map tự do. Lối thoát hiểm của mô hình document: các
+  trường code chưa biết tới. Cũng là lý do ``không schema'' cần kỷ luật
+  (Chương~8).
+\end{description}
+
+Mô hình mua được gì: một lượt đọc trả về mọi thứ trang cần, không join,
+không N+1 qua các bảng; thêm trường là thay đổi code, không phải
+migration; và hình dạng trên đường truyền là hình dạng trên đĩa, khiến
+service gần như toàn là keo dán. Nó tốn gì: quan hệ giữa các mục từ
+(\code{WordLink}) không nằm trong document và phải duyệt bằng tay; mọi
+trường mảng không index được theo tiền tố cho tìm kiếm chuỗi con; và
+không gì ngăn một document lớn không giới hạn.
+
+\begin{decision}[MongoDB, và lập luận cho việc lẽ ra chọn Postgres]
+Từ điển là một sổ tay theo người dùng với các trường lồng nhau, tùy
+chọn, tiến hóa --- sân nhà của mô hình document --- và không chia sẻ gì
+với các service quan hệ, nên cách ly không tốn gì. Đó là lý do tốt.
+Phản biện thật thà: Postgres có \code{jsonb} cho phần lồng nhau,
+\code{text[]} với index GIN cho tag, \code{pg\_trgm} cho đúng kiểu tìm
+chuỗi con service này chạy, và CTE đệ quy cho đồ thị từ, tất cả trong
+một cơ sở dữ liệu đội đã vận hành hai lần. Câu trả lời senior cho ``vì
+sao Mongo?'' vì thế không phải ``vì document''; mà là ``vì dữ liệu có
+hình dạng document \emph{và} chúng tôi chấp nhận một cơ sở dữ liệu thứ
+hai để service triển khai độc lập và để học polyglot persistence --- và
+đây là cái giá''. Điều gì sẽ lật: yêu cầu join từ với khóa học hay
+người dùng, hoặc một đội vận hành không muốn chạy engine thứ hai.
+\end{decision}
+
+\section{Đọc đường tìm kiếm}
+
+Endpoint ai cũng dùng là tìm kiếm. Nó chạy qua ba mẩu code. Truy vấn
+trong repository:
+
+\begin{lstlisting}[language=Java]
+@Query("{ 'createdByUserId': ?0, '$or': [ "
+        + "{ 'word': { '$regex': ?1, '$options': 'i' } }, "
+        + "{ 'tags': { '$regex': ?1, '$options': 'i' } } ] }")
+List<WordDefinition> searchByWordOrTag(String userId, String regex);
+\end{lstlisting}
+
+Index đang tồn tại, từ \code{MongoIndexConfig}:
+
+\begin{lstlisting}[language=Java]
+mongoTemplate.indexOps("word_definitions")
+        .ensureIndex(new Index().on("createdByUserId", Sort.Direction.ASC));
+\end{lstlisting}
+
+Và phương thức service biến danh sách thành trang:
+
+\begin{lstlisting}[language=Java]
+List<WordDefinitionResponse> responses = wordDefinitionRepository
+        .searchByWordOrTag(userId, escapeRegex(query.trim()))   (*@\co{1}@*)
+        .stream()
+        .map(w -> toResponse(w, userId))                        (*@\co{2}@*)
+        .sorted(Comparator.comparing(WordDefinitionResponse::word,
+                String.CASE_INSENSITIVE_ORDER))                 (*@\co{3}@*)
+        .toList();
+int start = (int) pageable.getOffset();
+int end = Math.min(start + pageable.getPageSize(), responses.size());
+List<WordDefinitionResponse> pageContent = start < responses.size()
+        ? responses.subList(start, end) : List.of();            (*@\co{4}@*)
+return new PageImpl<>(pageContent, pageable, responses.size());
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Chữ người dùng gõ được ghép vào một biểu thức chính
+  quy. \code{escapeRegex} thêm gạch chéo ngược trước mọi ký tự đặc biệt
+  trước, nên \code{a.*} khớp đúng ba ký tự đó và \code{(} không làm
+  server sập vì lỗi parse. Bỏ qua bước này là có regex injection: nhẹ
+  thì kết quả sai, nặng thì một pattern thảm họa ghim chết một lõi CPU.
+  \item[\co{2}] \code{toResponse} chạy thêm hai truy vấn mỗi từ --- cha
+  và con từ \code{word\_links} --- nên một lượt tìm khớp $n$ từ phát ra
+  $2n + 1$ vòng đi-về. Đây là bài toán N+1, tái sinh trong một cơ sở dữ
+  liệu vốn được cho là tránh nó.
+  \item[\co{3}] Sắp xếp diễn ra trong JVM, trên \emph{mọi} kết quả khớp,
+  không phải trên trang.
+  \item[\co{4}] Phân trang cũng vậy. Mongo trả về mọi kết quả; service
+  giữ hai mươi và vứt phần còn lại. Trang 50 tốn đúng bằng trang 1,
+  cộng thêm việc sao chép.
+\end{description}
+
+\subsection{Server thực thi nó thế nào}
+
+Hỏi chính Mongo. Với stack đang chạy:
+
+\begin{handson}[đọc kế hoạch thực thi]
+\begin{lstlisting}[language=bash]
+$ docker compose exec mongodb mongosh ts_dictionary --quiet --eval '
+  db.word_definitions.find({ createdByUserId: "1", $or: [
+    { word: { $regex: "clou", $options: "i" } },
+    { tags: { $regex: "clou", $options: "i" } } ] })
+  .explain("executionStats").executionStats'
+\end{lstlisting}
+Lược bớt, câu trả lời trông thế này:
+\begin{lstlisting}
+{ nReturned: 3,
+  totalKeysExamined: 412,
+  totalDocsExamined: 412,
+  executionStages: {
+    stage: "FETCH",
+    filter: { $or: [ { word: { $regex: "clou", $options: "i" } },
+                     { tags: { $regex: "clou", $options: "i" } } ] },
+    inputStage: {
+      stage: "IXSCAN",
+      indexName: "createdByUserId_1",
+      indexBounds: { createdByUserId: [ "[\"1\", \"1\"]" ] } } } }
+\end{lstlisting}
+Ba dòng kể trọn câu chuyện: \code{IXSCAN} trên \code{createdByUserId}
+thu hẹp về 412 document của người dùng này; \code{FETCH} rồi nạp từng
+document từ đĩa; \code{filter} chạy cả hai regex trên mỗi document. Tỷ
+số \code{totalDocsExamined / nReturned} là 137 --- mỗi từ trả về, 137
+từ được đọc rồi loại.
+\end{handson}
+
+Vì sao regex không dùng được index: B-tree sắp xếp chuỗi theo các ký
+tự đầu. \code{\^{}clou} (có neo, phân biệt hoa thường) ánh xạ thành một
+khoảng key và Mongo sẽ dùng index trên \code{word} cho nó. \code{clou}
+không neo có thể xuất hiện bất kỳ đâu trong chuỗi, và \code{i} nghĩa là
+thứ tự byte của index thậm chí không khớp phép so sánh; không có khoảng
+nào để nhảy tới. Bộ lập kế hoạch của Mongo nói rõ điều này: một
+\code{\$regex} không phân biệt hoa thường hoặc không neo là quét toàn
+bộ phần mà các điều kiện khác để lại. Ở đây đó là lát của người dùng,
+và vì thế index \code{createdByUserId} đang làm toàn bộ việc hữu ích,
+còn index kép đề xuất về sau không thay đổi phần regex --- nó thay đổi
+điều xảy ra \emph{sau} đó.
+
+\subsection{Điều kiện trên mảng}
+
+\code{tags} là một mảng. Một điều kiện vô hướng trên trường mảng khớp
+nếu \emph{bất kỳ} phần tử nào khớp --- không cần \code{\$elemMatch} cho
+một điều kiện đơn. Đó là tiện lợi thật so với SQL, nơi cùng điều kiện
+là một \code{EXISTS} vào bảng con. Cũng vì thế regex chạy một lần cho
+mỗi tag mỗi document: một document có tám tag tốn tám lần đánh giá
+pattern bên cạnh một lần cho \code{word}.
+
+\section{Đồ thị}
+
+\code{WordLink} là một danh sách kề: một document mỗi cạnh với
+\code{parentWordId}, \code{childWordId}, \code{position}. Index ở cả
+hai đầu là đúng --- ``con của X'' và ``cha của X'' mỗi cái là một lượt
+tra index. Chi phí nằm ở việc duyệt:
+
+\begin{lstlisting}[language=Java]
+private WordGraphResponse buildGraphNode(String wordId, String userId,
+                                         Set<String> visited) {
+    if (visited.contains(wordId)) return null;
+    visited.add(wordId);
+    WordDefinition word = wordDefinitionRepository
+            .findByIdAndCreatedByUserId(wordId, userId).orElse(null); (*@\co{1}@*)
+    if (word == null) return null;
+    List<WordLink> childLinks = wordLinkRepository
+            .findByParentWordIdOrderByPosition(wordId);              (*@\co{2}@*)
+    List<WordGraphResponse> children = childLinks.stream()
+            .map(link -> buildGraphNode(link.getChildWordId(), userId,
+                    visited))
+            .filter(Objects::nonNull).toList();
+    return new WordGraphResponse(word.getId(), word.getWord(),
+            word.getMeaning(), children);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một truy vấn mỗi node.
+  \item[\co{2}] Thêm một nữa mỗi node. Một đồ thị 2{,}000 từ tốn
+  4{,}000 vòng đi-về, tuần tự, trên thread request. Mỗi lượt dưới một
+  mili giây trên cùng host; qua một chặng mạng là một trang nhiều giây.
+  Nhúng \code{childIds} vào document cha sẽ biến nó thành hai truy vấn
+  tổng cộng (\code{find} mọi từ của người dùng, dựng trong bộ nhớ) ---
+  với cái giá cập nhật hai document mỗi liên kết, mà không có
+  transaction giữ chúng cùng nhau.
+\end{description}
+
+Mongo có một toán tử đồ thị, \code{\$graphLookup}, duyệt
+\code{word\_links} đệ quy phía server trong một aggregation. Nó trả về
+tập phẳng các node với tới được kèm trường độ sâu, và cây được dựng lại
+trong bộ nhớ. Tập \code{visited} của dự án làm bằng tay điều
+\code{\$graphLookup} làm với \code{maxDepth}; khác biệt là $2n$ vòng
+đi-về so với một.
+
+\section{Transaction và nhất quán, thật thà}
+
+Mongo hỗ trợ transaction ACID nhiều document từ bản 4.0 --- trên một
+replica set. Dự án chạy một \code{mongod} đơn (Compose lẫn
+StatefulSet), và một node standalone không thể bắt đầu transaction nào.
+Nên \code{deleteWord} là hai lượt ghi độc lập: xóa định nghĩa, rồi
+\code{deleteByParentWordIdOrChildWordId}. Crash giữa hai lượt để lại
+các cạnh trỏ vào một từ đã mất; việc duyệt chịu được
+(\code{orElse(null)}, rồi lọc), là tư thế phòng thủ đúng, nhưng là một
+hợp đồng toàn vẹn dữ liệu ẩn. Cách sửa không tốn dòng code nào và một
+dòng vận hành là chạy replica set một node (\code{--replSet rs0} cộng
+một lời gọi initiate): transaction trở nên khả dụng, và cả change
+stream bạn sẽ muốn cho mẫu outbox của Chương~11.
+
+Write concern và read preference quan trọng ngay khi có node thứ hai.
+Mặc định \code{w: majority} nghĩa là một lượt ghi được xác nhận đã nằm
+trên đa số node; đọc từ secondary có thể trả về trạng thái cũ hơn. Với
+một sổ tay một người dùng, đọc-được-điều-mình-vừa-ghi trên primary là
+điều người dùng mong đợi, và là mặc định --- nói vậy trong phỏng vấn,
+và rằng bạn sẽ xem lại nó trước khi thêm read replica.
+
+\section{Ưu và nhược, thẳng thắn}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.62\linewidth}@{}}
+\toprule
+\textbf{Điểm mạnh} & \textbf{Dự án trả giá ở đâu} \\
+\midrule
+Một document, một lượt đọc, không join &
+  Liên kết nằm riêng; đồ thị là $2n$ truy vấn \\
+Mảng là hạng nhất (\code{tags}, \code{examples}) &
+  Tìm chuỗi con trên chúng là quét từng phần tử \\
+Không migration cho trường mới &
+  \code{extra} và \code{images} lớn không kiểm soát tới 16\,MB \\
+Tìm kiếm regex chạy ngay không cần gì &
+  Nó không dùng được index trừ khi có neo và phân biệt hoa thường \\
+Phân trang chỉ cách một \code{skip/limit} &
+  Đường tìm kiếm phân trang trong Java sau khi nạp tất cả \\
+Cơ sở dữ liệu độc lập, triển khai độc lập &
+  Không auth trên \code{mongod} trong Compose \emph{lẫn} cụm \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Dòng cuối không phải đặc tính của Mongo mà là một sự thật của dự án
+đáng biết trước khi ai đó hỏi: image chính thức chỉ bật xác thực khi
+đặt thông tin root, và cả hai manifest đều không đặt. Trong một mạng
+chỉ ClusterIP đó là rủi ro có cân nhắc, được ghi trong
+\code{mongodb.yaml}; nó là thứ đầu tiên phải đổi nếu service có ngày
+chia cụm với bất kỳ thứ gì không đáng tin.
+
+\section{Chuyện gì gãy}
+
+\begin{pitfall}[tìm kiếm chậm dần theo mỗi từ, rồi hết giờ]
+Triệu chứng: độ trễ tìm kiếm tăng tuyến tính theo từ điển của người
+dùng; tới vài nghìn từ, timeout của frontend nổ và trang không hiện gì.
+Nguyên nhân: ba hệ số nhân chồng lên cùng một request --- regex quét
+mọi document trong lát của người dùng; \code{toResponse} rồi phát hai
+truy vấn mỗi kết quả; và sắp xếp cùng phân trang diễn ra sau cả hai. Cơ
+sở dữ liệu đang làm đúng điều được yêu cầu. Sửa theo thứ tự hiệu quả:
+phân trang trong cơ sở dữ liệu (bên dưới), gộp các lượt tra liên kết
+thành một truy vấn \code{\$in} mỗi trang, và neo hoặc thay thế regex.
+\end{pitfall}
+
+\begin{pitfall}[document quá lớn]
+Triệu chứng: lưu một từ thất bại với
+\code{BsonMaximumSizeExceededException: ... exceeds 16793600 bytes}.
+Nguyên nhân: \code{images} giữ các data URL base64, và base64 phình
+thêm một phần ba; năm ảnh 3\,MB là document vượt giới hạn. Sửa: lưu ảnh
+trong MinIO dưới tiền tố \code{dictionary/\{userId\}/\{wordId\}/} và
+giữ key trong document --- quy tắc của Chương~35, áp dụng ở đây. Trong
+lúc chờ, giới hạn mảng bằng validation ở
+\code{WordDefinitionRequest}.
+\end{pitfall}
+
+\begin{pitfall}[regex không bao giờ trả về]
+Triệu chứng: một request ghim một lõi ở 100\,\% và các truy vấn còn lại
+của service xếp hàng sau nó. Nguyên nhân: một pattern như
+\code{(a+)+\$} trên chuỗi dài --- backtracking thảm họa.
+\code{escapeRegex} ngăn người dùng gửi một cái như vậy; rủi ro quay lại
+vào ngày ai đó thêm ``tìm kiếm nâng cao'' truyền pattern thô, hoặc quên
+escape ở một endpoint mới. Phòng thủ nhiều lớp: một \code{maxTimeMS}
+trên truy vấn (\code{@Meta(maxExecutionTimeMs)} của Spring Data) để
+pattern chạy hoang bị giết phía server sau một giây.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Node của StatefulSet MongoDB khởi động lại; pod ở trạng thái pending
+bốn phút trong khi claim gắn lại.
+
+\begin{itemize}
+  \item \textbf{dictionary-service} trả về 500 trên mọi endpoint.
+  Readiness probe của nó (Chương~17) không có kiểm tra cơ sở dữ liệu,
+  nên gateway vẫn định tuyến tới nó. Người dùng thấy lỗi thay vì một
+  trang ``dịch vụ không sẵn sàng''.
+  \item \textbf{Mọi thứ khác} không bị chạm. Không service nào khác giữ
+  kết nối Mongo, không service nào gọi dictionary-service, và không
+  topic Kafka nào phụ thuộc vào nó. Đây là mỗi-service-một-cơ-sở-dữ-liệu
+  hoạt động đúng thiết kế: bán kính thiệt hại của sự cố là đúng một
+  tính năng.
+  \item \textbf{Khi pod trở lại}, connection pool của driver tự kết nối
+  lại; không cần khởi động lại và không có cache phải làm ấm.
+  Create-on-write của Mongo nghĩa là một claim \emph{sai} sẽ lên với dữ
+  liệu rỗng và im lặng (cạm bẫy của Chương~8) --- kiểm tra
+  \code{show dbs} trước khi tin một báo cáo ``mất dữ liệu''.
+\end{itemize}
+
+Cái 3 giờ sáng còn lại thì chậm hơn: claim 5\,GB đầy. Mongo không từ
+chối gọn một lượt ghi ở thời điểm đó; nó khựng lại, journal thất bại,
+và process có thể thoát. Vì document có thể lớn lên (ảnh, \code{extra}),
+không có trần nào trong schema ngăn được. Cảnh báo thuộc về mức dùng của
+PVC, không phải ứng dụng.
+
+\section{Nâng cấp giải pháp}
+
+Bốn thay đổi, mỗi cái trọn vẹn, theo thứ tự đem lại hiệu quả.
+
+\subsection{Phân trang trong cơ sở dữ liệu}
+
+Thay truy vấn trả về danh sách bằng truy vấn trả về trang. Spring Data
+Mongo cần một truy vấn đếm riêng cho trang từ \code{@Query}:
+
+\begin{lstlisting}[language=Java]
+@Query(value = "{ 'createdByUserId': ?0, '$or': [ "
+        + "{ 'word': { '$regex': ?1, '$options': 'i' } }, "
+        + "{ 'tags': { '$regex': ?1, '$options': 'i' } } ] }",
+       count = true)
+long countByWordOrTag(String userId, String regex);
+
+@Query("{ 'createdByUserId': ?0, '$or': [ "
+        + "{ 'word': { '$regex': ?1, '$options': 'i' } }, "
+        + "{ 'tags': { '$regex': ?1, '$options': 'i' } } ] }")
+Page<WordDefinition> searchByWordOrTag(String userId, String regex,
+                                       Pageable pageable);          (*@\co{1}@*)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Java]
+public Page<WordDefinitionResponse> searchWords(String userId,
+        String query, Pageable pageable) {
+    Pageable sorted = PageRequest.of(pageable.getPageNumber(),
+            pageable.getPageSize(),
+            Sort.by("word").ascending());                            (*@\co{2}@*)
+    Page<WordDefinition> page = (query == null || query.isBlank())
+            ? wordDefinitionRepository.findByCreatedByUserId(userId, sorted)
+            : wordDefinitionRepository.searchByWordOrTag(userId,
+                    escapeRegex(query.trim()), sorted);
+    return toResponses(page, userId);                                (*@\co{3}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Spring Data nối \code{skip}, \code{limit} và
+  \code{sort} vào truy vấn. Regex vẫn quét lát của người dùng, nhưng chỉ
+  hai mươi document được nạp, tuần tự hóa và ánh xạ.
+  \item[\co{2}] Sắp xếp chuyển sang server. Thứ tự không phân biệt hoa
+  thường cần một collation trên truy vấn hoặc collection
+  (\code{\{locale: "en", strength: 2\}}); thêm nó vào index bên dưới để
+  sort dùng được.
+  \item[\co{3}] Các lượt tra liên kết thành một lô mỗi trang, tiếp theo.
+\end{description}
+
+\subsection{Gộp lô các liên kết}
+
+\begin{lstlisting}[language=Java]
+private Page<WordDefinitionResponse> toResponses(Page<WordDefinition> page,
+                                                 String userId) {
+    List<String> ids = page.map(WordDefinition::getId).toList();
+    Map<String, List<String>> parents = new HashMap<>();
+    Map<String, List<String>> children = new HashMap<>();
+    for (WordLink l : wordLinkRepository.findByChildWordIdIn(ids)) {   (*@\co{1}@*)
+        parents.computeIfAbsent(l.getChildWordId(), k -> new ArrayList<>())
+               .add(l.getParentWordId());
+    }
+    for (WordLink l : wordLinkRepository
+            .findByParentWordIdInOrderByPosition(ids)) {
+        children.computeIfAbsent(l.getParentWordId(), k -> new ArrayList<>())
+                .add(l.getChildWordId());
+    }
+    return page.map(w -> toResponse(w,
+            parents.getOrDefault(w.getId(), List.of()),
+            children.getOrDefault(w.getId(), List.of())));
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Hai truy vấn \code{\$in} mỗi trang thay vì hai mỗi từ:
+  $2n + 1$ thành $3$. Cả hai dùng index sẵn có trên \code{childWordId}
+  và \code{parentWordId}.
+\end{description}
+
+\subsection{Index cho sort, và tìm kiếm có neo}
+
+\begin{lstlisting}[language=Java]
+// MongoIndexConfig
+mongoTemplate.indexOps("word_definitions").ensureIndex(
+        new CompoundIndexDefinition(
+                new Document("createdByUserId", 1).append("word", 1))
+        .collation(Collation.of("en").strength(2)));               (*@\co{1}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Với index này, ``từ của người dùng này theo thứ tự chữ
+  cái'' là một lượt đi dọc index, nên danh sách không lọc và mọi trang
+  đã sort tránh được sort trong bộ nhớ. Và tìm theo \emph{tiền tố} ---
+  \code{\{word: \{\$regex: "\^{}clou"\}\}} với cùng collation --- thành
+  một lượt seek khoảng trên cùng index. Với từ điển, tiền tố thường là
+  điều người dùng muốn khi gõ.
+\end{description}
+
+\subsection{Text index cho tìm-từ-ở-bất-kỳ-đâu}
+
+Khi thực sự cần chuỗi con ở bất kỳ đâu, thôi dùng regex:
+
+\begin{lstlisting}[language=Java]
+// MongoIndexConfig: one text index per collection, weighted
+mongoTemplate.indexOps("word_definitions").ensureIndex(
+        new TextIndexDefinition.TextIndexDefinitionBuilder()
+                .onField("word", 10F)                                (*@\co{1}@*)
+                .onField("tags", 5F)
+                .onField("meaning", 1F)
+                .build());
+\end{lstlisting}
+
+\begin{lstlisting}[language=Java]
+// DictionaryService
+public Page<WordDefinitionResponse> textSearch(String userId,
+        String terms, Pageable pageable) {
+    TextCriteria text = TextCriteria.forDefaultLanguage()
+            .matchingAny(terms.split("\\s+"));                       (*@\co{2}@*)
+    Query q = TextQuery.queryText(text).sortByScore()
+            .addCriteria(Criteria.where("createdByUserId").is(userId))
+            .with(pageable);
+    List<WordDefinition> hits = mongoTemplate.find(q, WordDefinition.class);
+    long total = mongoTemplate.count(Query.of(q).skip(0).limit(0),
+            WordDefinition.class);
+    return toResponses(new PageImpl<>(hits, pageable, total), userId);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Text index tách token và rút gốc từ; \code{cloud} khớp
+  \code{clouds} và \code{clouded}, và một kết quả trong \code{word} xếp
+  trên cùng kết quả đó trong \code{meaning}. Nó không khớp \emph{bên
+  trong} một token (\code{lou} không tìm ra \code{cloud}) --- đó là
+  đánh đổi.
+  \item[\co{2}] Không regex, không escape, không backtracking. Index
+  được hỏi trước; \code{createdByUserId} lọc các kết quả.
+\end{description}
+
+\begin{decision}[tiền tố có neo so với full text]
+Regex neo tiền tố trên index kép trả lời ``từ bắt đầu bằng\ldots''
+trong vài micro giây và không cần loại index mới; nó là mặc định đúng
+cho ô gõ-là-gợi-ý. Text index trả lời ``mục từ về\ldots'' với xếp hạng
+và rút gốc, với cái giá là index lớn hơn và không khớp giữa từ. Regex
+không neo không phân biệt hoa thường --- thứ dự án có --- trả lời ``bất
+kỳ thứ gì chứa\ldots'' và trả một lượt quét cho nó. Khuyến nghị là tiền
+tố cho ô tìm kiếm, text search sau một nút ``tìm mọi nơi'' riêng, và
+regex về hưu. Atlas Search (Lucene dưới API của Mongo) cho cả hai cùng
+lúc, nhưng chỉ trên Atlas; trên một \code{mongod} tự host, hai công cụ
+này là tất cả.
+\end{decision}
+
+\section{Ngoài dự án}
+
+Mọi cơ sở dữ liệu document đều có hình dạng của chương này: DynamoDB
+với mẫu truy cập khóa-phân-vùng-trước và hoàn toàn không có tìm chuỗi
+con; Couchbase với N1QL và một index full-text; Elasticsearch là
+sidecar mà các kho document mọc ra khi tìm kiếm trở thành sản phẩm.
+\code{jsonb} cộng \code{pg\_trgm} của Postgres là câu trả lời phần lớn
+đội nên cân nhắc trước bất kỳ thứ nào trong số đó --- nó biến đúng
+\code{ILIKE '\%clou\%'} của service này thành một lượt seek index GIN.
+Cách đặt vấn đề senior cho ``SQL hay NoSQL?'' không bao giờ là engine;
+mà là các mẫu truy cập viết ra trước, rồi engine nào có index khớp với
+chúng.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Tìm kiếm từ điển chậm. Bạn kiểm tra gì trước?}
+
+Kế hoạch thực thi, trước mọi thứ: \code{explain("executionStats")}
+trên đúng truy vấn service gửi, và hai con số từ nó ---
+\code{totalDocsExamined} so với \code{nReturned}, và stage nào mang
+\code{filter}. Ở service này nó cho thấy một \code{IXSCAN} trên
+\code{createdByUserId} rồi một \code{FETCH} xem xét hàng trăm document
+mỗi kết quả, vì regex không neo không phân biệt hoa thường không dùng
+được index nào. Rồi nhìn điều xảy ra \emph{sau} truy vấn: ở đây, hai
+lượt tra liên kết mỗi kết quả và sort cùng phân trang trong bộ nhớ.
+Tôi sẽ sửa theo thứ tự đó --- phân trang trong cơ sở dữ liệu, gộp lô
+liên kết bằng \code{\$in}, neo regex thành tiền tố trên index kép
+\code{\{createdByUserId, word\}} với collation không phân biệt hoa
+thường --- và đọc lại kế hoạch sau mỗi bước. Nếu ``bất kỳ đâu trong
+từ'' là yêu cầu thật, đó là một text index, không phải regex nhanh hơn.
+
+\subsection*{Q: Khi nào bạn không chọn MongoDB?}
+
+Khi mẫu truy cập có tính quan hệ: dữ liệu đọc theo cách nhóm khác với
+cách ghi, các bất biến trải qua nhiều thực thể (một bài nộp cần bài tập
+và học sinh của nó tồn tại), hay báo cáo join qua cả miền. Khi đội đã
+vận hành Postgres tốt và ``document'' chỉ cách một cột \code{jsonb}.
+Khi transaction nhiều document là chuyện thường ngày chứ không phải
+ngoại lệ --- Mongo có, nhưng trên replica set, với ngữ nghĩa retry bạn
+phải tự code. Và khi dữ liệu sẽ được tìm theo chuỗi con ở quy mô lớn:
+\code{pg\_trgm} là một dòng index; Mongo cần Atlas Search hoặc một
+engine ngoài. Từ điển của dự án qua được các bài kiểm tra đó vì nó theo
+người dùng, lồng nhau, và không join gì; miền khóa học trượt cả ba, và
+đó là lý do nó ở Postgres.
+
+\subsection*{Q: Phân trang một trăm nghìn kết quả mà không nạp chúng.}
+
+Không bao giờ bằng \code{skip} ở độ sâu lớn --- \code{skip(90000)} vẫn
+đi qua chín mươi nghìn mục index. Dùng phân trang \emph{keyset}: sort
+trên một khóa có index và gần như duy nhất (\code{word}, phân định bằng
+\code{\_id}) và hỏi \code{\{word: \{\$gt: lastWord\}\}} với
+\code{limit(20)}; mỗi trang là một lượt seek index bất kể độ sâu. Trả
+về khóa cuối làm cursor mờ thay vì số trang. Chỉ giữ truy vấn đếm nếu
+UI thực sự cần tổng, và cache nó, vì đếm một regex có lọc là lại chính
+lượt quét đó. Phân trang \code{subList} của dự án là ngược lại tất cả
+những điều này: nó nạp mọi thứ và trả về hai mươi.
+
+\subsection*{Q: Một service dùng Mongo, một service dùng Postgres. Giữ dữ liệu của chúng nhất quán thế nào?}
+
+Bạn không làm được, theo nghĩa transaction --- không có two-phase
+commit qua chúng và bạn cũng không nên muốn. Bạn giữ chúng nhất quán
+\emph{cuối cùng} qua sự kiện (Chương~11): service sở hữu commit thay
+đổi của mình và công bố một sự thật, service kia tiêu thụ và cập nhật
+bản sao của riêng nó, và một bảng outbox ở phía sở hữu khiến ``đã
+commit'' và ``đã công bố'' là một. Nơi dự án cần điều này hôm nay là id
+người dùng: dictionary-service lưu \code{createdByUserId} là một chuỗi
+do auth-service phát, và không bao giờ cần join trên nó, nên không cần
+đồng bộ gì. Nếu có ngày cần tên hiển thị của người dùng, câu trả lời là
+một consumer \code{UserRegistered} ghi vào một collection \code{users}
+nhỏ --- không phải một lời gọi Feign mỗi từ, và không phải một cơ sở dữ
+liệu dùng chung.
+
+\subsection*{Q: Hình dạng document đã đổi. Migrate không gián đoạn.}
+
+Mở rộng, di chuyển, thu hẹp. Triển khai code đọc được cả hai hình dạng
+và ghi hình dạng mới (một alias \code{@Field} hay một converter xử lý
+việc đổi tên); chạy một job nền viết lại document cũ theo lô với
+\code{updateMany} trên một khoảng \code{\_id} có giới hạn, có tiết lưu,
+lũy đẳng, tiếp tục được; rồi, khi đếm hình dạng cũ về không, triển khai
+code chỉ đọc hình dạng mới. Mongo làm bước đầu dễ vì không gì cưỡng chế
+schema, và nguy hiểm cũng vì lý do đó --- thêm một JSON Schema
+validator trên collection ở cuối để hình dạng cũ không quay lại được.
+Với trường \code{images} trong dự án này, migration còn là một lần
+chuyển dữ liệu: viết lại mỗi data URL thành một object MinIO và thay
+phần tử mảng bằng key của nó.
+
+\subsection*{Q: Mô hình hóa đồ thị từ --- nhúng hay tham chiếu, và duyệt tốn gì?}
+
+Tham chiếu, như dự án làm, khi cạnh có thuộc tính riêng
+(\code{position}) và cả hai chiều đều được truy vấn; nhúng một mảng
+\code{childIds} khi đồ thị nông, chủ yếu đọc, và cha-tới-con là chiều
+duy nhất quan trọng. Chi phí duyệt là phần thật thà: với tham chiếu và
+đệ quy ngây thơ đó là hai vòng đi-về mỗi node --- 4{,}000 cho đồ thị
+2{,}000 từ --- chính là điều \code{buildGraphNode} làm. Cách sửa, theo
+thứ tự, là nạp mọi cạnh của người dùng trong một truy vấn và duyệt
+trong bộ nhớ; hoặc một \code{\$graphLookup} với \code{maxDepth}; hoặc
+nhúng. Chu trình cần một tập visited dù đường nào; dự án có sẵn. Và nói
+to đánh đổi: nhúng biến một lần tạo liên kết thành hai lượt ghi
+document mà không có transaction trên node standalone.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Từ kết quả \code{explain}, \code{totalDocsExamined} là 412 và
+  \code{nReturned} là 3. Nêu stage đang loại bỏ, nói vì sao index
+  \code{createdByUserId} không giúp được nó, và nêu một thay đổi duy
+  nhất trên pattern cho phép index trên \code{word} phục vụ nó.
+  \item \code{searchWords} với \code{page=50\&size=20} trên người dùng
+  có 3{,}000 từ: Mongo trả về bao nhiêu document, bao nhiêu truy vấn
+  \code{word\_links} chạy, và trang được dựng ở đâu?
+  \item \code{deleteWord} phát hai lượt ghi không có transaction. Giải
+  thích vì sao transaction không khả dụng trên triển khai này, crash
+  giữa hai lượt để lại gì, và dòng nào của \code{buildGraphNode} chịu
+  được điều đó.
+  \item Một người dùng đính sáu ảnh vào một từ và lưu thất bại. Nêu
+  exception, phép tính tạo ra nó, và quy tắc lưu trữ từ Chương~35 sửa
+  được nó.
+  \item Với text index trên \code{word}, \code{tags} và
+  \code{meaning}, truy vấn ``lou'' không trả về gì dù ``cloud'' tồn
+  tại. Giải thích, và nói loại index nào trả lời được.
+  \item MongoDB chết bốn phút lúc 3 giờ sáng. Liệt kê cái gì hỏng, cái
+  gì không, và một thay đổi probe duy nhất biến 500 thành một ``chưa
+  sẵn sàng'' sạch sẽ.
+\end{enumerate}
+\end{quiz}

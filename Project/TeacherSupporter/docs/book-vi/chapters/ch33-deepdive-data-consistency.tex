@@ -1,0 +1,649 @@
+\chapter{Đào sâu: Dữ liệu xuyên service --- mỗi service một cơ sở dữ liệu, dữ liệu trùng lặp và outbox}
+\label{ch:dd-consistency}
+
+Chương~7 đặt ra quy tắc: mỗi service sở hữu cơ sở dữ liệu của mình, và
+con đường duy nhất tới dữ liệu của service khác là API hoặc sự kiện của
+nó. Quy tắc dễ phát biểu và tốn kém để sống cùng. Chương đào sâu này đi
+theo mẩu dữ liệu duy nhất mà dự án sao chép giữa các service --- tên và
+e-mail của một học viên --- từ lúc nó được ghi vào Postgres của
+auth-service tới lúc nó xuất hiện trong Postgres của course-service, và
+hỏi chuyện gì có thể hỏng trên đường đi. Câu trả lời là bài toán ghi kép
+(dual write), và cách sửa là transactional outbox.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Mỗi service một cơ sở dữ liệu mua được gì}, và cấm điều
+  gì --- join, khóa ngoại, transaction --- mà một monolith coi là hiển
+  nhiên?
+  \item \textbf{Dữ liệu trùng lặp giữ đúng bằng cách nào}, và cửa sổ
+  chính xác mà dự án đang sai hôm nay là gì?
+  \item \textbf{``Lưu dòng và phát sự kiện'' có thể nguyên tử được
+  không} --- và nếu không, thứ gần nhất với nó là gì?
+\end{enumerate}
+
+\section{Vì sao chọn nó, và nó giải quyết gì}
+
+Mở \code{docker-compose.yml}: hai container Postgres~17,
+\code{postgres-auth} giữ \code{ts\_auth} và \code{postgres-course} giữ
+\code{ts\_course}, trên volume và cổng riêng. Không gì trong
+course-service biết địa chỉ của cái đầu. Sự cô lập mua bốn thứ:
+
+\begin{itemize}
+  \item \textbf{Quyền sở hữu schema.} Auth-service có thể thêm cột
+  \code{totp\_secret}, đổi tên \code{provider\_id}, hay chạy một
+  migration Flyway phá hủy mà không cần phối hợp với ai. Các migration
+  \code{V3} và \code{V4} ở Chương~7 đã diễn ra đúng như thế.
+  \item \textbf{Triển khai độc lập.} Một migration khóa bảng
+  \code{users} một phút làm nghẽn đăng nhập, không phải danh sách khóa
+  học.
+  \item \textbf{Mở rộng và tinh chỉnh độc lập.} Cơ sở dữ liệu khóa học
+  sẽ lớn theo bài nộp; cơ sở dữ liệu auth thì không. Chúng có thể nằm
+  trên đĩa khác nhau, có connection pool khác nhau, lịch sao lưu khác
+  nhau.
+  \item \textbf{Chặn cứng sự ghép nối vô tình.} Trong một cơ sở dữ
+  liệu dùng chung, câu \code{JOIN users ON student.user\_id = users.id}
+  đầu tiên viết dưới áp lực deadline hàn schema của hai đội lại với nhau
+  mãi mãi. Ở đây join là bất khả, nên nó không bao giờ được viết.
+\end{itemize}
+
+Nó cấm đúng bằng ấy:
+
+\begin{itemize}
+  \item \textbf{Không join xuyên service.} ``Liệt kê học viên khóa~7
+  kèm e-mail'' không thể là một truy vấn nếu e-mail nằm ở nơi khác.
+  \item \textbf{Không khóa ngoại xuyên service.} \code{student.user\_id}
+  trong \code{V1\_\_create\_course\_tables.sql} là \code{BIGINT NOT NULL
+  UNIQUE} và không gì hơn --- Postgres không thể kiểm tra user~42 tồn
+  tại trong một cơ sở dữ liệu nó không nhìn thấy.
+  \item \textbf{Không transaction xuyên service.} Một thao tác nghiệp
+  vụ phải đổi cả hai cơ sở dữ liệu không thể rollback như một khối.
+\end{itemize}
+
+\begin{decision}[sao chép học viên, không gọi lấy user]
+Course-service cần tên và e-mail học viên trên mọi danh sách lớp và
+trong mọi thông báo bài tập. Có hai thiết kế: gọi auth-service mỗi lần
+(thậm chí có sẵn một Feign client cho việc đó,
+\code{AuthServiceClient.getUserById}, với fallback trả về \code{null}),
+hoặc giữ một bản sao cục bộ trong bảng \code{student}. Dự án chọn bản
+sao, và Feign client là code chết --- không class nào trong
+course-service gọi nó. Lý do: danh sách lớp được đọc nhiều hơn rất
+nhiều so với số lần tên thay đổi; một lời gọi đồng bộ cho mỗi dòng sẽ
+khiến tính sẵn sàng của course-service là tích của tính sẵn sàng
+auth-service (Chương~6); và bản sao cục bộ có thể index, join, phân
+trang bằng SQL thuần. Cái giá là bản sao có thể \emph{cũ}, và phần còn
+lại của chương nói về cũ đến đâu, và làm sao chặn trên nó. Quyết định
+lật lại khi dữ liệu thay đổi thường xuyên hoặc phải là nguồn tin cậy
+lúc đọc --- số dư tài khoản, một quyền hạn --- nơi một lời gọi, hoặc
+cache với vô hiệu hóa tường minh, mới là thiết kế trung thực.
+\end{decision}
+
+\section{Một học viên tới course-service bằng cách nào}
+
+Lần theo đường đi thật. Nó bắt đầu ở \code{AuthService} của
+auth-service, được đánh dấu \code{@Transactional} ở mức class:
+
+\begin{lstlisting}[language=Java]
+public void activate(String code) {
+    User user = userRepository.findByActivationCode(code)
+            .orElseThrow(() ->
+                new IllegalArgumentException("Invalid activation code"));
+
+    user.setActivated(true);
+    user.setActivationCode(null);
+    userRepository.save(user);                       (*@\co{1}@*)
+
+    userActivatedPublisher.publish(user);            (*@\co{2}@*)
+}
+\end{lstlisting}
+
+\code{UserActivatedPublisher} dựng một record \code{UserActivatedEvent}
+--- id user, e-mail, họ tên, vai trò --- và gọi
+\code{kafkaTemplate.send("ts.user.activated", event.userId(), event)}.
+Ở phía kia, \code{UserActivatedListener} của course-service:
+
+\begin{lstlisting}[language=Java]
+@KafkaListener(topics = "ts.user.activated", groupId = "course-group")
+public void onUserActivated(UserActivatedEvent event) {
+    if (!ROLE_STUDENT.equalsIgnoreCase(event.role())) {
+        return;
+    }
+    Long userId = Long.parseLong(event.userId());
+    if (studentRepository.findByUserId(userId).isPresent()) { (*@\co{3}@*)
+        return;
+    }
+    Student student = Student.builder()
+            .userId(userId)
+            .firstName(event.firstName())
+            .lastName(event.lastName())
+            .email(event.email())
+            .build();
+    studentRepository.save(student);                       (*@\co{4}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Dòng đang bẩn bên trong một transaction chưa commit.
+  \code{save()} trên một entity đã được quản lý là no-op cho tới khi
+  flush.
+  \item[\co{2}] Sự kiện được trao cho Kafka producer \emph{bên trong}
+  cùng transaction, trước commit ở lúc thoát method. Ghi nhớ dòng này;
+  nó là toàn bộ vấn đề.
+  \item[\co{3}] Listener lũy đẳng (idempotent) theo khóa tự nhiên: giao
+  lại lần hai cùng sự kiện thấy dòng đã có và trả về. Đây là lý do dự án
+  sống sót qua giao nhận ít-nhất-một-lần (Chương~34) mà không cần bảng
+  khử trùng --- ở đây.
+  \item[\co{4}] Bản sao. Từ giờ, course-service trả lời mọi truy vấn
+  danh sách lớp từ dòng này và không bao giờ hỏi auth-service nữa.
+\end{description}
+
+Cửa sổ nhất quán vì thế là: từ commit ở auth-service tới commit ở
+course-service. Trên một stack yên tĩnh đó là mili giây. Với
+notification-service và course-service cùng nằm trên đường consumer,
+và broker trên cùng cái máy hai nhân (Chương~25), nó có thể là vài
+giây. Một giáo viên ghi danh học viên ``ngay lập tức'' sau khi học viên
+kích hoạt có thể nhận \code{404 Student not found} từ
+\code{EnrollmentService.enroll} --- hành vi đúng, trải nghiệm bất ngờ.
+
+\subsection{Thứ hoàn toàn không được lan truyền}
+
+Giờ tìm sự kiện thứ hai. Không có. \code{ts.user.activated} bắn một
+lần, lúc kích hoạt. Một user sau đó đổi tên hay e-mail trong
+auth-service không bao giờ được phản ánh vào \code{student}; ghi chú
+``future: Kafka event propagates e-mail changes'' trong
+\code{DATABASE-DESIGN.md} là lời thừa nhận. Thông báo bài tập sẽ tiếp
+tục đi tới địa chỉ cũ. Đây là trạng thái trung thực của nhất quán cuối
+cùng trong dự án: \emph{cuối cùng} cho việc tạo, \emph{không bao giờ}
+cho việc cập nhật. Mục~\ref{sec:enhancing-outbox} thêm sự kiện còn
+thiếu.
+
+\section{Ưu và nhược, thẳng thắn}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.3\linewidth}p{0.3\linewidth}@{}}
+\toprule
+ & Cơ sở dữ liệu dùng chung & Mỗi service một CSDL (ở đây) \\
+\midrule
+Đọc xuyên entity & một \code{JOIN} & bản sao cục bộ, hoặc hai lời gọi \\
+Toàn vẹn & khóa ngoại & code ứng dụng + sự kiện \\
+Ghi nhiều entity & một transaction & saga hoặc outbox \\
+Đổi schema & phối hợp mọi chủ sở hữu & chủ sở hữu tự quyết \\
+Bán kính sự cố & một CSDL, mọi service & một service \\
+Độ cũ & không & vài giây (tạo), không giới hạn (cập nhật) hôm nay \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Điểm yếu thật của dự án, gọi tên:
+
+\begin{itemize}
+  \item Sự kiện cập nhật không tồn tại; bản sao trôi vĩnh viễn.
+  \item Lưu-và-phát không nguyên tử (mục kế tiếp).
+  \item Fallback của Feign trả \code{null}, nên nếu ai đó nối
+  \code{AuthServiceClient} vào, trạng thái circuit mở sẽ hiện ra dưới
+  dạng \code{NullPointerException} thay vì một phản hồi suy giảm rõ
+  ràng.
+  \item Không có đường báo cáo: ``bao nhiêu học viên đã kích hoạt mỗi
+  khóa'' cần dữ liệu từ cả hai cơ sở dữ liệu và không có read model nào
+  cho nó.
+\end{itemize}
+
+\section{Bài toán ghi kép}
+\label{sec:dual-write}
+
+Dòng \co{2} ở trên ghi vào hai hệ thống --- Postgres và Kafka --- không
+chia sẻ transaction manager. Dù bạn đặt thứ tự thế nào, một trong hai
+sự cố là khả dĩ:
+
+\begin{itemize}
+  \item \textbf{Commit, rồi mất sự kiện.} \code{send()} là bất đồng
+  bộ: nó nối vào một bộ đệm phía client và trả về một future. Method
+  thoát, transaction commit, và JVM bị giết (\code{OOMKilled}, một
+  rolling update, \code{kubectl delete pod}) trước khi bộ đệm được
+  flush. User đã kích hoạt; course-service không bao giờ nghe về nó;
+  học viên không bao giờ ghi danh được, và không gì log lỗi.
+  \item \textbf{Phát, rồi rollback.} Bộ đệm flush trong vài mili giây;
+  broker ack; rồi commit thất bại --- một ràng buộc unique, kết nối
+  rớt, deadlock. Course-service tạo học viên cho một user không tồn
+  tại. Một dòng \emph{ma}.
+\end{itemize}
+
+Cả hai hiếm theo từng request và chắc chắn theo từng năm. Phiên bản
+phỏng vấn: ``bạn lưu một đơn hàng và phát \code{OrderCreated}; làm sao
+bảo đảm cả hai xảy ra?'' Câu trả lời junior là ``bọc trong try/catch''.
+Câu trả lời senior bắt đầu bằng ``không thể, với hai tài nguyên'', rồi
+gọi tên outbox.
+
+\begin{pitfall}[đăng ký treo sáu mươi giây, rồi thất bại]
+Triệu chứng: khi Kafka chết, \code{POST /api/auth/register} không thất
+bại nhanh --- nó treo một phút rồi trả 500. Nguyên nhân: producer phải
+lấy metadata topic trước lần gửi đầu; không broker nào với được, nó
+chặn trong \code{max.block.ms} (mặc định 60\,000\,ms) rồi ném ngoại lệ.
+Ngoại lệ lan ra khỏi \code{register()}, transaction rollback, và user
+\emph{không} được đăng ký --- vì broker gửi mail chết. Một phụ thuộc lẽ
+ra bất đồng bộ đã thành điểm lỗi đồng bộ với timeout một phút. Outbox
+bên dưới biến chuyện này thành ``đã đăng ký; e-mail đến trễ''.
+\end{pitfall}
+
+\begin{pitfall}[bản sao sống lâu hơn bản gốc]
+Triệu chứng: e-mail bài tập bị trả lại từ một địa chỉ user đã đổi nhiều
+tháng trước. Nguyên nhân: \code{student.email} được
+\code{UserActivatedListener} ghi một lần và không có sự kiện
+\code{ts.user.updated}. Cách sửa: phát ra một sự kiện như thế, và để
+listener upsert. Mục~\ref{sec:enhancing-outbox} cho thấy bên phát; thay
+đổi ở listener là một
+\code{findByUserId().map(update).orElseGet(create)}.
+\end{pitfall}
+
+\section{Nâng cấp giải pháp: transactional outbox}
+\label{sec:enhancing-outbox}
+
+Ý tưởng là ghi sự kiện vào \emph{cùng cơ sở dữ liệu}, trong \emph{cùng
+transaction}, với dòng nghiệp vụ --- và để một tiến trình riêng chép nó
+sang Kafka sau đó. Postgres bảo đảm dòng và sự kiện commit cùng nhau
+hoặc không gì cả; relay bảo đảm sự kiện cuối cùng tới Kafka; tính lũy
+đẳng của consumer bảo đảm relay thử lại không gây hại. Đây là cài đặt
+đầy đủ cho auth-service.
+
+Bảng, dưới dạng migration Flyway \code{V5\_\_create\_outbox.sql}:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE outbox (
+    id             UUID PRIMARY KEY,
+    aggregate_type VARCHAR(64)  NOT NULL,   -- 'user'
+    aggregate_id   VARCHAR(64)  NOT NULL,   -- also the Kafka key
+    event_type     VARCHAR(64)  NOT NULL,   -- 'UserActivated'
+    topic          VARCHAR(128) NOT NULL,
+    payload        JSONB        NOT NULL,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    published_at   TIMESTAMPTZ,
+    attempts       INT          NOT NULL DEFAULT 0
+);
+-- the relay's only query: oldest unpublished first
+CREATE INDEX idx_outbox_unpublished
+    ON outbox (created_at) WHERE published_at IS NULL;
+\end{lstlisting}
+
+Entity cố tình ngu ngốc --- một dòng, không phải domain object:
+
+\begin{lstlisting}[language=Java]
+@Entity @Table(name = "outbox")
+@Getter @Setter @NoArgsConstructor
+public class OutboxEvent {
+    @Id private UUID id;
+    private String aggregateType;
+    private String aggregateId;
+    private String eventType;
+    private String topic;
+    @JdbcTypeCode(SqlTypes.JSON)
+    private String payload;                       // serialized event
+    private Instant createdAt;
+    private Instant publishedAt;
+    private int attempts;
+}
+
+public interface OutboxRepository extends JpaRepository<OutboxEvent, UUID> {
+    // SKIP LOCKED: two relay instances never pick the same row
+    @Query(value = """
+        SELECT * FROM outbox WHERE published_at IS NULL
+        ORDER BY created_at LIMIT :n FOR UPDATE SKIP LOCKED""",
+        nativeQuery = true)
+    List<OutboxEvent> lockUnpublished(@Param("n") int n);
+}
+\end{lstlisting}
+
+Publisher không còn đụng tới Kafka. Nó ghi một dòng, và vì được gọi từ
+bên trong transaction của \code{AuthService}, dòng đó commit cùng với
+user:
+
+\begin{lstlisting}[language=Java]
+@Component
+@RequiredArgsConstructor
+public class UserActivatedPublisher {
+
+    private final OutboxRepository outbox;
+    private final ObjectMapper mapper;
+
+    public void publish(User user) {
+        UserActivatedEvent event = new UserActivatedEvent(
+                String.valueOf(user.getId()), user.getEmail(),
+                user.getFirstName(), user.getLastName(),
+                user.getRole().name());
+        OutboxEvent row = new OutboxEvent();
+        row.setId(UUID.randomUUID());               (*@\co{1}@*)
+        row.setAggregateType("user");
+        row.setAggregateId(event.userId());          (*@\co{2}@*)
+        row.setEventType("UserActivated");
+        row.setTopic("ts.user.activated");
+        row.setPayload(toJson(event));
+        row.setCreatedAt(Instant.now());
+        outbox.save(row);                            (*@\co{3}@*)
+    }
+
+    private String toJson(Object o) {
+        try { return mapper.writeValueAsString(o); }
+        catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+\end{lstlisting}
+
+Relay chạy mỗi giây, lấy một lô đã khóa, gửi từng dòng \emph{đồng bộ},
+và đánh dấu:
+
+\begin{lstlisting}[language=Java]
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class OutboxRelay {
+
+    private final OutboxRepository outbox;
+    private final KafkaTemplate<String, String> kafka;
+
+    @Scheduled(fixedDelay = 1000)
+    @Transactional                                   (*@\co{4}@*)
+    public void relay() {
+        for (OutboxEvent row : outbox.lockUnpublished(100)) {
+            ProducerRecord<String, String> rec = new ProducerRecord<>(
+                    row.getTopic(), row.getAggregateId(), row.getPayload());
+            rec.headers().add("eventId",
+                    row.getId().toString().getBytes(UTF_8));    (*@\co{5}@*)
+            rec.headers().add("eventType",
+                    row.getEventType().getBytes(UTF_8));
+            try {
+                kafka.send(rec).get(10, TimeUnit.SECONDS);      (*@\co{6}@*)
+                row.setPublishedAt(Instant.now());
+            } catch (Exception e) {
+                row.setAttempts(row.getAttempts() + 1);
+                log.warn("outbox {} attempt {} failed: {}",
+                        row.getId(), row.getAttempts(), e.toString());
+                break;                                          (*@\co{7}@*)
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Id sự kiện được đúc \emph{ở đây}, một lần, và sống qua
+  mọi lần thử lại. Nó là khóa khử trùng của consumer (Chương~34).
+  \item[\co{2}] Id aggregate trở thành key Kafka, nên mọi sự kiện về
+  một user rơi vào một partition, theo thứ tự.
+  \item[\co{3}] Một \code{INSERT} thuần, trong transaction của bên gọi.
+  Nếu \code{activate()} rollback, dòng này cũng vậy: không sự kiện ma.
+  Nếu commit, dòng đã bền vững trước khi Kafka dính líu: không mất sự
+  kiện.
+  \item[\co{4}] Transaction của relay giữ các khóa \code{FOR UPDATE SKIP
+  LOCKED}, nên replica auth-service thứ hai chạy cùng scheduler lấy
+  những dòng khác.
+  \item[\co{5}] Header mang danh tính và loại mà không làm bẩn payload
+  JSON mà các class DTO giải tuần tự.
+  \item[\co{6}] Nơi \emph{duy nhất} trong auth-service chờ Kafka, và nó
+  là một luồng nền. Request HTTP không bao giờ chặn trên broker nữa.
+  \item[\co{7}] Khi thất bại thì dừng lô, giữ thứ tự (dòng~2 không được
+  phát trước dòng~1 cho cùng key), và để nhịp kế tiếp thử lại.
+  \code{attempts} là thứ bạn đặt cảnh báo.
+\end{description}
+
+Thêm \code{@EnableScheduling} vào \code{AuthServiceApplication} và đổi
+\code{KafkaTemplate} thành \code{<String, String>}, vì payload đã là
+JSON. Consumer thấy đúng thứ nó từng thấy.
+
+Hai dòng sổ sách hoàn tất nó: một lệnh hằng đêm
+\code{DELETE FROM outbox WHERE published\_at < now() - interval '7 days'}
+giữ bảng nhỏ, và cùng hình dạng \code{UserActivatedPublisher} cho bạn
+\code{ts.user.updated} miễn phí --- gọi nó từ bất cứ đâu lưu thay đổi
+hồ sơ, với \code{eventType = "UserUpdated"}, và để
+\code{UserActivatedListener} upsert thay vì insert.
+
+\begin{handson}[xem outbox hấp thụ một sự cố broker]
+Với outbox đã có, dừng Kafka, kích hoạt một user, và nhìn:
+\begin{lstlisting}[language=bash]
+$ docker compose stop kafka
+$ curl -s -X POST localhost:8080/api/auth/activate?code=$CODE
+{"message":"Account activated"}          # instant, no 60s hang
+$ docker compose exec postgres-auth psql -U postgres ts_auth -c \
+  "select event_type, attempts, published_at from outbox"
+ event_type    | attempts | published_at
+ UserActivated |        3 |
+$ docker compose start kafka
+# ...a few seconds later
+ UserActivated |        3 | 2026-09-07 03:04:11.20+00
+\end{lstlisting}
+Rồi xem log của course-service tìm \code{Provisioned student row}. Việc
+kích hoạt chưa bao giờ gặp rủi ro, và học viên xuất hiện ngay khi
+broker xuất hiện.
+\end{handson}
+
+\subsection{Change data capture: relay cấp công nghiệp}
+
+Relay kiểu polling đơn giản và thêm tối đa một giây độ trễ cộng một
+truy vấn mỗi giây mỗi replica. Ở quy mô lớn relay được thay bằng
+\emph{change data capture}: Debezium đọc đuôi write-ahead log của
+Postgres, thấy \code{INSERT INTO outbox}, và tự phát nó lên Kafka,
+không cần scheduler ứng dụng và độ trễ dưới 100\,ms. Code ứng dụng y
+hệt --- ghi dòng --- đó là lý do nên áp dụng outbox sớm: relay là phần
+duy nhất thay đổi.
+
+\section{Saga: khi hai service đều phải thay đổi}
+
+Ghi danh hôm nay là cục bộ --- \code{course}, \code{student} và
+\code{enrollment} đều nằm trong \code{ts\_course}, nên
+\code{EnrollmentService.enroll} là một transaction bình thường. Lần ghi
+xuyên service thực sự đầu tiên mà dự án sẽ gặp là \emph{xóa tài
+khoản}: auth-service phải xóa user; course-service phải xóa học viên,
+các ghi danh, bài nộp, và file bài nộp trong MinIO (Chương~9). Không
+có transaction nào trải qua từng ấy.
+
+Một \emph{saga} là chuỗi các transaction cục bộ trong đó mỗi bước phát
+một sự kiện kích hoạt bước kế, và mỗi bước có một hành động \emph{bù}
+(compensating) nếu bước sau thất bại:
+
+\begin{enumerate}
+  \item auth-service đánh dấu user \code{DELETING} (chưa xóa) và ghi
+  \code{UserDeletionRequested} vào outbox.
+  \item course-service xóa dữ liệu và file của học viên, rồi phát
+  \code{StudentDataDeleted} --- hoặc, khi thất bại,
+  \code{StudentDataDeletionFailed}.
+  \item auth-service, khi nhận sự kiện thành công, xóa hẳn user; khi
+  nhận sự kiện thất bại, bù bằng cách khôi phục \code{ACTIVE} và báo
+  cho vận hành.
+\end{enumerate}
+
+Đây là \emph{choreography}: không có điều phối viên, mỗi service phản
+ứng với sự kiện. Nó hợp với hai hay ba bước. Quá số đó --- xóa xuyên
+năm service, với ràng buộc thứ tự --- đồ thị sự kiện trở nên không đọc
+nổi, và các đội chuyển sang \emph{orchestration}: một thành phần (saga
+orchestrator, hoặc một workflow engine như Temporal) giữ máy trạng thái
+và gửi \emph{lệnh} tới từng service. Đánh đổi là thêm một service để
+vận hành lấy một luồng bạn thực sự đọc được.
+
+Hai tính chất mọi saga phải có, và người phỏng vấn kiểm tra:
+\emph{khóa ngữ nghĩa} --- trạng thái \code{DELETING} ngăn user đăng nhập
+trong vài giây saga chạy --- và \emph{bước lũy đẳng}, để giao nhận
+ít-nhất-một-lần của Chương~34 không thể xóa hai lần hay bù hai lần.
+
+\section{Đọc xuyên service}
+
+Khoảng trống còn lại là báo cáo. ``Học viên đã kích hoạt mỗi khóa, kèm
+lần đăng nhập cuối'' cần dữ liệu auth và dữ liệu khóa học, và không
+service nào có cả hai. Ba câu trả lời, theo chi phí tăng dần:
+
+\begin{itemize}
+  \item \textbf{Ghép API.} Gateway hoặc một backend-for-frontend nhỏ gọi
+  cả hai service và join trong bộ nhớ. Ổn cho một trang, sai cho một
+  báo cáo hằng đêm trên mọi khóa học.
+  \item \textbf{Một read model.} Một cơ sở dữ liệu \code{reporting}
+  riêng đăng ký \emph{mọi} sự kiện miền và duy trì các bảng phi chuẩn
+  hóa theo hình dạng truy vấn. Đây là CQRS: ghi đi tới các service sở
+  hữu, đọc đi tới một mô hình dựng từ sự kiện của chúng. Outbox ở trên
+  là điều kiện tiên quyết --- không có sự kiện đáng tin, read model trôi
+  âm thầm.
+  \item \textbf{Một kho dữ liệu.} CDC từ mọi cơ sở dữ liệu service vào
+  một kho phân tích. Read model cho những người không phải bạn.
+\end{itemize}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+\begin{itemize}
+  \item \textbf{postgres-course chết; user vẫn kích hoạt.} Không có
+  outbox, không gì mất ở phía auth, nhưng \code{UserActivatedListener}
+  ném ngoại lệ ở \code{save()}. Error handler mặc định của Spring thử
+  lại mười lần liên tiếp, rồi \emph{log và bỏ qua} record (Chương~34).
+  Sự kiện đã tiêu thụ, học viên không bao giờ được tạo, và dòng log là
+  dấu vết duy nhất. Có outbox thì phía auth an toàn, nhưng phía consumer
+  vẫn cần topic thử lại --- outbox sửa producer, không sửa consumer.
+  \item \textbf{Một sự kiện bị phát lại.} Ai đó reset offset của
+  \code{course-group} để phục hồi sau sự cố trên. Mọi
+  \code{ts.user.activated} kể từ đầu retention được giao lại.
+  \code{findByUserId().isPresent()} biến từng cái thành no-op. Lũy đẳng
+  theo khóa tự nhiên là thứ biến phát lại thành thao tác thường ngày
+  thay vì sự cố.
+  \item \textbf{Thứ tự.} \code{UserActivated} và một
+  \code{UserUpdated} tương lai cho cùng user được key theo
+  \code{userId} nên chung partition; cập nhật không thể vượt mặt kích
+  hoạt. Sự kiện cho các user \emph{khác nhau} có thể xen kẽ tự do, ổn
+  thôi --- không có bất biến xuyên user. Đổi key, hoặc gửi từ hai
+  producer khác nhau, và bảo đảm này biến mất.
+  \item \textbf{Relay kẹt.} Một dòng độc --- payload broker từ chối vì
+  kích thước --- khiến \co{7} break ở mọi nhịp, và các dòng phía sau xếp
+  hàng mãi mãi. Cảnh báo trên \code{max(attempts)} và trên
+  \code{count(*) where published\_at is null}; sau N lần thử, chuyển
+  dòng sang bảng \code{outbox\_dead} và để hàng đợi chảy tiếp.
+\end{itemize}
+
+\begin{decision}[khi một cơ sở dữ liệu là lựa chọn tốt hơn]
+\code{docs/PLAN-A} mô tả cùng sản phẩm dưới dạng modular monolith: một
+ứng dụng Spring Boot, một cơ sở dữ liệu \code{ts}, và
+\code{student.user\_id} là khóa ngoại thật. Mọi vấn đề trong chương này
+--- ghi kép, trôi dữ liệu, saga, read model --- biến mất ở đó, thay bằng
+một \code{JOIN} và một transaction. Đó không phải khoản tiết kiệm nhỏ.
+Bố cục microservice (\code{PLAN-B}) chỉ xứng đáng với chi phí khi những
+điều bị cấm chính là mục đích: các đội phải triển khai không cần nhau,
+dữ liệu phải mở rộng riêng, hoặc tổ chức đủ lớn để một schema dùng
+chung \emph{sẽ} bị join chéo trong cơn nóng giận. Với một đội ba người
+dự án này cố ý xây quá tay, và chặng đường phía trước ở Chương~27
+thẳng thắn về điều đó. Câu trả lời senior trong phỏng vấn không phải
+``microservices'' hay ``monolith''; nó là ``modular monolith cho tới
+khi một ranh giới có lý do để trở thành ranh giới mạng --- và khi đó,
+outbox ngay từ ngày đầu''.
+\end{decision}
+
+\section{Ngoài dự án}
+
+Outbox là mẫu đứng sau ``outbox event router'' của Debezium, transactional
+messaging của Axon và Eventuate, và các dạng
+\code{TransactionalEventPublisher} trong mọi codebase hướng sự kiện
+nghiêm túc. Saga kiểu orchestration được sản phẩm hóa bởi Temporal,
+Camunda và AWS Step Functions; kiểu choreography đơn giản là ``sự kiện
+kèm hành động bù'' và một sơ đồ ai đó phải giữ cho cập nhật. Netflix,
+Uber, và mọi ngân hàng bạn kể tên được đều chạy một tổ hợp nào đó của
+ba thứ này --- outbox cho độ tin cậy, saga cho ghi nhiều bước, read
+model CQRS cho truy vấn vượt ranh giới sở hữu. Điều duy nhất không ai
+trong số họ làm là điều dự án đang làm hôm nay: gọi \code{send()} bên
+trong một transaction và hy vọng.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Bạn cần một báo cáo join user và khóa học, mà chúng nằm ở hai cơ sở dữ liệu. Làm thế nào?}
+
+Trước hết tôi hỏi cần tươi đến đâu và lớn đến đâu. Cho một màn hình,
+ghép API: một backend-for-frontend gọi \code{/users?ids=} và
+\code{/courses}, join trong bộ nhớ, ổn tới vài trăm dòng. Cho một báo
+cáo thật tôi dựng read model: một cơ sở dữ liệu \code{reporting} đăng
+ký \code{ts.user.activated}, \code{ts.user.updated} và các sự kiện khóa
+học, duy trì một bảng \code{course\_roster} phi chuẩn hóa theo hình
+dạng truy vấn. Đó là CQRS --- các service sở hữu giữ phần ghi, read
+model trả lời phần đọc xuyên service. Điều kiện tiên quyết là sự kiện
+đáng tin, nên tôi đặt outbox vào trước; một read model nuôi bằng những
+lời gọi \code{send()} kiểu cố-gắng-hết-sức sẽ trôi và không ai nhận ra
+cho tới khi bộ phận tài chính nhận ra. Cho phân tích ở quy mô công ty,
+cùng ý tưởng là CDC vào kho dữ liệu. Điều tôi từ chối làm là cấp cho
+job báo cáo một read replica của cả hai cơ sở dữ liệu và một join xuyên
+cơ sở dữ liệu --- đó là sự ghép nối qua cơ sở dữ liệu dùng chung mà kiến
+trúc này tồn tại để ngăn, quay lại bằng cửa hông.
+
+\subsection*{Q: Hai service phải cùng thành công hoặc không service nào. Làm thế nào, không dùng two-phase commit?}
+
+Một saga. Mỗi service làm một transaction cục bộ và phát sự kiện; bước
+kế phản ứng; mỗi bước có hành động bù. Trong dự án, xóa tài khoản:
+auth-service đặt \code{DELETING} và phát \code{UserDeletionRequested};
+course-service xóa dữ liệu và phát \code{StudentDataDeleted} hoặc
+\code{...Failed}; auth-service hoặc xóa hẳn hoặc khôi phục
+\code{ACTIVE}. Hai thứ khiến nó đúng thay vì hy vọng: khóa ngữ nghĩa
+--- trạng thái \code{DELETING} chặn đăng nhập trong vài giây saga chạy
+--- và bước lũy đẳng, vì Kafka sẽ giao ít nhất một lần. Tôi chọn
+choreography cho hai hay ba bước và orchestration (Temporal, Camunda,
+hoặc một máy trạng thái tự viết) khi đồ thị sự kiện cần một sơ đồ mới
+theo dõi được. 2PC bị loại không phải vì nó sai mà vì Kafka và Postgres
+không chia sẻ transaction coordinator, và giữ lock xuyên một lời gọi
+mạng là cách bạn nhận cuộc gọi lúc 3 giờ sáng.
+
+\subsection*{Q: Một sự kiện bị mất giữa commit cơ sở dữ liệu và lần gửi Kafka. Làm sao để điều đó bất khả?}
+
+Bằng cách không bao giờ gửi từ luồng request. Transactional outbox: sự
+kiện là một dòng trong bảng \code{outbox} ghi trong cùng transaction với
+dòng nghiệp vụ, nên Postgres bảo đảm cả hai hoặc không gì. Một relay
+--- một poller \code{@Scheduled} với \code{FOR UPDATE SKIP LOCKED}, hoặc
+Debezium đọc WAL --- phát nó sau đó và đánh dấu. Relay là
+ít-nhất-một-lần, nên dòng mang một id sự kiện để consumer khử trùng.
+Trong dự án này nó còn gỡ một sự cố tiềm ẩn: hôm nay
+\code{kafkaTemplate.send()} bên trong \code{AuthService.register} chặn
+trong \code{max.block.ms} khi broker chết, nên một sự cố broker mail
+khiến đăng ký thất bại sau sáu mươi giây. Với outbox, đăng ký commit
+trong mili giây và e-mail đến trễ thay vì lượt đăng ký bị mất.
+
+\subsection*{Q: Làm sao chuyển một cơ sở dữ liệu dùng chung sang mỗi service một cơ sở dữ liệu một cách an toàn?}
+
+Strangler, không phải big bang. Bước một: cầm máu --- tìm mọi join và
+khóa ngoại xuyên schema và định tuyến chúng qua API của service sở hữu
+hoặc một bản sao cục bộ, trong khi các bảng vẫn ở một cơ sở dữ liệu. Đó
+là phần khó và có thể mất nhiều tháng; tách vật lý sau đó là một cuối
+tuần. Bước hai: cấp cho mỗi service credential và schema riêng, để một
+join vô tình thất bại ngay lúc biên dịch. Bước ba: ghi kép hoặc CDC các
+bảng sang cơ sở dữ liệu mới, kiểm đếm và checksum, lật phần đọc, rồi
+phần ghi, giữ bảng cũ chỉ-đọc thêm một bản phát hành, rồi drop. Xuyên
+suốt, outbox đi vào \emph{trước} khi tách, vì khoảnh khắc join biến mất
+là bạn dựa vào sự kiện để giữ bản sao đúng. ``Hai server Postgres,
+không phải hai schema'' của Chương~7 là trạng thái cuối; bạn tới đó
+bằng schema-mỗi-service trước.
+
+\subsection*{Q: Bạn đã nhân bản dữ liệu Student vào course-service. Làm sao giữ nó đúng?}
+
+Tôi chấp nhận nó sẽ cũ và tôi chặn trên độ cũ. Việc tạo tới trên
+\code{ts.user.activated}; cập nhật cần một \code{ts.user.updated} dự án
+chưa phát --- đó là sửa đầu tiên. Cả hai key theo \code{userId}, nên
+chung partition và cập nhật không thể vượt mặt việc tạo. Listener upsert
+theo khóa tự nhiên, khiến phát lại an toàn. Sự kiện tới từ outbox, nên
+không cái nào mất; consumer ghi lại id sự kiện đã xử lý, nên không cái
+nào áp dụng hai lần. Rồi tôi đo: một job hằng đêm so một mẫu
+\code{student.email} với auth-service và cảnh báo khi trôi, vì mỗi cơ
+chế ở trên đều có một lỗi tôi chưa tìm ra. Điều tôi không làm là đặt
+e-mail vào JWT --- việc đó đóng băng nó suốt đời token và ghép schema
+qua hợp đồng token (Chương~28).
+
+\begin{quiz}
+\begin{enumerate}
+  \item Đọc \code{AuthService.activate}. Mô tả hai thứ tự sự cố khác
+  nhau khiến auth-service và course-service bất đồng, và nói thứ tự nào
+  tạo ra một dòng lẽ ra không tồn tại.
+  \item Kafka không với được. Giải thích vì sao \code{POST /register}
+  hôm nay mất khoảng một phút để thất bại và không tạo user, nêu tên
+  thiết lập producer chịu trách nhiệm. Cùng request đó làm gì sau khi
+  có outbox?
+  \item Trong relay, vì sao \code{FOR UPDATE SKIP LOCKED} là cần thiết,
+  và chuyện gì hỏng với hai replica auth-service nếu thay nó bằng một
+  \code{SELECT} thuần?
+  \item Vì sao \code{break} (không phải \code{continue}) theo sau một
+  lần gửi thất bại trong vòng lặp relay? Nêu kịch bản mà phương án kia
+  làm hỏng.
+  \item E-mail của một học viên đổi trong auth-service. Nêu
+  course-service biết gì về việc đó hôm nay, và liệt kê ba thay đổi
+  code khép lại khoảng trống.
+  \item Thiết kế xóa tài khoản xuyên auth-service, course-service và
+  MinIO như một saga choreography: gọi tên các trạng thái, các sự kiện,
+  hành động bù, và giải thích trạng thái \code{DELETING} bảo vệ khỏi
+  điều gì.
+\end{enumerate}
+\end{quiz}

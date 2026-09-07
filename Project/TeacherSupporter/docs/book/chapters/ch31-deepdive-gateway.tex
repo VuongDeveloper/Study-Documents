@@ -1,0 +1,623 @@
+\chapter{Deep Dive: The Gateway Under Load --- Reactive Internals, Rate Limits, and the Edge's Job}
+\label{ch:dd-gateway}
+
+Chapter~4 taught the gateway as a route table: predicates, \code{lb://}
+URIs, \code{StripPrefix}, one JWT filter. That is the gateway on a quiet
+day. This chapter is the gateway on a bad one --- a slow course-service,
+a client in a retry loop, a pod restart at the wrong moment --- and it
+asks what the reactive stack actually buys, what the project's edge is
+missing, and where the line runs between an edge's job and everybody
+else's.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{Why is the gateway non-blocking}, and what exactly goes
+  wrong if a filter blocks?
+  \item \textbf{What breaks first under load} --- and why the answer is
+  ``the thing without a timeout''?
+  \item \textbf{What belongs at the edge} --- rate limits, circuit
+  breakers, CORS --- and what never should?
+\end{enumerate}
+
+\section{Why a gateway, and what it solves}
+
+Without the gateway the frontend would hold six addresses, each service
+would verify JWTs, and CORS, rate limits and tracing headers would be
+implemented six times or zero times. The gateway collapses that into one
+address and one place for every \emph{cross-cutting} concern --- concerns
+that are about \emph{every} request rather than about courses or users.
+The interview form of the question is ``what does an API gateway do that
+a load balancer does not?'' and the senior answer is: a load balancer
+picks a backend; a gateway \emph{understands the request} --- it can
+authenticate, rewrite, rate-limit, and fail over per route, because it
+runs application code on the path. That power is also the risk: whatever
+you put on that path, every request pays for.
+
+\begin{decision}[an application gateway behind an infrastructure router]
+The cluster already has Traefik (Chapter~18). Why keep Spring Cloud
+Gateway behind it? Because the two do different jobs: Traefik owns the
+host, TLS, and the path fan-out; the gateway owns things only the
+application knows --- which Eureka name serves \code{/api/courses}, what
+a valid JWT looks like, which headers to inject. Merging them would mean
+teaching Traefik the JWT secret and the header contract, which is
+possible (ForwardAuth middleware) but moves application security into
+infrastructure config. The decision flips if the platform provides
+identity itself (a cloud API Gateway with Cognito or IAP): then the
+Spring gateway is a second hop paid for nothing.
+\end{decision}
+
+\section{The reactive stack, read from the filter}
+\label{sec:reactive}
+
+The gateway declares \code{web-application-type: reactive} in its
+\code{application.yml}. That one line swaps Tomcat's thread-per-request
+model for Reactor Netty's event loop, and every line of the JWT filter
+is written for that model:
+
+\begin{lstlisting}[language=Java]
+@Override
+public Mono<Void> filter(ServerWebExchange exchange,
+                         GatewayFilterChain chain) {           (*@\co{1}@*)
+    String path = exchange.getRequest().getURI().getPath();
+    if (isPublicPath(path)) {
+        return chain.filter(exchange);                          (*@\co{2}@*)
+    }
+    String authHeader = exchange.getRequest().getHeaders()
+            .getFirst(HttpHeaders.AUTHORIZATION);
+    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        return unauthorizedResponse(exchange, "Missing ...");  (*@\co{3}@*)
+    }
+    String token = authHeader.substring(7);
+    try {
+        Claims claims = Jwts.parser().verifyWith(signingKey)
+                .build().parseSignedClaims(token).getPayload(); (*@\co{4}@*)
+        ServerHttpRequest mutated = exchange.getRequest().mutate()
+                .header(JwtConstants.HEADER_USER_ID, claims.getSubject())
+                .header(JwtConstants.HEADER_USER_ROLE,
+                        claims.get(JwtConstants.CLAIM_ROLE, String.class))
+                .build();
+        return chain.filter(exchange.mutate().request(mutated).build());
+    } catch (Exception e) {
+        return unauthorizedResponse(exchange, "Invalid or expired token");
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The return type is the whole story. A servlet filter
+  returns \code{void} \emph{after} the request is done; this returns a
+  \code{Mono<Void>} --- a \emph{description} of work that completes
+  later. The thread that called \code{filter} is free the moment this
+  method returns.
+  \item[\co{2}] \code{chain.filter(exchange)} does not forward the
+  request; it returns the next stage's \code{Mono}. Nothing has happened
+  yet. The chain is assembled first and subscribed once.
+  \item[\co{3}] Even the error path is reactive: \code{writeWith} returns
+  a \code{Mono} that completes when Netty has flushed the body.
+  \item[\co{4}] The one piece of real work, and it is CPU-bound and
+  microseconds long: an HMAC over a few hundred bytes. This is the kind
+  of work that \emph{may} run on an event-loop thread. A database call
+  is not.
+\end{description}
+
+\subsection{Threads: four, not four hundred}
+
+Tomcat answers concurrency with threads: 200 by default, one per
+in-flight request, each parked while its backend answers. A proxy's
+requests are almost entirely waiting, so a Tomcat proxy under 1{,}000
+in-flight requests needs 1{,}000 threads and about a gigabyte of stacks.
+Reactor Netty runs a small fixed pool of \emph{event-loop} threads, each
+multiplexing thousands of sockets with non-blocking I/O: a request
+arrives, the filter chain is assembled, the upstream write is issued, and
+the thread moves on. When the upstream answers, whichever loop owns that
+socket resumes the chain.
+
+\begin{hardware}
+Reactor Netty sizes the loop as \code{max(availableProcessors, 4)}.
+On ts-server's two cores that is \textbf{four} event-loop threads for
+the whole gateway. Four threads serving every request is the reason the
+gateway's Deployment asks for less memory than an MVC service
+(384\,Mi vs.\ 512\,Mi, Chapter~17) --- and the reason one blocked thread
+is not a 0.5\,\% problem but a 25\,\% one.
+\end{hardware}
+
+\subsection{What blocking does to an event loop}
+
+Suppose someone ``improves'' the filter by checking a deny-list in
+Postgres:
+
+\begin{lstlisting}[language=Java]
+// DO NOT: a JDBC call inside a WebFlux filter
+boolean revoked = jdbcTemplate.queryForObject(
+        "select exists(select 1 from revoked where jti = ?)",
+        Boolean.class, claims.getId());
+\end{lstlisting}
+
+JDBC is blocking by specification: the calling thread waits for the
+socket. That thread is one of four event loops, and while it waits it
+is not servicing the hundreds of other sockets it owns. Their requests
+stall --- not fail, \emph{stall} --- until the query returns. Under a
+slow database, all four loops are pinned within seconds and the gateway
+accepts connections it cannot process: every route, every user, one
+symptom. The same is true of \code{.block()} on a \code{Mono},
+\code{Thread.sleep}, a synchronous \code{RestTemplate} call, or a file
+read. The reactive alternative moves the work off the loop and
+\emph{composes} it into the chain:
+
+\begin{lstlisting}[language=Java]
+return Mono.fromCallable(() -> deny.isRevoked(claims.getId()))
+        .subscribeOn(Schedulers.boundedElastic())   // off the loop
+        .flatMap(revoked -> revoked
+                ? unauthorizedResponse(exchange, "Token revoked")
+                : chain.filter(exchange.mutate().request(mutated).build()));
+\end{lstlisting}
+
+Better still is a non-blocking client (reactive Redis, R2DBC) so no
+thread waits at all. The rule for anything on the gateway path:
+\emph{if the library's method returns a value instead of a}
+\code{Mono}\emph{/}\code{Flux}\emph{, it does not belong in a filter.}
+Reactor's BlockHound agent turns that rule into a test failure.
+
+\subsection{Predicates, order, and the \code{StripPrefix} arithmetic}
+
+Routes are tried in declaration order (all have the default
+\code{order} of 0, and the sort is stable); the first predicate match
+wins. The project's table has no overlaps, but a future
+\code{Path=/api/**} catch-all placed \emph{above} the specific routes
+would swallow them silently --- put catch-alls last or give them a high
+\code{order}. Filters attached to a route are numbered in sequence and
+run \emph{after} global filters with a lower order; the JWT filter's
+\code{getOrder()} of $-1$ places it before every route filter, which is
+what lets a route's rate limiter (below) read the \code{X-User-Id}
+header the JWT filter just wrote.
+
+\begin{pitfall}[the doubled segment]
+Symptom: the frontend calls \code{/api/courses/courses/5} and it
+works, but a hand-written \code{/api/courses/5} returns 404 from
+course-service. Cause: \code{StripPrefix=2} removes exactly two
+segments, \code{/api} and \code{/courses}, so \code{/api/courses/5}
+arrives as \code{/5} --- and no controller is mapped there. The first
+\code{courses} selects the \emph{route}; the second survives the strip
+and matches \code{@RequestMapping("/courses")}. The frontend repeats the
+segment on purpose. The cleaner design is \code{StripPrefix=1} with
+controllers keeping their resource prefix; the project chose to keep
+services unaware of \code{/api} at the cost of the doubled URL.
+\end{pitfall}
+
+\section{CORS at the edge}
+
+\code{CorsConfig} registers one \code{CorsWebFilter} for \code{/**}:
+origins \code{localhost:3000} and \code{5173}, six methods, any header,
+credentials allowed. Three things to understand about where it lives.
+
+\emph{Why here and not in each service.} CORS is a browser rule about
+\emph{origins}, and the origin the browser talks to is the gateway.
+A service answering \code{Access-Control-Allow-Origin} would be
+answering a question nobody asked it; and if two services disagreed, the
+browser would see inconsistent policy for one API. Edge concerns go at
+the edge.
+
+\emph{What a preflight costs.} For any request that is not ``simple''
+--- a JSON \code{POST}, anything with an \code{Authorization} header ---
+the browser first sends an \code{OPTIONS} request and waits for the
+answer. That is one extra round trip per call, and every API call in
+this project carries \code{Authorization}. The gateway answers preflights
+itself without touching a route, which is cheap, but the round trip is
+paid by the user. \code{Access-Control-Max-Age} lets the browser cache
+the answer; \code{CorsConfig} does not set it, so Chrome falls back to
+five seconds. One line, \code{config.setMaxAge(3600L)}, removes almost
+every preflight from a session.
+
+\emph{When it is never consulted.} In the cluster the frontend and
+\code{/api} share one origin behind Traefik (Chapter~26), so no request
+is cross-origin and the filter is idle. Dev is the only place it runs
+--- and Vite's proxy could make even dev same-origin. CORS config is
+therefore not a security feature here; it is a development convenience
+that must not be widened carelessly: \code{allowCredentials(true)} with
+a wildcard origin is refused by browsers precisely because it would let
+any site call the API with the user's cookies.
+
+\section{The edge's job, and what is not}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.44\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Belongs at the edge & Does not \\
+\midrule
+Authentication, identity headers & Authorization rules per resource \\
+Rate limiting, quotas & Business validation \\
+Timeouts, retries (idempotent), circuit breaking & Response aggregation across services \\
+CORS, TLS termination, compression & Calling a database \\
+Tracing headers, access logs & Data transformation beyond headers/paths \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The right-hand column is the ``smart pipes'' anti-pattern the ESB era
+taught: once the gateway knows business rules, every feature ships in
+two places and the gateway team becomes the bottleneck for everyone. The
+one legitimate exception --- composing several service calls into one
+screen-shaped response --- is a service of its own (a \emph{backend for
+frontend}), deployed and scaled separately from the edge.
+
+\section{Pros and cons, honestly}
+
+\begin{itemize}
+  \item \textbf{Pro:} one address, one JWT filter, one CORS policy;
+  routes are configuration, changeable without a rebuild
+  (Chapter~2).
+  \item \textbf{Pro:} the reactive model holds thousands of in-flight
+  requests on four threads and boots in seconds.
+  \item \textbf{Con:} the project's gateway sets \emph{no} HTTP client
+  timeouts. Reactor Netty's defaults are a 30-second connect timeout and
+  \emph{no} response timeout at all.
+  \item \textbf{Con:} no circuit breaker, no rate limiter --- every
+  client can send as fast as it likes, and a dead service is discovered
+  by each request individually.
+  \item \textbf{Con:} \code{replicas: 1} in Kubernetes. The component
+  every request passes is the one with a single copy.
+  \item \textbf{Con:} the starter it uses, \code{spring-cloud-starter-gateway},
+  is deprecated in Spring Cloud 2025.0 in favor of
+  \code{spring-cloud-starter-gateway-server-webflux}; the rename is
+  harmless today and a build break in a future upgrade.
+\end{itemize}
+
+\section{What breaks}
+
+\begin{pitfall}[a slow downstream takes the whole route with it]
+Symptom: course-service is slow (a lock, a full GC), and within a minute
+\emph{all} requests to \code{/api/courses/**} fail with 503 or hang ---
+including cheap ones that would have succeeded. Cause: the gateway keeps
+a per-host connection pool, sized \code{max(cores, 8) $\times$ 2} = 16
+on this box. With no response timeout, each slow request holds one
+pooled connection for as long as course-service takes; the seventeenth
+request waits in the acquire queue for 45 seconds and then fails. Every
+user is queued behind the slowest one. Fix: a response timeout
+(Section~\ref{sec:gw-enhance}) so a stuck connection is reclaimed, and a
+circuit breaker so the route fails fast once failures cluster.
+\end{pitfall}
+
+\begin{pitfall}[431 Request Header Fields Too Large]
+Symptom: a user with many cookies, or a token with fat claims
+(Chapter~28), gets an immediate 431 from the gateway with nothing in the
+service logs. Cause: Netty caps the request \emph{header block} at
+8\,KB by default; the gateway rejects the request before any filter
+runs. Fix: keep tokens thin. Raising
+\code{server.max-http-request-header-size} is the second-best answer,
+because every hop behind the gateway has its own cap.
+\end{pitfall}
+
+\begin{pitfall}[the gateway is the single point of failure]
+Symptom: a rolling update of the gateway, a node reboot, or an OOM kill
+--- and the entire application is down, while every service behind it
+is healthy. Cause: one replica. The gateway is stateless, so the fix is
+\code{replicas: 2} plus a \code{PodDisruptionBudget}; the only thing
+that would make scaling harder is per-instance state such as an
+in-memory rate limiter, which is exactly why the enhancement below keeps
+that state in Redis.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+course-service's Postgres starts a long autovacuum; queries that took
+20\,ms take 4\,s. Walk the path.
+
+\begin{enumerate}
+  \item The frontend fires a dashboard's six requests. Four hit
+  course-service and take 4\,s each. The gateway holds four pooled
+  connections for 4\,s.
+  \item Users retry. Twenty users, four requests each: 80 requests
+  compete for 16 connections. Acquire queue grows; after 45\,s waiting
+  requests fail with 503.
+  \item Requests to auth-service and dictionary-service are
+  \emph{unaffected} --- the pool is per host --- until users' access
+  tokens expire and \code{/refresh} succeeds but the dashboard still
+  fails, so they log out and back in, adding load.
+  \item Nobody is paged, because the gateway is ``healthy'':
+  \code{/actuator/health} answers 200 and its event loops are not
+  blocked. The failure is invisible at the edge and visible only as
+  latency in Zipkin (Chapter~24).
+\end{enumerate}
+
+With a 5\,s response timeout and a circuit breaker on the route, step~2
+becomes: slow calls are cut at 5\,s and counted as failures; after ten
+of them the breaker opens; for the next 10\,s every \code{/api/courses}
+request fails in under a millisecond with a fallback body; the pool is
+never exhausted; auth and dictionary keep working; the breaker's state
+change is a metric you can alert on. The database is still slow ---
+resilience does not fix causes --- but the blast radius is one route
+instead of the site.
+
+\section{Enhancing the resolution}
+\label{sec:gw-enhance}
+
+Three additions, all configuration plus one bean. Dependencies first
+(gateway \code{pom.xml}):
+
+\begin{lstlisting}[language=yaml]
+# spring-cloud-starter-circuitbreaker-reactor-resilience4j
+#   -> the reactive CircuitBreaker gateway filter
+# spring-boot-starter-data-redis-reactive
+#   -> backing store for RequestRateLimiter (non-blocking client)
+\end{lstlisting}
+
+Then \code{api-gateway.yml} in the config-server:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}            # redis:6379 in compose
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 2000                  (*@\co{1}@*)
+        response-timeout: 5s
+        pool:
+          max-connections: 64                  (*@\co{2}@*)
+          acquire-timeout: 2000
+      default-filters:
+        - RemoveRequestHeader=X-User-Id        (*@\co{3}@*)
+        - RemoveRequestHeader=X-User-Role
+      routes:
+        - id: course-service-courses
+          uri: lb://course-service
+          predicates:
+            - Path=/api/courses/**
+          filters:
+            - StripPrefix=2
+            - name: CircuitBreaker             (*@\co{4}@*)
+              args:
+                name: courseCb
+                fallbackUri: forward:/fallback/course
+                statusCodes: "500,502,503,504"
+            - name: RequestRateLimiter         (*@\co{5}@*)
+              args:
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 40
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@userKeyResolver}"
+resilience4j:
+  circuitbreaker:
+    instances:
+      courseCb:
+        sliding-window-size: 10
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 3s       (*@\co{6}@*)
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+  timelimiter:
+    instances:
+      courseCb:
+        timeout-duration: 5s                   (*@\co{7}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Connect in 2\,s or give up; a full response within 5\,s
+  or the connection is closed and returned to the pool. Per-route
+  overrides are possible via route \code{metadata} for a known-slow
+  endpoint such as file upload.
+  \item[\co{2}] Sixteen connections per host is tight once timeouts
+  make requests short; 64 is comfortable on this box and still bounded.
+  \item[\co{3}] The Chapter~28 fix: identity headers can only be
+  written by the gateway.
+  \item[\co{4}] The reactive Resilience4j filter. Failures (and the
+  listed status codes) count toward the breaker; when open, requests are
+  forwarded to \code{/fallback/course} \emph{inside the gateway}.
+  \item[\co{5}] Token bucket in Redis: 20 tokens per second refill, up
+  to 40 stored, one spent per request. Exceeding it returns 429 with
+  \code{X-RateLimit-Remaining: 0}. Redis, not memory, so two gateway
+  replicas share one bucket per user.
+  \item[\co{6}] Without this, slow calls are not failures --- the
+  default slow-call threshold is 60\,s. Three seconds means ``slower
+  than we designed for''.
+  \item[\co{7}] The gateway's breaker wraps every call in a
+  TimeLimiter whose default is \textbf{one second}. Left unset, a
+  healthy 1.2\,s upload would trip the breaker. Set it explicitly and
+  keep it $\ge$ the response timeout.
+\end{description}
+
+The key resolver and the fallback endpoint:
+
+\begin{lstlisting}[language=Java]
+@Configuration
+public class RateLimitConfig {
+
+    /** Bucket per authenticated user; anonymous callers share
+     *  a bucket per client IP (public paths: login, refresh). */
+    @Bean
+    public KeyResolver userKeyResolver() {
+        return exchange -> {
+            String user = exchange.getRequest().getHeaders()
+                    .getFirst(JwtConstants.HEADER_USER_ID);
+            if (user != null) {
+                return Mono.just("u:" + user);
+            }
+            var addr = exchange.getRequest().getRemoteAddress();
+            return Mono.just("ip:" + (addr == null ? "unknown"
+                    : addr.getAddress().getHostAddress()));
+        };
+    }
+}
+
+@RestController
+public class FallbackController {
+
+    /** Served by the gateway itself when a breaker is open.
+     *  503 + Retry-After tells clients (and browsers) to back off. */
+    @GetMapping("/fallback/course")
+    public ResponseEntity<Map<String, String>> course() {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "10")
+                .body(Map.of("error", "course-service unavailable",
+                             "retryAfterSeconds", "10"));
+    }
+}
+\end{lstlisting}
+
+\begin{decision}[what to key the rate limit on]
+Per \emph{user id} is the right default for an authenticated API: it
+matches the thing you are protecting (a tenant's fair share) and cannot
+be dodged by rotating IPs. Per \emph{IP} is the only option before
+authentication --- login and refresh --- and is the right one there,
+because the threat is credential stuffing from one source; it is wrong
+behind a corporate NAT, where one IP is a thousand users. Per \emph{API
+key} is for machine clients and partners, where the key is the contract.
+Production edges usually stack two: a coarse per-IP limit on public
+paths and a per-user limit on everything else.
+\end{decision}
+
+\begin{handson}[hit the bucket]
+With Redis added to \code{docker-compose.yml} and the gateway restarted,
+fire 50 requests as one user faster than the bucket refills:
+\begin{lstlisting}[language=bash]
+$ for i in $(seq 1 50); do
+    curl -s -o /dev/null -w "%{http_code} " \
+      -H "Authorization: Bearer $TOKEN" \
+      http://localhost:8080/api/courses/courses
+  done; echo
+200 200 200 ... 200 429 429 429 429 429 429 429 429 429 429
+$ curl -si -H "Authorization: Bearer $TOKEN" \
+    http://localhost:8080/api/courses/courses | grep -i ratelimit
+X-RateLimit-Remaining: 0
+X-RateLimit-Burst-Capacity: 40
+X-RateLimit-Replenish-Rate: 20
+\end{lstlisting}
+Forty succeed (the burst), then 429s until a second passes and twenty
+tokens return. Stop course-service and repeat: after ten failures the
+same command returns the fallback JSON in under a millisecond, and
+\code{/actuator/circuitbreakers} shows \code{courseCb} as \code{OPEN}.
+\end{handson}
+
+\section{Outside the project}
+
+Kong, Envoy (and Istio's ingress built on it), nginx, and the cloud
+gateways (AWS API Gateway, Apigee) implement the same four ideas ---
+timeouts, breakers, rate limits, header rewriting --- as native
+configuration rather than Spring filters, with the token bucket
+typically in the proxy's own memory per node plus a shared store for
+global limits. Envoy's ``outlier detection'' is the circuit breaker;
+its ``local rate limit'' filter is the bucket. What you have learned
+here transfers directly: the questions an interviewer asks about any of
+them --- where does state live, what happens when the store is down,
+what is the timeout hierarchy --- have the same answers.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: Traffic goes 10$\times$ on Monday morning. What breaks first in the gateway, and what do you tune?}
+
+Not the event loops. Four loops doing non-blocking I/O handle far more
+than ten times this project's traffic; CPU on the gateway is HMAC
+verification and header copying, which is microseconds. What breaks
+first is whatever is \emph{unbounded}: the per-host connection pool (16
+by default here) fills as soon as any downstream slows, and with no
+response timeout it never drains. So the tuning order is: response and
+connect timeouts so connections are reclaimed; the pool ceiling raised
+to something the downstream can actually serve (\code{max-connections},
+and a short \code{acquire-timeout} so queued requests fail fast rather
+than pile up); a circuit breaker per route so a struggling service is
+shed instead of queued; then horizontal scaling --- two or three
+replicas behind the Service with an HPA on CPU, which for a stateless
+gateway is trivial once rate-limit state is in Redis. Memory limits
+matter too: Netty keeps direct buffers off-heap, so a 512\,Mi limit
+with \code{MaxRAMPercentage=75} leaves 128\,Mi for them; under 10$\times$
+buffering that is where an OOM kill would come from.
+
+\subsection*{Q: One downstream is slow and the whole site hangs. Why, and what do you do?}
+
+Because the site shares the thing that is exhausted. If the gateway has
+one connection pool per host, only that host's route should degrade ---
+so ``the whole site'' says something else is shared: an event loop
+blocked by a synchronous call in a filter, a global rate limiter keyed
+on the wrong thing, or the frontend firing all its calls in one
+\code{Promise.all} so one slow response holds the page. The fix is in
+that order: audit filters for blocking calls (BlockHound in tests),
+give the slow route a timeout and breaker so it fails in milliseconds
+with a fallback body, and make the frontend render partial pages. The
+senior point is that resilience is about \emph{isolation}: the goal is
+not that course-service never slows down but that its slowness cannot
+reach the login page.
+
+\subsection*{Q: How do you rate-limit per user across three gateway replicas?}
+
+State must be shared or the limit is per replica and off by a factor
+of three. Spring Cloud Gateway's \code{RequestRateLimiter} runs a token
+bucket as a Lua script in Redis, atomically, keyed by whatever the
+\code{KeyResolver} returns --- here \code{u:<userId>} from the header
+the JWT filter set, falling back to the client IP on public paths. The
+numbers are the policy: \code{replenishRate} is sustained requests per
+second, \code{burstCapacity} what a page load may spend at once; set
+burst to roughly one screen's worth of calls. Redis becomes a
+dependency, so decide its failure mode deliberately: the filter's
+default is to \emph{allow} when Redis is unreachable, which is right
+for an internal app and wrong for a public one facing abuse. For very
+high volume, a local per-replica bucket in front of the shared one
+absorbs most of the Redis round trips.
+
+\subsection*{Q: Where do you put authentication, and where do you not put logic?}
+
+Authentication --- ``is this token valid and whose is it'' --- at the
+edge, once, because it is the same question for every request and
+because that is where the credential enters the system. Authorization
+--- ``may this user grade this submission'' --- in the service that owns
+submissions, because only it knows the data. The gateway may enforce
+coarse rules that are still request-shaped (``\code{/api/admin/**}
+requires role ADMIN'') but the moment a rule needs a database row it
+belongs downstream. Nothing business-shaped goes in the gateway:
+no aggregation, no transformation of bodies, no calls to data stores.
+The test I use in reviews: if a change to a domain rule requires a
+gateway deploy, the line has been crossed.
+
+\subsection*{Q: How do you deploy the gateway with zero dropped requests?}
+
+Two replicas at minimum, a \code{PodDisruptionBudget} of
+\code{minAvailable: 1}, and a rolling update with
+\code{maxUnavailable: 0} so the new pod is Ready before an old one is
+removed. Readiness must be real: the probe should fail while Eureka's
+registry is still empty, or the new pod is routed to before it can
+route anywhere. On shutdown, the old pod must stop receiving \emph{and}
+finish in-flight requests: \code{server.shutdown: graceful} with a
+\code{spring.lifecycle.timeout-per-shutdown-phase} longer than the
+response timeout, and a \code{preStop} sleep of a few seconds so the
+kube-proxy endpoint removal propagates before the process gets
+SIGTERM. That last gap --- the endpoint list and the pod's lifetime are
+updated by different controllers --- is what drops the requests people
+blame on ``the rolling update''.
+
+\subsection*{Q: A partner integration needs one response built from three services. Gateway?}
+
+No. That is a backend-for-frontend: a small service that calls the three
+in parallel, tolerates one failing, and shapes the response for that
+client. It scales and deploys on its own schedule, owns its own
+timeouts, and keeps the gateway a proxy. Put it in the gateway and every
+partner change is an edge deploy, and the gateway's event loops start
+holding fan-out state for the slowest of three calls.
+
+\begin{quiz}
+\begin{enumerate}
+  \item The JWT filter returns \code{chain.filter(exchange)} without
+  awaiting anything. Explain what has and has not happened at the moment
+  that line returns, and why a servlet filter could not be written this
+  way.
+  \item A colleague adds a synchronous Redis lookup to the JWT filter to
+  check a deny-list. Under a 200\,ms Redis stall, what happens to
+  requests for \emph{other} routes, and why is the impact on this
+  machine 25\,\% per stalled call?
+  \item course-service hangs on 10\,\% of requests. With the project's
+  current gateway configuration, how many concurrent hung requests
+  block \emph{all} traffic to that service, and which single setting
+  changes that number?
+  \item The gateway's \code{CircuitBreaker} filter is added to a route
+  without a \code{timelimiter} block. A healthy upload takes 1.5\,s.
+  What happens, and why?
+  \item Why is the rate limiter's state in Redis rather than in the
+  gateway's memory, and what is the trade-off when Redis is down?
+  \item Every request from the frontend carries \code{Authorization}.
+  What does that imply for CORS preflights in development, what single
+  setting reduces them, and why does none of this apply in the cluster?
+\end{enumerate}
+\end{quiz}

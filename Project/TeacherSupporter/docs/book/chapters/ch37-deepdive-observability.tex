@@ -1,0 +1,701 @@
+\chapter{Deep Dive: Observability --- Traces Across Feign and Kafka, Sampling, and Alerts That Matter}
+\label{ch:dd-observability}
+
+Chapter~24 taught you to debug the stack from the outside in ---
+\code{describe} before \code{logs} --- and Chapter~27 named the trio
+that comes next: metrics, traces, alerts. This deep dive opens the
+wiring that is already in every service and asks what it actually does.
+The answer is less than the configuration suggests: the tracing
+dependencies are on every classpath, the log pattern prints trace ids,
+the cluster samples at zero, and the Prometheus endpoint that Chapter~27
+counts on does not exist yet. Reading why is the fastest route to
+understanding how distributed tracing works at all.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{Where does a trace start, and how does it survive} the
+  hops browser $\rightarrow$ gateway $\rightarrow$ Feign $\rightarrow$
+  Kafka $\rightarrow$ consumer --- and where in this project does it
+  quietly die?
+  \item \textbf{What does sampling cost} at 1.0, at 0.0, and at the
+  numbers production systems really use?
+  \item \textbf{Which signals deserve an alert}, and what has to be
+  added before any alert can fire?
+\end{enumerate}
+
+\section{Why this, and what it solves}
+
+Logs answer ``what did this process say?'' Metrics answer ``how is the
+system doing, in aggregate, over time?'' Traces answer the question the
+other two cannot: ``what happened to \emph{this one request} as it
+crossed five services and a message broker?'' In a monolith a stack
+trace is a trace. In this project a single ``create assignment'' click
+touches the gateway, course-service, auth-service (over Feign),
+Kafka, and notification-service; no single log file sees all of it.
+
+The project chose Micrometer Tracing with the Brave bridge, reporting to
+Zipkin. Each service's \code{pom.xml} carries the same pair:
+
+\begin{lstlisting}[language=yaml]
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-tracing-bridge-brave</artifactId>   (*@\co{1}@*)
+</dependency>
+<dependency>
+  <groupId>io.zipkin.reporter2</groupId>
+  <artifactId>zipkin-reporter-brave</artifactId>             (*@\co{2}@*)
+</dependency>
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Micrometer Tracing is the \emph{facade} Spring Boot~3
+  instruments against; Brave (the Zipkin project's tracer) is one of
+  two implementations, OpenTelemetry being the other. The bridge is
+  what turns Spring's \emph{observations} --- the Micrometer Observation
+  API that every Boot~3 starter emits --- into spans.
+  \item[\co{2}] The reporter ships finished spans to Zipkin over HTTP.
+  Swapping this one artifact for \code{opentelemetry-exporter-otlp}
+  points the same spans at Tempo, Jaeger, or a vendor.
+\end{description}
+
+\begin{decision}[Brave and Zipkin, not OpenTelemetry]
+Brave plus Zipkin is the shortest path from zero to a working trace
+view: one container, no collector, no protocol negotiation, and Spring
+Boot's auto-configuration knows both intimately. That is the right
+choice for learning the mechanics and for a homelab. What would flip
+it: a second language in the stack (OpenTelemetry's SDKs cover all of
+them with one wire protocol), a vendor backend (Datadog, Honeycomb,
+Grafana Cloud all speak OTLP natively), or the need for tail-based
+sampling, which requires a collector between the apps and the store.
+The migration is mechanical --- swap two dependencies, change the
+endpoint property --- because the code never touched Brave directly.
+Interviewers ask ``Zipkin or Jaeger or Tempo?'' expecting exactly this
+answer: the backend is replaceable, the instrumentation standard is the
+decision that lasts.
+\end{decision}
+
+\section{How a trace travels through this project}
+
+\subsection{The configuration, in every service}
+
+The five service documents in config-server all end the same way:
+
+\begin{lstlisting}[language=yaml]
+management:
+  tracing:
+    sampling:
+      probability: 1.0                                   (*@\co{1}@*)
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans       (*@\co{2}@*)
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus          (*@\co{3}@*)
+logging:
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"  (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Every request is traced. Fine on a laptop; see
+  Section~\ref{sec:sampling} for what it costs elsewhere. In the
+  cluster, every Deployment overrides this to \code{0.0} with the
+  comment ``Zipkin is not in the cluster yet''.
+  \item[\co{2}] Compose overrides the host to \code{zipkin:9411}; the
+  reporter POSTs JSON batches here.
+  \item[\co{3}] Exposure is a \emph{list of names}. Naming
+  \code{prometheus} does not create the endpoint; the endpoint exists
+  only when \code{micrometer-registry-prometheus} is on the classpath,
+  and no \code{pom.xml} in the repository has it. Today
+  \code{/actuator/prometheus} answers 404 on every service --- the
+  Chapter~27 plan assumes an endpoint that still has to be added.
+  \item[\co{4}] The log pattern reads two MDC keys that the tracing
+  bridge populates. With no active span the fallbacks \code{-} print
+  empty, which is itself diagnostic: an empty trace id in a log line
+  means the code ran outside any traced context.
+\end{description}
+
+\subsection{Hop by hop}
+
+Follow one \code{POST /api/courses/7/assignments} from the browser.
+
+\textbf{Browser $\rightarrow$ gateway.} The browser sends no trace
+header; \code{axios} knows nothing of tracing. The gateway is a WebFlux
+application and Spring Cloud Gateway is instrumented through the
+Observation API, so the server-side observation of the incoming request
+\emph{starts} a new trace: a random 128-bit trace id and a root span.
+When the gateway forwards to course-service, the reactive
+\code{WebClient} it uses is instrumented too, and the propagator writes
+the context into the outgoing request. Spring Boot~3 defaults matter
+here: Brave is configured to \emph{produce} W3C Trace Context
+(\code{traceparent: 00-<traceId>-<spanId>-01}) and to \emph{consume}
+W3C \emph{and} both B3 formats. So this project speaks W3C on the wire
+and would still understand an older B3 caller.
+
+\textbf{Gateway $\rightarrow$ course-service.} Course-service is servlet
+MVC. Its server observation reads \code{traceparent}, continues the
+same trace, and opens a child span. Everything logged inside the
+controller now carries that trace id --- the pattern in \co{4} above
+prints it.
+
+\textbf{course-service $\rightarrow$ auth-service over Feign.}
+\code{AuthServiceClient} is a Spring Cloud OpenFeign client. OpenFeign
+ships a Micrometer capability, enabled by default, that wraps each call
+in an observation; the Brave propagator injects \code{traceparent} into
+the Feign request. Auth-service continues the trace. In Zipkin the Feign
+call appears as a client span in course-service nested under the
+controller span, with a matching server span in auth-service. If
+Resilience4j's circuit breaker short-circuits the call
+(Chapter~6), no client span is created --- the fallback ran, the wire
+was never touched, and the trace shows the gap.
+
+\textbf{course-service $\rightarrow$ Kafka.} Here the trace dies. Read
+the project's producer:
+
+\begin{lstlisting}[language=Java]
+@Bean
+public ProducerFactory<String, Object> producerFactory() {
+    Map<String, Object> configProps = new HashMap<>();
+    configProps.put(BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+    configProps.put(KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    configProps.put(VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+    return new DefaultKafkaProducerFactory<>(configProps);
+}
+
+@Bean
+public KafkaTemplate<String, Object> kafkaTemplate() {
+    return new KafkaTemplate<>(producerFactory());       (*@\co{1}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A hand-built \code{KafkaTemplate}. Spring Kafka
+  \emph{can} propagate trace context --- it writes \code{traceparent}
+  into the record's headers and starts a producer span --- but only
+  when \code{setObservationEnabled(true)} is called on the template, or
+  \code{spring.kafka.template.observation-enabled=true} is set for the
+  auto-configured one. This bean does neither, and the property is
+  absent from every config document. The record leaves without a
+  header. On the consuming side, \code{@KafkaListener} in
+  notification-service would need
+  \code{spring.kafka.listener.observation-enabled=true} to read one.
+  Neither half is on. The e-mail that results from the click is, to
+  Zipkin, an unrelated event.
+\end{description}
+
+Auth-service's \code{UserRegisteredPublisher} uses the auto-configured
+template and has the same gap for the same reason: the property, not
+the bean, is what is missing.
+
+\textbf{The scheduler boundary.} \code{CourseLifecycleScheduler} runs
+\code{@Scheduled} at 01:00. Nothing instruments a cron trigger; its log
+line ``Auto-archived 3 course(s)'' prints with empty trace and span ids.
+The same is true of any \code{@Async} method unless the executor is
+wrapped with a context-propagating decorator. A trace is a property of a
+\emph{request}; work that no request started has no trace unless you
+give it one.
+
+\subsection{Correlating logs}
+
+With the pattern from \co{4}, a grep across all five services' logs for
+one trace id assembles the story Zipkin draws --- useful precisely when
+Zipkin is down or sampled out:
+
+\begin{lstlisting}[language=bash]
+$ docker compose logs --no-color api-gateway course-service \
+    auth-service | grep 6f2c1a9e4b3d8e10
+api-gateway     | INFO [api-gateway,6f2c1a9e4b3d8e10,9a1b...] ...
+course-service  | INFO [course-service,6f2c1a9e4b3d8e10,c04d...] ...
+auth-service    | INFO [auth-service,6f2c1a9e4b3d8e10,e77f...] ...
+\end{lstlisting}
+
+Notice what is absent: no \code{notification-service} line, because no
+trace id crossed Kafka. The grep shows the hole exactly as Zipkin would.
+
+\section{Sampling}
+\label{sec:sampling}
+
+\code{probability: 1.0} means every trace is recorded and every span
+shipped. The cost is linear in traffic: each span is a few hundred bytes
+of JSON, batched and POSTed by a background thread, then indexed and
+stored by Zipkin. At the project's traffic that is nothing. At
+1{,}000 requests per second with six spans each it is 6{,}000 spans per
+second, roughly 2\,MB/s of ingest and tens of gigabytes of storage a
+day --- most of it recording requests that succeeded in 20\,ms and
+that nobody will ever look at.
+
+\emph{Head-based} sampling --- what \code{probability} configures ---
+decides at the root span whether to keep the trace, and propagates the
+decision in the \code{traceparent} flags so every downstream service
+agrees. It is cheap and consistent, and it is blind: at 0.01 it keeps
+1\% of traces chosen at random, so the one request that failed at
+3\,a.m. was kept with probability 0.01. \emph{Tail-based} sampling
+defers the decision until the whole trace is known and keeps every
+trace that errored or exceeded a latency budget, plus a random sample
+of the rest. It needs a component that buffers whole traces before the
+store --- an OpenTelemetry Collector --- which is why it is out of
+reach of the Brave-to-Zipkin direct wiring.
+
+\begin{decision}[the sampling rate]
+Laptop and Compose: \code{1.0}, because you are debugging and traffic
+is you. Cluster today: \code{0.0}, honest about the absence of a
+Zipkin pod --- sampling at zero also disables span creation cost, not
+only shipping. Cluster with Zipkin: start at \code{0.1}; drop to
+\code{0.01} when the store grows faster than you read it. The senior
+answer to ``what sample rate?'' is ``head-based 1--10\% for the
+baseline, tail-based for errors and slow requests once there is a
+collector'' --- and the follow-up is always ``and error traces are
+what you actually want, so budget for the collector''.
+\end{decision}
+
+\section{Metrics: what exists and what does not}
+
+Actuator's \code{/actuator/metrics} already exists on every service and
+lists a few hundred meters: JVM memory and GC, HTTP server requests
+tagged by \code{uri}, \code{status} and \code{method}, Kafka client
+metrics, HikariCP pool state, and Resilience4j circuit-breaker state
+in course-service. It answers one meter at a time, by name, over HTTP
+--- a debugging tool, not a monitoring one. Monitoring means a system
+that \emph{pulls} all of them every 15 seconds, stores them as time
+series, and evaluates rules. That system is Prometheus, and its
+endpoint is missing (see \co{3} above).
+
+Two vocabularies to carry into interviews. \textbf{RED} is for
+request-driven services: Rate, Errors, Duration --- the three the
+\code{http.server.requests} timer already provides. \textbf{USE} is
+for resources: Utilization, Saturation, Errors --- CPU, heap, the
+Hikari pool, Kafka consumer lag. A dashboard per service should show
+RED at the top and USE below it; an alert should fire on a RED symptom
+the user feels, and USE panels explain why.
+
+\section{Pros and cons}
+
+\begin{center}
+\begin{tabular}{@{}p{0.47\linewidth}p{0.47\linewidth}@{}}
+\toprule
+\textbf{Strengths} & \textbf{Weak points, today} \\
+\midrule
+Zero code changes: every hop is instrumented by starters, and the log
+pattern is one line. &
+Kafka propagation is off in both producer and consumer; the most
+interesting path in the system is the one that is invisible. \\
+Vendor-neutral facade: Brave and Zipkin are swappable for OTLP
+without touching source. &
+No Prometheus registry on any classpath; \code{prometheus} in the
+exposure list is aspirational. \\
+W3C \code{traceparent} on the wire, B3 accepted --- interoperable
+with anything modern. &
+Head-based sampling only; an error at 1\% sampling is kept 1\% of the
+time. \\
+Log correlation works even without Zipkin. &
+Zipkin runs \code{:latest} with no volume: traces vanish on every
+\code{compose down}. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{What breaks}
+
+\begin{pitfall}[the trace that ends at Kafka]
+Symptom: in Zipkin, the \code{POST /assignments} trace ends with the
+controller span; the notification that followed is a separate one-span
+trace, or absent. Cause: neither \code{spring.kafka.template.\allowbreak
+observation-enabled} nor \code{spring.kafka.listener.\allowbreak
+observation-enabled} is set, so no \code{traceparent} header is written
+to or read from the record. Fix: both properties, in both services'
+config documents (course-service and auth-service produce;
+notification-service consumes) --- and the hand-built template in
+\code{KafkaProducerConfig} must call \code{setObservationEnabled(true)}
+because properties only configure the auto-configured bean. The
+Section~\ref{sec:enhance} listing does all three.
+\end{pitfall}
+
+\begin{pitfall}[high-cardinality tags]
+Symptom: a service's heap climbs for days and \code{/actuator/metrics}
+takes seconds to answer; eventually \code{OOMKilled}. Cause: a tag whose
+value set is unbounded. The classic is a handler mapped as
+\code{/courses/\{id\}} that someone rewrote to build the path by hand
+--- the \code{uri} tag then carries \code{/courses/42},
+\code{/courses/43}, \ldots, one time series each, forever. The same
+happens when a span is tagged with a user id or an e-mail. Fix: tag
+with the \emph{template} (\code{/courses/\{id\}}), never the value;
+put identifiers in the span's log annotations or the log line, which
+are not indexed by value. Spring's default \code{uri} tag is the
+template precisely to avoid this.
+\end{pitfall}
+
+\begin{pitfall}[a 401 that has no trace]
+Symptom: a user reports ``I got logged out'' and there is no trace for
+their request. Cause: the gateway's \code{JwtAuthenticationFilter}
+rejects at order \code{-1}, before routing; the server observation
+still records the request, but with the sampling at 0.0 in the cluster
+nothing is exported anywhere. Fix is not tracing at all: this is a
+\emph{metric} question. Count \code{http.server.requests} with
+\code{status=401} at the gateway and alert on a jump --- one bad
+deploy of \code{JWT\_SECRET} shows as a cliff on that counter within
+15 seconds.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+Zipkin dies at 3\,a.m.; the services keep running.
+
+\begin{itemize}
+  \item \textbf{Request latency: unchanged.} The reporter is
+  asynchronous. Spans finish into an in-memory queue; a background
+  thread drains it in batches over HTTP. The request thread never waits
+  on Zipkin. This is the property to state first in an interview,
+  because the fear ``tracing slows my service'' is the common objection.
+  \item \textbf{Memory: bounded.} The queue has a fixed capacity
+  (\code{queuedMaxSpans}, 10{,}000 by default). When it is full, new
+  spans are \emph{dropped}, counted, and a warning is logged --- the
+  reporter does not grow the heap to keep them. You lose visibility,
+  not the service.
+  \item \textbf{Logs: still correlated.} Trace ids are generated
+  locally; the MDC pattern keeps printing them. The grep in the
+  correlation section works exactly as before. This is the argument for
+  always having the log pattern, regardless of the trace backend.
+  \item \textbf{Recovery: automatic.} The reporter retries each batch on
+  the next drain; when Zipkin returns, new spans flow. The spans dropped
+  during the outage are gone --- there is no replay.
+\end{itemize}
+
+Now the other direction: \emph{traffic} spikes at 3\,a.m. with sampling
+at 1.0. The queue fills, spans drop, and the warning log itself becomes
+noise at hundreds of lines per second. That is the concrete form of the
+sampling trade-off --- and the reason to set the rate before the spike,
+not during it.
+
+\section{Enhancing the resolution}
+\label{sec:enhance}
+
+Four additions turn the wiring into a monitoring system. Each is
+complete; add them in order.
+
+\textbf{1. The Prometheus endpoint.} One dependency per service (the
+parent's Boot BOM manages the version):
+
+\begin{lstlisting}[language=yaml]
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+\end{lstlisting}
+
+With it on the classpath, the existing exposure list makes
+\code{/actuator/prometheus} real. Add the tracing switches that are
+missing, and a common tag so every series says which service it came
+from:
+
+\begin{lstlisting}[language=yaml]
+management:
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}   # every series, one tag
+  tracing:
+    sampling:
+      probability: ${TRACING_SAMPLE:0.1}          # env-overridable
+spring:
+  kafka:
+    template:
+      observation-enabled: true    # producer span + traceparent header
+    listener:
+      observation-enabled: true    # consumer span, continues the trace
+\end{lstlisting}
+
+And the hand-built template in course-service, which ignores the
+property:
+
+\begin{lstlisting}[language=Java]
+@Bean
+public KafkaTemplate<String, Object> kafkaTemplate() {
+    KafkaTemplate<String, Object> template =
+            new KafkaTemplate<>(producerFactory());
+    // Properties configure only the auto-configured template; a
+    // hand-built one must opt in explicitly or traces end here.
+    template.setObservationEnabled(true);
+    return template;
+}
+\end{lstlisting}
+
+\textbf{2. Scraping in the cluster.} With \code{kube-prometheus-stack}
+installed (Chapter~27), a \code{ServiceMonitor} tells its operator
+which Services to scrape. One object covers all five, by label:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ts-services
+  namespace: ts
+  labels:
+    release: kube-prometheus-stack   # the selector the chart installs
+spec:
+  selector:
+    matchLabels:
+      monitoring: actuator           # add this label to each Service
+  endpoints:
+    - port: http                     # the Service port *name*
+      path: /actuator/prometheus
+      interval: 15s
+\end{lstlisting}
+
+The auth-service and course-service Services must permit
+\code{/actuator/prometheus} in their SecurityConfig for this to work
+--- the same permit that Chapter~17 needed for probes. Restrict it to
+the pod network with a NetworkPolicy rather than leaving it open to the
+Ingress.
+
+\textbf{3. Structured logs.} A grep across containers works on a
+laptop; in the cluster, Loki or Elasticsearch parse JSON far more
+reliably than a bracketed pattern. Logback's JSON encoder is a
+dependency plus a \code{logback-spring.xml}:
+
+\begin{lstlisting}[language=yaml]
+<dependency>
+  <groupId>net.logstash.logback</groupId>
+  <artifactId>logstash-logback-encoder</artifactId>
+  <version>8.0</version>
+</dependency>
+\end{lstlisting}
+
+\begin{lstlisting}
+<configuration>
+  <springProperty name="app" source="spring.application.name"/>
+  <appender name="JSON"
+            class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <customFields>{"application":"${app}"}</customFields>
+      <!-- traceId and spanId come from the MDC automatically -->
+      <includeMdcKeyName>traceId</includeMdcKeyName>
+      <includeMdcKeyName>spanId</includeMdcKeyName>
+    </encoder>
+  </appender>
+  <springProfile name="!local">
+    <root level="INFO"><appender-ref ref="JSON"/></root>
+  </springProfile>
+  <springProfile name="local">
+    <include resource="org/springframework/boot/logging/logback/base.xml"/>
+  </springProfile>
+</configuration>
+\end{lstlisting}
+
+The profile split keeps the human-readable pattern on a laptop and emits
+one JSON object per line everywhere else. Every line now carries
+\code{traceId} as a field; a log query for a trace id is an index
+lookup, not a scan.
+
+\textbf{4. Two alerts tied to what users feel.} Prometheus rules, in
+the operator's \code{PrometheusRule} kind:
+
+\begin{lstlisting}[language=yaml]
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ts-slo
+  namespace: ts
+  labels: { release: kube-prometheus-stack }
+spec:
+  groups:
+    - name: ts.slo
+      rules:
+        - alert: GatewayErrorBudgetBurn
+          expr: |
+            sum(rate(http_server_requests_seconds_count{
+                  application="api-gateway", status=~"5.."}[5m]))
+            /
+            sum(rate(http_server_requests_seconds_count{
+                  application="api-gateway"}[5m])) > 0.02
+          for: 10m
+          labels: { severity: page }
+          annotations:
+            summary: "Gateway 5xx ratio above 2% for 10 minutes"
+        - alert: NotificationConsumerLag
+          expr: |
+            sum by (topic) (
+              kafka_consumer_fetch_manager_records_lag_max{
+                application="notification-service"}) > 500
+          for: 15m
+          labels: { severity: ticket }
+          annotations:
+            summary: "notification-group is {{ $value }} records behind"
+\end{lstlisting}
+
+The first is a \emph{symptom} alert on the RED ``errors'' ratio at the
+one place every request passes; 2\% over ten minutes is a starting
+budget, not a law. The second is the Chapter~27 answer to ``which Kafka
+metric first'': lag growing for 15 minutes means mail is not going out,
+whatever the pods' health says. Note the meter name: Spring Kafka
+registers the client's own \code{records-lag-max} under Micrometer's
+naming, which the Prometheus registry renders with underscores.
+
+\begin{handson}[prove the trace crosses Kafka]
+After adding the two \code{observation-enabled} properties and the
+template line, restart course-service and notification-service under
+Compose, create an assignment through the UI, then ask Zipkin for the
+trace by the id printed in course-service's log:
+\begin{lstlisting}[language=bash]
+$ curl -s "http://localhost:9411/api/v2/trace/6f2c1a9e4b3d8e10" \
+    | jq -r '.[] | "\(.localEndpoint.serviceName)  \(.name)"'
+api-gateway            http post
+course-service         http post /courses/{id}/assignments
+course-service         http get                   # Feign to auth
+auth-service           http get /users/{id}
+course-service         ts.assignment.created send
+notification-service   ts.assignment.created process
+\end{lstlisting}
+Before the change the last two lines do not exist. The consumer span's
+parent is the producer span; the e-mail is now attributable to the
+click that caused it.
+\end{handson}
+
+\section{Outside the project}
+
+Production stacks converge on the same shape with different names.
+Instrumentation: OpenTelemetry SDKs or the Java agent, which
+auto-instruments without even the starters. Collection: an
+OpenTelemetry Collector per node or per cluster, which is where
+tail-based sampling, redaction, and fan-out to several backends live.
+Storage: Tempo for traces, Loki for logs, Prometheus or Mimir for
+metrics --- the Grafana trio --- or Jaeger, Elasticsearch and Thanos;
+or a vendor that takes OTLP and bills by volume. The interview thread
+runs through all of them: ``how do you find a slow request across
+services?'' is answered by trace ids in logs and a trace store; ``how
+do you know before users tell you?'' by RED alerts on the edge; ``what
+does tracing cost?'' by the sampling discussion above --- and the
+senior version of every answer names the component that stays
+(instrumentation and the trace id in every log line) and the ones that
+are replaceable (everything behind the exporter).
+
+\section{Questions from real interviews}
+
+\subsection*{Q: p99 latency doubled last night. Walk me through finding the cause.}
+
+Start with metrics, not logs: the \code{http\_server\_requests} histogram
+at the gateway, split by \code{uri}, tells you in one query whether
+\emph{every} route slowed (infrastructure --- node, network, GC) or one
+route did (a code path or a downstream). Then pull one slow trace from
+that window --- with head-based sampling at 1\% there will be a few
+hundred --- and read the span waterfall: the slow span is either a
+child (a downstream call, say the Feign hop to auth-service at 800\,ms
+instead of 8) or a gap between children (the service itself, usually a
+database call or a lock, which shows as time in the parent not covered
+by any child). If it is a gap, the trace id takes you to that service's
+logs for the exact minute; the JSON layout makes that an index lookup.
+The senior detail is the order --- aggregate, then one exemplar, then
+its logs --- and naming what you would have wished for: an exemplar
+link from the histogram bucket straight to a trace, which
+OpenTelemetry-native stacks provide and Zipkin does not.
+
+\subsection*{Q: You cannot afford to trace 100\%. What do you sample, and what do you never drop?}
+
+Head-based sampling at 1--10\% for the steady state, decided at the
+gateway and propagated in the \code{traceparent} flags so downstream
+services never disagree. Never drop errors and never drop the slow
+tail --- which head-based sampling cannot promise, because the root
+span is sampled before anyone knows the request will fail. So the real
+answer has two stages: a collector doing tail-based sampling that keeps
+every trace with a 5xx or above a latency budget, plus a 1\% random
+baseline for the shape of normal traffic. Mention the cost honestly:
+tail-based sampling buffers whole traces in the collector's memory for
+the decision window, typically 10--30\,s, so the collector is sized by
+traffic, not by what you keep. In this project that is the step from
+\code{zipkin-reporter-brave} to an OTLP exporter plus a collector; the
+application code does not change.
+
+\subsection*{Q: A request disappears from the trace at Kafka. Why, and how do you fix it?}
+
+Because trace context crosses Kafka only as record headers, and
+nothing writes them unless the template is told to. In Spring Kafka
+two properties do it, both false by default in Boot~3: on the
+producer, \code{template.observation-enabled}; on the consumer,
+\code{listener.observation-enabled} (both under \code{spring.kafka}).
+The subtlety worth
+saying out loud: properties only configure the auto-configured
+template, so a hand-built \code{KafkaTemplate} bean --- exactly what
+course-service's \code{KafkaProducerConfig} does --- needs
+\code{setObservationEnabled(true)} in code. After the fix the consumer
+span's parent is the producer span and the whole e-mail path hangs off
+the original HTTP request. The follow-up an interviewer wants: the
+consumer span is a \emph{child}, but it can run seconds or hours after
+the request finished, so a trace view sorted by time will show a long
+gap --- that gap is queue latency, and it is itself the metric to
+watch.
+
+\subsection*{Q: What would you page on for this stack?}
+
+Symptoms users feel, expressed as SLOs, never raw resources. Two pages:
+gateway 5xx ratio above the error budget for ten minutes --- the one
+point every request passes --- and p99 latency at the gateway above
+target for the same window. One ticket-level alert: notification
+consumer lag growing for fifteen minutes, because that is ``mail is not
+going out'' in the only form the system can express it. Everything
+else --- CPU, heap, pod restarts, Hikari pool exhaustion --- is a
+dashboard panel that explains a page, not a page itself; alerting on
+CPU at 80\% wakes people for a system that is working. The senior
+framing is the error budget: at a 99.9\% availability target you may
+burn 43 minutes of errors a month, and the alert fires on the
+\emph{burn rate}, which is why the ratio is measured over a window
+rather than on a single failed request.
+
+\subsection*{Q: One user's request touched five services. How do you find those five log lines?}
+
+By the trace id, which every service prints because the log pattern
+includes \code{\%X\{traceId\}} and the tracing bridge fills the MDC on
+every hop. On a laptop that is a grep across container logs; in the
+cluster it is a query on a log store that indexes the field, which is
+why logs are shipped as JSON rather than parsed with a regex. Two
+details separate a senior answer: first, the trace id must be
+\emph{returned to the user} --- a \code{X-Trace-Id} response header
+from the gateway --- so that a support ticket can quote it instead of
+``around 3 p.m.''; second, anything that runs outside the request
+(\code{@Scheduled}, \code{@Async}, a Kafka consumer without
+propagation) logs an empty id, and you should know which of your code
+paths those are before the incident.
+
+\subsection*{Q: Zipkin is down. Does production slow down?}
+
+No, and you should be able to say why from the reporter's design: spans
+are handed to an in-memory queue and a background thread POSTs them in
+batches, so no request thread ever waits on Zipkin; the queue is
+bounded at 10{,}000 spans and drops on overflow, so memory is capped;
+the failed batches are logged and retried on the next drain, so
+recovery is automatic. What you lose is the spans from the outage
+window --- there is no replay. The trap in the question is the
+opposite case: a \emph{synchronous} exporter, or an unbounded queue,
+would turn a monitoring outage into an application outage, which is
+the property to check before adopting any agent or exporter. And the
+mitigation for the lost spans is the same as for everything else in
+this chapter: the trace id is still in every log line, so the logs
+carry the correlation even when the trace store cannot.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Name the exact property or method call missing at each of the
+  two Kafka-side halves of the project, and explain why setting the
+  properties alone would fix auth-service but not course-service.
+  \item A request arrives at the gateway carrying
+  \code{X-B3-TraceId} from an old upstream proxy. Does the project
+  continue that trace or start a new one, and which Boot~3 default
+  decides it? What header leaves the gateway toward course-service?
+  \item \code{/actuator/prometheus} is in every exposure list yet
+  returns 404. Explain, and name the one artifact that changes the
+  answer.
+  \item Zipkin is down for an hour under normal traffic. State what
+  happens to request latency, to heap, and to the spans produced
+  during the hour --- and which of the three would change if the
+  reporter were synchronous.
+  \item At \code{probability: 0.01}, what fraction of \emph{failed}
+  requests have a trace, and what architectural component is required
+  to make that fraction 1.0 without tracing every success?
+  \item A colleague adds \code{span.tag("email", user.getEmail())}
+  to the login span. Predict the failure over the following weeks and
+  give the rule that prevents it.
+\end{enumerate}
+\end{quiz}

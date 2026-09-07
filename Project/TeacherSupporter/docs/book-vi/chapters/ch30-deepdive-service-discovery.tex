@@ -1,0 +1,552 @@
+\chapter{Đào sâu: Khám phá dịch vụ --- bên trong Eureka, các kiểu lỗi và phương án Kubernetes}
+\label{ch:dd-discovery}
+
+Chương~3 giải thích Eureka trong bốn gạch đầu dòng --- đăng ký,
+heartbeat, cache, tự bảo toàn --- và Chương~27 phác họa việc cho nó nghỉ
+hưu trong hai dòng. Giữa hai chỗ đó là mọi thứ người vận hành thực sự
+gặp: các bộ đếm thời gian quyết định một instance đã chết còn nhận lưu
+lượng bao lâu, ngưỡng chuyển registry sang chế độ nó ngừng nói thật, và
+sự thật khó xử rằng trên Kubernetes dự án chạy hai hệ thống khám phá
+cùng lúc mà gateway chỉ hỏi một trong hai. Chương này đo những thứ đó,
+làm gãy chúng, rồi chỉ ra cấu hình chính xác để gỡ Eureka mà không làm
+hỏng Compose.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Registry giải quyết gì mà DNS không giải quyết}, và vì
+  sao stack cổ điển đặt việc tra cứu ở \emph{client}?
+  \item \textbf{Registry có thể cũ tới mức nào} --- tính bằng giây, với
+  phép tính --- và sự cũ đó gây gì trong lúc deploy?
+  \item \textbf{Cái gì thay thế từng tính năng của Eureka} khi nền tảng
+  là Kubernetes, và làm sao chuyển đổi mà không có ngày ``cắt cầu dao''?
+\end{enumerate}
+
+\section{Vì sao cần registry, và vì sao ở client}
+
+Vấn đề là địa chỉ. Instance có IP đổi theo mỗi lần khởi động lại; bên
+gọi cần một cái tên ổn định. Có ba họ câu trả lời:
+
+\begin{itemize}
+  \item \textbf{Load balancer phía server.} Bên gọi quay một địa chỉ cố
+  định (một nginx, một AWS ELB); nó biết các instance. Đơn giản cho bên
+  gọi, nhưng mỗi bước nhảy thêm độ trễ và bộ cân bằng tự nó phải được
+  cập nhật.
+  \item \textbf{Registry phía client} (Eureka, Consul). Mỗi instance
+  đăng ký; mỗi bên gọi tải danh sách về và cân bằng cục bộ. Không thêm
+  bước nhảy, không có bộ cân bằng phải scale, bên gọi sống sót qua sự
+  cố registry nhờ cache --- và mọi bên gọi phải nhúng một thư viện
+  client.
+  \item \textbf{DNS của nền tảng} (Service của Kubernetes). Nền tảng
+  theo dõi readiness của pod và giữ danh sách endpoint của một IP ảo
+  luôn cập nhật; bên gọi dùng DNS thuần và không biết gì. Không thư
+  viện, không tiến trình registry, nhưng chỉ bên trong nền tảng đó.
+\end{itemize}
+
+Netflix xây cái thứ hai năm 2012 vì họ chạy trên EC2 không có DNS nền
+tảng để dựa vào và hàng nghìn bên gọi JVM mang được thư viện. Spring
+Cloud thừa kế nó, và dự án này thừa kế từ Spring Cloud. Lịch sử đó là
+câu trả lời thành thật cho ``vì sao Eureka'': không phải vì nó hợp nhất
+với một cụm Kubernetes năm 2026, mà vì stack cổ điển vẫn là thứ phần
+lớn công ty Java đang chạy và phần lớn phỏng vấn Java đang hỏi.
+
+\begin{decision}[phía client, rồi phía nền tảng]
+Dự án giữ Eureka qua Compose và các milestone Kubernetes đầu tiên vì hai
+lý do: Compose không có DNS gắn với readiness, nên registry là cách duy
+nhất để gateway bỏ qua một service đã lên nhưng chưa sẵn sàng; và chạy
+hai hệ thống song song là cách bạn học nền tảng thay thế cái gì. Khoảnh
+khắc Compose không còn là đích triển khai --- nó vốn chỉ là công cụ dev
+--- registry là chi phí thuần: thêm một JVM, thêm một phụ thuộc khởi
+động, và một ý kiến thứ hai về pod nào còn sống, bất đồng với kubelet
+tới bốn phút. Mục~\ref{sec:discovery-enhance} thực hiện cú chuyển.
+\end{decision}
+
+\section{Đọc cấu hình thật}
+
+Server là một cổng và một annotation. Toàn bộ hành vi nằm ở các giá trị
+mặc định dự án không bao giờ đặt, nên đọc phía client trước:
+
+\begin{lstlisting}[language=yaml]
+# course-service/src/main/resources/application.yml
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/     (*@\co{1}@*)
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/course-service.yaml (env excerpt)
+- { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE,
+    value: "http://discovery-server:8761/eureka/" }  (*@\co{2}@*)
+- { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" } (*@\co{3}@*)
+\end{lstlisting}
+
+Và bên tiêu thụ, các route của gateway:
+
+\begin{lstlisting}[language=yaml]
+# configurations/api-gateway.yml (excerpt)
+- id: course-service-courses
+  uri: lb://course-service                          (*@\co{4}@*)
+  predicates:
+    - Path=/api/courses/**
+  filters:
+    - StripPrefix=2
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Địa chỉ duy nhất client được cho biết. Mọi thứ khác ---
+  course-service ở đâu, auth-service ở đâu --- trở về từ URL này dưới
+  dạng một tài liệu registry.
+  \item[\co{2}] Trên Kubernetes \code{discovery-server} được \emph{DNS
+  nền tảng} phân giải thành một ClusterIP. Chính registry được tìm thấy
+  bằng cơ chế nó sắp sao chép.
+  \item[\co{3}] Đăng ký IP của pod, không phải tên pod (Chương~3). Địa
+  chỉ đăng ký là thứ gateway sẽ quay, bỏ qua hoàn toàn Service
+  \code{course-service}.
+  \item[\co{4}] \code{lb://} trao cái tên cho Spring Cloud LoadBalancer,
+  nó hỏi cache cục bộ của Eureka client để lấy instance và chọn một cái
+  theo vòng tròn. Service Kubernetes \code{course-service:8082} không
+  bao giờ được hỏi trên đường này.
+\end{description}
+
+Điểm \co{4} là câu cần nhớ từ chương này. Trên cụm, \emph{readiness
+probe bảo vệ Service của Kubernetes, và gateway không dùng Service của
+Kubernetes}. Thứ duy nhất đứng giữa gateway và một pod chưa sẵn sàng là
+trạng thái Eureka --- thứ pod tự báo về chính nó.
+
+\subsection{Các bộ đếm thời gian}
+
+Mọi thứ dưới đây là mặc định dự án thừa kế. Mỗi cái là một thuộc tính
+bạn đặt được; mỗi cái có lý do cho giá trị của nó.
+
+\begin{center}
+\begin{tabular}{@{}p{0.50\linewidth}rp{0.32\linewidth}@{}}
+\toprule
+\textbf{Thuộc tính (\code{eureka.*})} & \textbf{Mặc định} & \textbf{Ý nghĩa} \\
+\midrule
+\texttt{\footnotesize instance.lease-renewal-interval-in-seconds} & 30\,s & chu kỳ heartbeat \\
+\texttt{\footnotesize instance.lease-expiration-duration-in-seconds} & 90\,s & im lặng lâu thế này = hết hạn \\
+\texttt{\footnotesize server.eviction-interval-timer-in-ms} & 60\,s & chu kỳ quét lease hết hạn \\
+\texttt{\footnotesize server.response-cache-update-interval-ms} & 30\,s & cache chỉ đọc của server \\
+\texttt{\footnotesize client.registry-fetch-interval-seconds} & 30\,s & client tải lại registry \\
+\texttt{\footnotesize spring.cloud.loadbalancer.cache.ttl} & 35\,s & cache của LoadBalancer \\
+\texttt{\footnotesize server.renewal-percent-threshold} & 0.85 & ngưỡng tự bảo toàn \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Giờ là phép tính người phỏng vấn muốn nghe.
+
+\textbf{Instance mới nhận lưu lượng.} Spring Cloud đăng ký ngay khi web
+server khởi động (client Netflix thô sẽ đợi 40\,s;
+\code{EurekaAutoServiceRegistration} của Spring ép một lần đăng ký theo
+yêu cầu). Cache chỉ đọc của server có thể cũ tới 30\,s, lượt tải
+registry của gateway chậm tới 30\,s sau đó, và cache LoadBalancer của
+nó chậm tới 35\,s sau nữa. Trường hợp xấu nhất: khoảng \textbf{95 giây}
+giữa ``Tomcat đang lắng nghe'' và ``gateway biết''. Thông thường: một
+nửa.
+
+\textbf{Instance chết ngừng nhận lưu lượng.} Pod bị giết mà không tắt
+êm (OOM, mất node). Lease hết hạn sau 90\,s không heartbeat; lượt quét
+loại bỏ chạy mỗi 60\,s, nên tới 150\,s sau khi chết server vẫn liệt kê
+nó; cộng cùng 30 + 30 + 35\,s cache: tới \textbf{245 giây} --- bốn phút
+--- trong đó gateway tiếp tục quay một IP không còn trả lời. Tắt êm gửi
+một DELETE lúc rời đi và bỏ qua 150\,s đầu, còn lại tới 95\,s cache cũ.
+
+\textbf{Tự bảo toàn.} Mỗi phút server so heartbeat nhận được với
+heartbeat kỳ vọng: số instance $\times$ 2 (một lần mỗi 30\,s) $\times$
+0,85. Dưới vạch, nó ngừng loại bỏ bất cứ thứ gì và dashboard hiện băng
+đỏ. Dự án đăng ký năm client: kỳ vọng $5 \times 2 = 10$, ngưỡng
+$\lfloor 10 \times 0{,}85 \rfloor = 8$, và điều kiện là ``nhiều hơn 8''.
+Giết \emph{một} service và số đếm rơi xuống 8 --- không nhiều hơn 8 ---
+và registry vào chế độ tự bảo toàn. Trên stack này, một service crash
+nghĩa là \emph{không} instance nào bị loại bỏ nữa cho tới khi nó quay
+lại. Netflix chỉnh ngưỡng đó cho hàng trăm instance, nơi mất 15\,\%
+trong một phút thật sự nghĩa là phân mảnh mạng; trên năm instance, nó
+nghĩa là thứ Ba.
+
+\begin{handson}[xem một instance chết vẫn sống]
+Trong Compose, dừng course-service mà không cho nó hủy đăng ký, rồi
+hỏi registry về nó một phút sau:
+\begin{lstlisting}[language=bash]
+$ docker compose kill course-service
+$ sleep 60
+$ curl -s -H 'Accept: application/json' \
+    http://localhost:8761/eureka/apps/COURSE-SERVICE | \
+    python -c "import sys,json; a=json.load(sys.stdin)['application']; \
+      print([i['status'] for i in a['instance']])"
+['UP']
+\end{lstlisting}
+Giờ mở \code{http://localhost:8761}. Sau lượt quét kế tiếp, instance
+hoặc biến mất --- hoặc, vì bốn client còn lại gửi 8 lần gia hạn mỗi
+phút, trang mang băng \textsc{emergency! eureka may be incorrectly
+claiming instances are up when they're not}, và course-service giữ
+\code{UP} lâu tùy bạn muốn đợi. Trong lúc đó \code{curl
+localhost:8080/api/courses} trả về 503 từ gateway ở mọi lần thử rơi
+vào địa chỉ đã chết.
+\end{handson}
+
+\section{Ưu và nhược, thành thật}
+
+\begin{itemize}
+  \item \textbf{Ủng hộ.} Không thêm bước nhảy mạng; bên gọi tiếp tục
+  hoạt động qua sự cố registry nhờ cache; một cơ chế giống hệt trên
+  laptop, trong Compose và trong cụm; một dashboard cho thấy ai đã đăng
+  ký; và một instance có thể tự đánh dấu \code{OUT\_OF\_SERVICE} để rút
+  lui có kiểm soát.
+  \item \textbf{Phản đối, trong dự án này.} Một nguồn sự thật thứ hai về
+  sự sống chậm hơn kubelet tới bốn phút; readiness probe bị bỏ qua trên
+  đường của gateway (\co{4} ở trên); tự bảo toàn chỉnh cho một đội tàu
+  lớn gấp trăm lần; một JVM 512\,Mi không làm gì cho lưu lượng;
+  \code{prefer-ip-address} là cách chữa cháy riêng cho nền tảng mà mọi
+  manifest phải mang; và mọi service biên dịch với một thư viện client
+  mà upstream đang ở chế độ bảo trì.
+  \item \textbf{Trung lập.} Eureka là AP theo thiết kế: nó thích trả lời
+  bằng dữ liệu cũ hơn là không trả lời. Đó là lựa chọn đúng cho một
+  registry --- bên gọi với danh sách hơi sai có thể thử lại; bên gọi
+  không có danh sách thì không làm được gì --- và cũng là lý do mọi con
+  số ở trên đều là ``tới''.
+\end{itemize}
+
+\section{Cái gì gãy}
+
+\begin{pitfall}[rolling deploy, ba mươi giây 503]
+Triệu chứng: \code{kubectl rollout restart deployment/course-service}
+thành công, readiness qua, và trong nửa phút gateway trả về \code{503
+Service Unavailable} trên \code{/api/courses}. Nguyên nhân: pod cũ hủy
+đăng ký khi SIGTERM và thoát; pod mới đăng ký với IP mới; nhưng
+LoadBalancer của gateway vẫn giữ IP cũ tới 95\,s cache. Service của
+Kubernetes chuyển tức thì và không ai hỏi nó. Sửa, theo chi phí tăng
+dần: một hook \code{preStop} ngủ 20--30\,s để pod cũ tiếp tục trả lời
+trong lúc cache cạn (\code{terminationGracePeriodSeconds} phải lớn hơn
+nó); cache ngắn hơn (\code{registry-fetch-interval-seconds: 5},
+\code{spring.cloud.loadbalancer.cache.ttl: 5s}) với cái giá là tải lên
+registry; hoặc một filter \code{Retry} trên gateway cho lỗi kết nối để
+lần thử thứ hai rơi vào IP còn sống. Hoặc gỡ registry khỏi đường đi
+(Mục~\ref{sec:discovery-enhance}) và để Service làm việc nó sinh ra để
+làm.
+\end{pitfall}
+
+\begin{pitfall}[đã đăng ký, UP, và trả về lỗi]
+Triệu chứng: dashboard hiện course-service \code{UP}; request thất bại
+với lỗi cơ sở dữ liệu. Nguyên nhân: trạng thái Eureka do instance tự
+báo, và mặc định nó là \code{UP} ngay khoảnh khắc đăng ký thành công
+--- nó không hỏi actuator health. Flyway có thể đã thất bại sau khi
+đăng ký, Postgres có thể đã biến mất, và instance vẫn nói \code{UP} mỗi
+30\,s. Sửa: \code{eureka.client.healthcheck.enabled: true} truyền
+actuator health sang trạng thái registry, để một health check
+\code{DOWN} thành \code{DOWN} trong Eureka ở heartbeat kế tiếp --- 30\,s
+sau, cộng cache. Readiness của Kubernetes sẽ rút pod trong 5\,s; trên
+đường của gateway, nó không có cơ hội.
+\end{pitfall}
+
+\begin{pitfall}[hai replica Eureka, hai câu trả lời]
+Triệu chứng: sau khi scale discovery-server lên hai replica cho tính
+sẵn sàng, một số bên gọi thấy một instance mà những bên khác không
+thấy. Nguyên nhân: các peer sao chép đăng ký cho nhau bất đồng bộ; một
+client có \code{defaultZone} liệt kê cả hai địa chỉ nói chuyện với cái
+trả lời trước và có thể đọc một replica chưa nhận được bản sao. Mỗi
+server cũng đếm gia hạn độc lập, nên một cái có thể vào tự bảo toàn
+trong khi cái kia loại bỏ. Sửa: liệt kê cả hai peer trong
+\code{defaultZone} của mọi client và của mỗi server (chúng phải đăng ký
+\emph{với nhau}), chấp nhận vài giây bất nhất là cái giá của AP, và
+đừng bao giờ scale một registry bạn sắp gỡ.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Pod discovery-server chết lúc 3 giờ sáng; không gì khác chết.
+
+\begin{itemize}
+  \item \textbf{Lưu lượng gateway: không ảnh hưởng.} Eureka client của
+  gateway giữ registry cuối cùng trong bộ nhớ và LoadBalancer tiếp tục
+  định tuyến theo nó. Lượt tải registry thất bại mỗi 30\,s và log cảnh
+  báo; cache không hết hạn. Đây là lời hứa AP được giữ.
+  \item \textbf{Heartbeat: thất bại lặng lẽ.} Mọi client log một lần gia
+  hạn thất bại mỗi 30\,s. Không gì khác đổi; lease là khái niệm của
+  server và server đã đi.
+  \item \textbf{Service khởi động lại trong lúc sự cố: vô hình.} Nó
+  boot, đăng ký thất bại, thử lại ở nền --- và nó không phục vụ gì qua
+  gateway cho tới khi registry trở lại và 95\,s cache cạn. Service
+  Kubernetes của nó có nó làm endpoint trong vài giây; không ai dùng
+  Service đó.
+  \item \textbf{Service chết trong lúc sự cố: vẫn được định tuyến tới.}
+  Không server, không loại bỏ. Gateway giữ IP chết cho tới khi registry
+  trở lại \emph{và} đã loại bỏ nó \emph{và} cache đã quay vòng: trọn
+  245\,s, tính từ lúc server trở lại.
+  \item \textbf{Khi discovery-server trở lại: registry lạnh.} Nó bắt đầu
+  rỗng. Trong \code{wait-time-in-ms-when-sync-empty} đầu tiên (mặc định
+  5 phút) nó từ chối phục vụ một registry nó coi là chưa đầy đủ, trả về
+  những gì nó có; client đăng ký lại ở heartbeat kế tiếp trong vòng
+  30\,s. Hồi phục hoàn toàn: khoảng một phút sau khi pod Ready.
+\end{itemize}
+
+So với đường nền tảng: danh sách endpoint của một Service do control
+plane duy trì, thứ được sao chép và mọi thành phần khác đã phụ thuộc
+vào. Không có câu chuyện 3 giờ sáng riêng cho DNS Kubernetes vì nó
+không có tiến trình riêng nào để mất.
+
+\section{Nâng cấp giải pháp}
+\label{sec:discovery-enhance}
+
+Mục tiêu: trên Kubernetes, định tuyến bằng DNS của Service và để
+readiness probe gác lưu lượng; trong Compose, giữ Eureka để trải nghiệm
+dev không đổi. Một profile Spring tách hai bên, và config-server phục
+vụ tài liệu profile chồng lên tài liệu gốc.
+
+\subsection{Bước 1: tài liệu profile cho gateway}
+
+\code{api-gateway.yml} gốc giữ các route \code{lb://}. Một
+\code{api-gateway-k8s.yml} mới bên cạnh thay thế chúng --- cả danh
+sách, vì danh sách YAML ghi đè theo chỉ số và ghi đè một phần là cái
+bẫy:
+
+\begin{lstlisting}[language=yaml]
+# configurations/api-gateway-k8s.yml -- served when profile k8s is active
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: auth-service
+          uri: http://auth-service:8081               (*@\co{1}@*)
+          predicates:
+            - Path=/api/auth/**
+          filters:
+            - StripPrefix=2
+        - id: auth-oauth2
+          uri: http://auth-service:8081
+          predicates:
+            - Path=/oauth2/**
+        - id: auth-oauth2-callback
+          uri: http://auth-service:8081
+          predicates:
+            - Path=/login/oauth2/**
+        - id: course-service
+          uri: http://course-service:8082
+          predicates:
+            - Path=/api/courses/**,/api/students/**,/api/assignments/**,/api/enrollments/**,/api/submissions/**
+          filters:
+            - StripPrefix=2
+        - id: dictionary-service
+          uri: http://dictionary-service:8083
+          predicates:
+            - Path=/api/dictionary/**
+          filters:
+            - StripPrefix=2
+      httpclient:
+        connect-timeout: 2000                          (*@\co{2}@*)
+        response-timeout: 10s
+eureka:
+  client:
+    enabled: false                                     (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một tên Service và cổng. CoreDNS phân giải nó thành
+  ClusterIP; kube-proxy cân bằng qua các endpoint Ready. Readiness probe
+  giờ nằm trên đường của gateway.
+  \item[\co{2}] Không có registry để hỏi, phòng thủ duy nhất của gateway
+  trước một endpoint chết là connect timeout nhanh; đằng nào kube-proxy
+  cũng sẽ gỡ endpoint trong vài giây.
+  \item[\co{3}] Eureka client vẫn trên classpath nhưng không làm gì:
+  không đăng ký, không tải, không cảnh báo heartbeat. Đây là thứ cho
+  phép một image phục vụ cả hai môi trường.
+\end{description}
+
+\subsection{Bước 2: Feign không cần registry}
+
+\code{AuthServiceClient} của course-service phân giải
+\code{auth-service} qua LoadBalancer. Cho nó một URL cố định tùy chọn:
+
+\begin{lstlisting}[language=Java]
+// course-service/.../client/AuthServiceClient.java
+@FeignClient(
+        name = "auth-service",
+        url = "${app.clients.auth-service:}",   // empty -> use lb://
+        fallback = AuthServiceFallback.class)
+public interface AuthServiceClient {
+    @GetMapping("/users/{id}")
+    UserDto getUserById(@PathVariable Long id);
+}
+\end{lstlisting}
+
+Khi \code{url} phân giải thành chuỗi rỗng, Feign quay về phân giải cân
+bằng tải theo \code{name}; khi nó phân giải thành
+\code{http://auth-service:8081}, LoadBalancer bị bỏ qua. Tài liệu
+profile của course-service đặt nó:
+
+\begin{lstlisting}[language=yaml]
+# configurations/course-service-k8s.yml
+app:
+  clients:
+    auth-service: http://auth-service:8081
+eureka:
+  client:
+    enabled: false
+\end{lstlisting}
+
+\subsection{Bước 3: các manifest}
+
+Diff so với \code{deploy/k8s/base/api-gateway.yaml}; mọi manifest
+service đổi cùng cách:
+
+\begin{lstlisting}
+ env:
++  - { name: SPRING_PROFILES_ACTIVE, value: "k8s" }
+   - { name: SPRING_CONFIG_IMPORT,
+       value: "configserver:http://config-server:8888" }
+-  - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE,
+-      value: "http://discovery-server:8761/eureka/" }
+-  - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+\end{lstlisting}
+
+Và trong \code{kustomization.yaml}:
+
+\begin{lstlisting}
+ resources:
+   - config-server.yaml
+-  - discovery-server.yaml
+   - api-gateway.yaml
+\end{lstlisting}
+
+Compose không đụng tới: không profile, tài liệu gốc, \code{lb://},
+Eureka. Cùng các image chạy ở cả hai. Khi Compose cuối cùng nghỉ hưu,
+xóa \code{spring-cloud-starter-netflix-eureka-client} khỏi mọi
+\code{pom.xml}, module \code{discovery-server}, và các route
+\code{lb://} trong tài liệu gốc --- theo thứ tự đó, mỗi việc một commit
+riêng để pipeline kiểm chứng được.
+
+\begin{handson}[chứng minh đường nền tảng]
+Sau khi áp dụng profile, xác nhận gateway không còn quay thẳng IP pod
+--- nó quay Service, mà endpoint theo readiness:
+\begin{lstlisting}[language=bash]
+$ kubectl -n ts get endpoints course-service
+NAME             ENDPOINTS         AGE
+course-service   10.42.0.57:8082   3d
+$ kubectl -n ts rollout restart deployment/course-service
+$ while true; do curl -s -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $TOKEN" \
+    http://ts.local/api/courses; sleep 1; done
+200
+200
+200   # no 503 window: the endpoint switched with readiness
+\end{lstlisting}
+Chạy cùng vòng lặp trước khi đổi và đếm số 503.
+\end{handson}
+
+\section{Ngoài dự án}
+
+Consul là registry bạn gặp ngoài JVM: một agent trên mỗi host tự chạy
+health check thay vì tin heartbeat tự báo, và phục vụ kết quả qua DNS
+lẫn HTTP, nên bên gọi không cần thư viện. Service mesh (Istio, Linkerd)
+đi thêm một bước và đặt một proxy sidecar cạnh mỗi pod làm khám phá,
+retry, timeout và mTLS, để ứng dụng chỉ còn
+\code{http://course-service}. Trong Spring,
+\code{spring-cloud-kubernetes} cho phép tên \code{lb://} phân giải qua
+API Kubernetes thay vì Eureka --- hữu ích trong lúc chuyển đổi, không
+cần thiết khi chuyển xong. Và AWS Cloud Map, hậu duệ được quản lý của ý
+tưởng Eureka, tồn tại chủ yếu cho ECS, nơi không có kube-proxy để khiến
+nó thừa.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Gateway của bạn vẫn gửi lưu lượng tới một instance đã
+chết chín mươi giây trước. Vì sao, và cắt ngắn bằng cách nào?}
+
+Vì không gì trên đường đi nhận ra. Eureka biết một cái chết không êm
+chỉ qua heartbeat thiếu: 90\,s hết hạn lease, rồi một lượt quét chạy
+mỗi 60\,s, rồi 30\,s cache server, 30\,s tải của client, và 35\,s cache
+LoadBalancer --- tới bốn phút đầu-cuối, và nếu registry đã trượt vào
+tự bảo toàn, mãi mãi. Cắt phần đuôi trước: rút
+\code{registry-fetch-interval-seconds} và TTL LoadBalancer xuống 5\,s,
+tốn lưu lượng registry mà bạn kham được dưới vài trăm instance. Rồi
+cắt phần đầu: làm cái chết trở nên êm (xử lý SIGTERM,
+\code{terminationGracePeriodSeconds} đủ dài) để DELETE được gửi đi và
+150\,s logic lease không bao giờ chạy. Rồi làm bên gọi bền bất kể: một
+filter \code{Retry} cho lỗi kết nối, để một địa chỉ cũ tốn một lần thử
+lại, không phải một lỗi. Câu trả lời senior kết bằng ``hoặc ngừng định
+tuyến bằng registry trên Kubernetes, vì kube-proxy gỡ endpoint trong
+vài giây sau khi readiness probe thất bại''.
+
+\subsection*{Q: Làm sao một instance mới bắt đầu nhận lưu lượng trong
+rolling deploy với không lỗi nào?}
+
+Hai điều kiện và một chồng lấn. Instance mới không được nhận lưu lượng
+trước khi phục vụ được: trên Kubernetes đó là readiness probe, trên
+Eureka đó là chỉ đăng ký sau khi context lên hẳn --- Spring làm thế,
+nhưng một health check qua trước khi Flyway xong thì không, nên hãy
+probe thứ gì phụ thuộc cơ sở dữ liệu. Instance cũ phải tiếp tục phục vụ
+tới khi mọi bên gọi ngừng gửi: trên Kubernetes endpoint bị gỡ lúc
+SIGTERM nhưng request đang chạy hoàn tất trong grace period, và một
+\code{preStop} ngủ che cho bên gọi có cache cũ. Chồng lấn là
+\code{maxSurge: 1, maxUnavailable: 0}: đưa cái mới lên, đợi Ready, rồi
+hạ cái cũ. Lỗi trong rollout hầu như luôn là một trong ba thứ --- probe
+nói dối, cache sống lâu hơn pod, hay grace period ngắn hơn request chậm
+nhất --- và bạn gọi tên được cái nào từ hình dạng của lỗi.
+
+\subsection*{Q: Eureka so với DNS Kubernetes. Một phút.}
+
+Cả hai ánh xạ một tên tới một tập địa chỉ; chúng khác ở ai duy trì tập
+đó và ai tra cứu. Eureka: instance tự đăng ký, tự báo sức khỏe, và mọi
+bên gọi mang một client tải và cache danh sách --- không cần nền tảng,
+chạy trên VM, AP với vài phút cũ, và mọi bên gọi là một JVM có thư
+viện. Kubernetes: control plane duy trì endpoint của Service từ label
+selector và readiness probe do chính nó chạy, kube-proxy cân bằng, bên
+gọi dùng DNS và không biết gì --- vài giây cũ, không thư viện, không
+tiến trình registry, nhưng chỉ trong cụm. Trên Kubernetes, Eureka là ý
+kiến thứ hai, chậm hơn, về sự sống. Chỉ giữ nó nếu bạn buộc phải chạy
+cùng code ở nơi nền tảng không có mặt.
+
+\subsection*{Q: Bạn chạy hai replica Eureka và chúng bất đồng về việc
+một instance còn sống không. Giờ sao?}
+
+Hãy lường trước; thiết kế cho nó. Sao chép giữa peer là bất đồng bộ và
+mỗi replica loại bỏ và tự bảo toàn theo bộ đếm riêng, nên một cửa sổ
+bất đồng là cố hữu --- Eureka là AP và bất đồng là cái giá của việc trả
+lời trong lúc phân mảnh. Điều quan trọng là client chịu được: mọi
+client liệt kê cả hai replica, thử cái thứ hai khi thất bại, và coi
+registry là gợi ý mà một connect timeout có thể phủ quyết. Nếu bất
+đồng kéo dài quá vài phút, một replica đang tự bảo toàn còn cái kia
+không; so ngưỡng gia hạn với số instance thực, và trên đội tàu nhỏ hạ
+\code{renewal-percent-threshold} hoặc tắt hẳn tự bảo toàn. Câu trả lời
+sai là cố làm registry nhất quán; câu đúng là làm bên gọi thờ ơ với
+replica nào chúng đọc.
+
+\subsection*{Q: Hai trăm service, mỗi cái tải registry mỗi ba mươi
+giây. Registry đang tan chảy. Bạn đổi gì?}
+
+Bốn trăm lượt tải mỗi phút của một tài liệu liệt kê hai trăm ứng dụng
+là nút thắt đầu tiên, và câu trả lời của Eureka là tải delta: client
+hỏi \code{/apps/delta} sau lần tải đầy đủ đầu tiên, mặc định bật và chỉ
+hỏng khi hàng đợi delta của server bị tắt. Thứ hai, cache phản hồi chỉ
+đọc tồn tại chính xác để server tuần tự hóa registry một lần mỗi
+30\,s, không phải mỗi request --- giữ nó. Thứ ba, chia theo zone: cấu
+hình \code{availability-zone} của Eureka cho client ưu tiên registry
+cục bộ và instance cục bộ, để mỗi server gánh một phần lượt tải. Quá
+một nghìn instance, câu trả lời của chính Netflix là thêm server Eureka
+sau DNS, và câu trả lời ngày nay là ở cỡ đó bạn đang ở trên một nền
+tảng làm khám phá hộ bạn.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Tính độ trễ xấu nhất trước khi gateway định tuyến tới một pod
+  course-service vừa khởi động, gọi tên từng cache trong chuỗi và mặc
+  định của nó.
+  \item Một instance bị OOM killer giết. Liệt kê các bộ đếm phải trôi
+  qua trước khi gateway ngừng quay nó, và nêu cái nào một lượt tắt êm
+  sẽ bỏ qua.
+  \item Với năm client đăng ký, chỉ ra vì sao mất một cái đưa registry
+  vào tự bảo toàn, và nêu cấu hình một dòng thay đổi điều đó trên đội
+  tàu nhỏ.
+  \item Trên Kubernetes, cơ chế nào gác lưu lượng tới một pod trên
+  đường của gateway hôm nay, và vì sao readiness probe không? Thay đổi
+  cấu hình đơn nào đưa readiness trở lại đường đi?
+  \item Sau \code{eureka.client.enabled: false} dưới profile \code{k8s},
+  giải thích vì sao cùng image course-service vẫn đăng ký với Eureka
+  trong Compose, và \code{url = "\${app.clients.auth-service:}"} làm gì
+  ở mỗi môi trường.
+  \item Phỏng vấn: ``Vì sao registry tiếp tục phục vụ một instance đã
+  chết trong khi Service Kubernetes thì không?'' Trả lời theo ai quan
+  sát sự sống và bằng cách nào.
+\end{enumerate}
+\end{quiz}

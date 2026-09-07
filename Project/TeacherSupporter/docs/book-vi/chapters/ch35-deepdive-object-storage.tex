@@ -1,0 +1,701 @@
+\chapter{Đào sâu: File ở quy mô lớn --- presigned URL, endpoint, và vì sao byte không thuộc về Postgres}
+\label{ch:dd-storage}
+
+Chương~9 giới thiệu MinIO như ``S3 tại nhà'' và giải thích lỗi hai
+endpoint. Chừng đó đủ để bài nộp hoạt động. Chương này hỏi thiết kế đó
+tốn gì khi file trở nên nhiều, lớn và quan trọng --- khoảnh khắc bài
+luận đã chấm của một học sinh là bản sao duy nhất ở bất kỳ đâu. Code
+của dự án là mẫu vật: một \code{S3Config}, một \code{S3StorageService},
+một cột tên \code{file\_object\_key}.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Byte nên sống ở đâu} --- trong cơ sở dữ liệu, trên đĩa,
+  hay trong kho đối tượng --- và mỗi lựa chọn tốn chính xác những gì?
+  \item \textbf{Ai nên chuyển byte} --- trình duyệt đi qua service, hay
+  trình duyệt đi thẳng tới kho với một giấy phép có chữ ký?
+  \item \textbf{Chuyện gì xảy ra khi hai kho bất đồng} --- một dòng gọi
+  tên một object không tồn tại, hay một object không dòng nào gọi tên?
+\end{enumerate}
+
+\section{Vì sao kho đối tượng, và nó giải quyết gì}
+
+Một bài nộp có hai nửa: các dữ kiện về nó (ai, khi nào, lần thứ mấy,
+điểm bao nhiêu) và chính file. Dữ kiện có tính quan hệ và bé xíu; file
+thì mờ đục và có thể nặng 20\,MB. File có ba nơi để ở.
+
+\textbf{Trong Postgres, dưới dạng \code{bytea}.} Một kho, một
+transaction, một bản backup. Cũng là nơi rắc rối bắt đầu. Mỗi lần đọc
+dòng kéo cả blob qua shared buffers; \code{pg\_dump} lớn thêm bằng kích
+thước mọi bài luận từng nộp; mỗi lần cập nhật ghi lại toàn bộ giá trị và
+để lại một dead tuple cho autovacuum; write-ahead log chở mỗi byte hai
+lần (WAL, rồi page); replication đẩy nó tới mọi standby; và một lượt tải
+xuống phải hiện thân trọn vẹn trong JVM trước khi tới socket. Postgres
+làm được, và tới vài gigabyte không ai để ý. Quá mức đó, mọi tác vụ vận
+hành --- backup, restore, độ trễ replication, vacuum --- bị chi phối bởi
+dữ liệu mà cơ sở dữ liệu chẳng thêm giá trị nào.
+
+\textbf{Trên một volume mount vào service.} Nhanh và đơn giản cho tới
+khi service có hai replica trên hai node, thứ đầu tiên Kubernetes muốn
+làm. Một claim \code{ReadWriteOnce} (Chương~19) gắn với một node;
+\code{ReadWriteMany} cần NFS hoặc một storage driver, và giờ service tự
+sở hữu bố cục file, quyền, dọn dẹp và backup của riêng nó. Đĩa cũng nằm
+trong vùng lỗi của pod.
+
+\textbf{Trong kho đối tượng.} Không gian tên phẳng, API HTTP, độ bền
+theo nội dung, và --- quyết định --- khả năng đưa cho client một URL rồi
+bước ra khỏi đường dữ liệu. Backup thành một quy tắc replication của
+bucket. Phục vụ file thành việc của CDN. Cơ sở dữ liệu chỉ giữ một key
+500 ký tự.
+
+\begin{decision}[một key trong Postgres, byte trong MinIO]
+Dự án lưu metadata trong bảng \code{submission} và file dưới một key
+trong bucket \code{ts-submissions}. Dòng tham chiếu object bằng tên;
+không gì tham chiếu ngược từ object tới dòng. Các phương án khác thua ở
+trục quan trọng với một trường học: bài nộp được ghi một lần, đọc vài
+lần, và giữ nhiều năm --- hồ sơ mà kho đối tượng sinh ra để phục vụ và
+cơ sở dữ liệu làm tệ nhất. Quyết định chỉ đảo ngược nếu file rất nhỏ
+(vài KB), cần nguyên tử với dòng trong cùng transaction, và được đọc
+mỗi lần truy cập dòng --- một ảnh đại diện thu nhỏ, chẳng hạn. Ngay cả
+khi đó câu trả lời thật thà thường vẫn là ``vẫn S3, cộng một cache''.
+\end{decision}
+
+\section{Đọc code của dự án}
+
+\subsection{Hai client, hai endpoint}
+
+Cửa ngõ của mọi thứ là \code{S3Config}. Đọc nó với môi trường compose
+trong đầu (\code{APP\_S3\_ENDPOINT=http://minio:9000},
+\code{APP\_S3\_PUBLIC\_ENDPOINT=http://localhost:9000}):
+
+\begin{lstlisting}[language=Java]
+@Bean
+public S3Client s3Client() {
+    return S3Client.builder()
+            .endpointOverride(URI.create(endpoint))            (*@\co{1}@*)
+            .region(Region.of(region))
+            .credentialsProvider(credentialsProvider())
+            .serviceConfiguration(S3Configuration.builder()
+                    .pathStyleAccessEnabled(true).build())     (*@\co{2}@*)
+            .build();
+}
+
+@Bean
+public S3Presigner s3Presigner() {
+    return S3Presigner.builder()
+            .endpointOverride(URI.create(publicEndpoint))      (*@\co{3}@*)
+            .region(Region.of(region))
+            .credentialsProvider(credentialsProvider())
+            .serviceConfiguration(S3Configuration.builder()
+                    .pathStyleAccessEnabled(true).build())
+            .build();
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Client chuyển byte nói chuyện với tên \emph{nội bộ}.
+  Trong Compose hay trong cụm, \code{minio} là một tên DNS trên mạng
+  riêng (Chương~18); từ trình duyệt nó chẳng là gì.
+  \item[\co{2}] Địa chỉ kiểu path-style: bucket nằm trong đường dẫn URL,
+  nên request là \code{/ts-submissions/key} trên host \code{minio:9000}.
+  Mặc định của AWS là kiểu virtual-host, bucket là một subdomain DNS ---
+  host \code{ts-submissions.s3.amazonaws.com}, đường dẫn \code{/key}.
+  MinIO cũng làm được, nhưng chỉ khi nó biết domain của chính mình
+  (\code{MINIO\_DOMAIN}) và có wildcard DNS cho domain đó; trên mạng
+  gia đình cả hai đều không có, nên dạng path là dạng duy nhất phân giải
+  được.
+  \item[\co{3}] Presigner không bao giờ gửi request. Nó chỉ tính chữ ký
+  --- và phải tính cho host mà \emph{trình duyệt} sẽ liên hệ. Nó là một
+  bean riêng chỉ vì lý do đó. Mục~\ref{sec:sigv4} giải thích vì sao
+  không thể đổi host sau khi ký.
+\end{description}
+
+\subsection{Key, upload, download}
+
+\code{S3StorageService} đủ ngắn để đọc trọn; các dòng quan trọng là
+đây:
+
+\begin{lstlisting}[language=Java]
+@PostConstruct
+void ensureBucketExists() {
+    try {
+        s3Client.headBucket(HeadBucketRequest.builder()
+                .bucket(bucket).build());
+    } catch (NoSuchBucketException e) {                     (*@\co{1}@*)
+        s3Client.createBucket(CreateBucketRequest.builder()
+                .bucket(bucket).build());
+    }
+}
+
+public String upload(MultipartFile file, Long assignmentId,
+                     Long studentId) {
+    String key = "submissions/%d/%d/%s-%s".formatted(
+            assignmentId, studentId, UUID.randomUUID(), original); (*@\co{2}@*)
+    s3Client.putObject(PutObjectRequest.builder()
+                    .bucket(bucket).key(key)
+                    .contentType(file.getContentType())
+                    .contentLength(file.getSize()).build(),
+            RequestBody.fromInputStream(file.getInputStream(),
+                    file.getSize()));                          (*@\co{3}@*)
+    return key;
+}
+
+public String presignedDownloadUrl(String key) {
+    GetObjectPresignRequest presignRequest = GetObjectPresignRequest
+            .builder()
+            .signatureDuration(Duration.ofMinutes(presignedExpiryMinutes))
+            .getObjectRequest(GetObjectRequest.builder()
+                    .bucket(bucket).key(key).build())
+            .build();
+    return s3Presigner.presignGetObject(presignRequest).url().toString();
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Chỉ \code{NoSuchBucketException} được bắt. Một
+  connection refused --- MinIO chưa lên --- là
+  \code{SdkClientException}, thoát ra ngoài, làm hỏng việc tạo bean, và
+  kéo cả service xuống. Manifest Kubernetes của MinIO nói vậy ngay ở
+  comment đầu: course-service sẽ \code{CrashLoopBackOff} cho tới khi
+  MinIO trả lời. Compose che điều này bằng
+  \code{depends\_on: service\_healthy}.
+  \item[\co{2}] Key là toàn bộ mô hình dữ liệu của một kho đối tượng.
+  S3 không có thư mục; dấu gạch chéo chỉ là ký tự trong chuỗi. Nhưng
+  \emph{tiền tố} là thứ bạn liệt kê theo, nên
+  \code{submissions/\{assignmentId\}/\{studentId\}/} nghĩa là ``mọi lần
+  nộp của học sinh này cho bài này'' là một lời gọi \code{ListObjectsV2}
+  với một tiền tố. UUID bảo đảm key mới cho mỗi lần nộp, nên không gì
+  bị ghi đè và versioning không cần thiết cho an toàn. Tên file gốc
+  được nối vào để dễ đọc trong console; cơ sở dữ liệu giữ riêng nó trong
+  \code{file\_name} vì key không phải chỗ tốt cho dấu cách, Unicode, hay
+  \code{..}.
+  \item[\co{3}] Byte chảy \emph{xuyên qua} JVM này: hỗ trợ multipart
+  của Spring đã parse chúng (đổ ra file tạm khi vượt một ngưỡng nhỏ),
+  và giờ chúng được stream tới MinIO. Thread request bị chiếm suốt
+  lượt truyền, hai lần.
+\end{description}
+
+Và đường nối với nửa quan hệ, trong \code{SubmissionService}:
+
+\begin{lstlisting}[language=Java]
+@Transactional
+public SubmissionResponse submit(...) {
+    ...
+    if (hasFile) {
+        String key = s3StorageService.upload(file, assignmentId,
+                student.getId());                              (*@\co{1}@*)
+        submission.setFileObjectKey(key);
+        submission.setFileName(file.getOriginalFilename());
+    }
+    submission = submissionRepository.save(submission);        (*@\co{2}@*)
+    return toResponse(submission);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một lời gọi HTTP tới hệ thống khác, bên trong một
+  transaction cơ sở dữ liệu. Nó không, và không thể, là một phần của
+  transaction đó.
+  \item[\co{2}] Nếu insert này thất bại --- ràng buộc unique trên
+  \code{(assignment\_id, student\_id, attempt\_number)} thua một cuộc
+  đua giữa hai tab, hay Postgres thoáng không với tới được ---
+  transaction rollback và object đã upload ở \co{1} nằm lại trong
+  bucket, mang một key không dòng nào sẽ ghi lại. Chương~11 gọi đây là
+  bài toán dual-write khi hệ thống thứ hai là Kafka; vẫn bài toán đó với
+  một hệ thống thứ hai khác.
+\end{description}
+
+\section{Signature Version 4, và vì sao host được hàn chết vào}
+\label{sec:sigv4}
+
+Một presigned URL là một request S3 bình thường với phần xác thực
+chuyển từ header sang chuỗi truy vấn. Link tải xuống của dự án trông
+thế này (đã ngắt dòng):
+
+\begin{lstlisting}
+http://localhost:9000/ts-submissions/submissions/7/3/2f9c...-essay.pdf
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &X-Amz-Credential=minioadmin/20260907/us-east-1/s3/aws4_request
+  &X-Amz-Date=20260907T091500Z
+  &X-Amz-Expires=900
+  &X-Amz-SignedHeaders=host
+  &X-Amz-Signature=3c1f...e9a0
+\end{lstlisting}
+
+Chữ ký được tính qua hai giai đoạn. Trước hết một \emph{khóa ký} được
+dẫn xuất từ secret qua một chuỗi HMAC trên ngày, region, tên dịch vụ và
+chuỗi cố định \code{aws4\_request}, nên bản thân secret không bao giờ
+chạm vào request. Rồi khóa đó ký một \emph{string to sign} chứa SHA-256
+của một \emph{canonical request}: phương thức HTTP, URI chuẩn hóa
+(bucket và key, kiểu path), chuỗi truy vấn đã sắp xếp, các header được
+ký, và mã băm của payload. Nhìn \code{X-Amz-SignedHeaders=host}: header
+\code{Host} luôn được ký. Đổi host --- \code{minio} thành
+\code{localhost}, hay \code{localhost} thành \code{127.0.0.1} --- là
+canonical request đổi, mã băm đổi, chữ ký không khớp nữa, và MinIO trả
+lời \code{403 SignatureDoesNotMatch}. Không có cách nào ký với tên nội
+bộ rồi viết lại link cho thế giới bên ngoài. Ai ký phải biết chính xác
+origin mà trình duyệt sẽ dùng.
+
+\begin{handson}[cố tình làm hỏng một chữ ký]
+Đăng nhập, nộp một bài có file, và chép \code{downloadUrl} mà API trả
+về. Nó hoạt động đúng như được phát:
+\begin{lstlisting}[language=bash]
+$ curl -s -o /dev/null -w "%{http_code}\n" "$URL"
+200
+\end{lstlisting}
+Giờ chỉ đổi host, sang một địa chỉ tới đúng container MinIO đó:
+\begin{lstlisting}[language=bash]
+$ curl -s "${URL/localhost/127.0.0.1}" | head -c 160
+<?xml version="1.0" encoding="UTF-8"?><Error>
+<Code>SignatureDoesNotMatch</Code><Message>The request signature we
+calculated does not match the signature you provided.
+\end{lstlisting}
+Cùng server, cùng object, cùng thông tin xác thực --- và một header
+\code{Host} khác là đủ. Đó là toàn bộ lý do \code{public-endpoint} tồn
+tại.
+\end{handson}
+
+\begin{pitfall}[link tải xuống chạy trong Compose và hỏng trong cụm]
+Triệu chứng: trên cụm, bấm vào file của một bài nộp mở ra
+\code{http://localhost:9000/...} và trình duyệt báo connection refused.
+Nguyên nhân: Deployment của course-service đặt \code{APP\_S3\_ENDPOINT}
+là \code{http://minio:9000} nhưng không bao giờ đặt
+\code{APP\_S3\_PUBLIC\_ENDPOINT}, nên giá trị mặc định
+\code{http://localhost:9000} của config-server được ký vào mọi link ---
+một địa chỉ từng nghĩa là ``laptop của lập trình viên'' và giờ nghĩa là
+``laptop của người dùng''. Sửa hai phần: mở cổng S3 của MinIO qua một
+quy tắc Ingress trên host riêng của nó (chữ ký path-style bao gồm cả
+đường dẫn, nên Ingress không được thêm tiền tố), và đặt public endpoint
+thành origin đó:
+\begin{lstlisting}[language=yaml]
+- { name: APP_S3_PUBLIC_ENDPOINT,
+    value: "https://files.ts-server.tailbfe002.ts.net" }
+\end{lstlisting}
+Chừng nào chưa có hostname thứ hai, giải pháp tạm thật thà là stream
+lượt tải qua course-service (\code{GetObject} vào body của response) để
+trình duyệt không bao giờ cần với tới MinIO --- chậm hơn, nhưng đúng.
+\end{pitfall}
+
+\section{Ai chuyển byte}
+
+Đường upload hôm nay là: trình duyệt $\rightarrow$ Traefik $\rightarrow$
+api-gateway $\rightarrow$ course-service $\rightarrow$ MinIO. Mỗi chặng
+thấy mỗi byte. Service cưỡng chế \code{max-file-size: 20MB} và
+\code{max-request-size: 25MB} trong cấu hình multipart, nên trường hợp
+xấu nhất có giới hạn; nhưng mỗi lượt upload giữ một thread Tomcat và một
+file tạm suốt thời gian của nó, gateway phản ứng (Chương~4) chuyển tiếp
+body từng khối nhưng vẫn tiêu event loop cho việc đó, và mọi giới hạn
+body hay idle timeout ở tầng ingress áp lên trước tất cả. Dưới hạn nộp
+--- 200 học sinh upload lúc 23:59 --- thread pool của service là nút
+thắt cho công việc nó không cần làm.
+
+Phương án thay thế là mẫu Chương~9 nhắc tới cho tải xuống, áp dụng cho
+tải lên: service ký một \emph{PUT} cho một key nó chọn, trình duyệt
+upload thẳng tới MinIO, và chỉ khi đó service mới ghi dòng. Service tốn
+vài micro giây mỗi file và không bao giờ thấy byte. Cái nó từ bỏ: không
+kiểm tra được nội dung trước khi nó hạ cánh (quét virus, nhận diện
+loại) và phải biết, từ đâu đó, rằng upload thực sự hoàn tất.
+Mục~\ref{sec:presigned-put} xây dựng điều này cho tử tế.
+
+Quá khoảng 100\,MB, một PUT đơn là công cụ sai trên mọi mạng:
+\emph{multipart upload} chia object thành các phần ít nhất 5\,MB,
+upload song song, tiếp tục sau sự cố bằng cách gửi lại một phần, và ráp
+chúng phía server trong một lời gọi cuối. \code{S3TransferManager} của
+SDK tự làm việc này trên một ngưỡng. Cái đuôi vận hành: upload bị bỏ dở
+để lại các phần vô hình vẫn bị tính tiền và đếm --- mọi bucket nên mang
+một quy tắc lifecycle hủy multipart upload dang dở sau vài ngày.
+
+\section{Ưu và nhược, thẳng thắn}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.62\linewidth}@{}}
+\toprule
+\textbf{Điểm mạnh} & \textbf{Dự án trả giá ở đâu} \\
+\midrule
+Cơ sở dữ liệu giữ nhỏ; backup chỉ là metadata &
+  Hai kho phải backup, và chỉ một trong số đó có transaction \\
+API chuẩn: MinIO hôm nay, S3 ngày mai với hai biến môi trường &
+  Hai endpoint phải giữ cho đúng, và cụm đặt sai một \\
+Presigned download đưa service ra khỏi đường dữ liệu &
+  Upload vẫn đi qua service, mỗi file một thread \\
+Key cho ``thư mục'' miễn phí theo tiền tố &
+  Thiết kế key là cánh cửa một chiều; đổi tên nghĩa là copy \\
+Độ bền là việc của kho &
+  Trên phần cứng này nó là một container và một claim 5\,GB \\
+Thông tin xác thực là hai chuỗi &
+  Đó là thông tin \emph{root} của MinIO, trong mọi pod course-service \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Dòng cuối đáng nhấn mạnh. \code{minioadmin} tạo được bucket, xóa được
+bucket, và đọc được mọi object trong mọi bucket. Service cần
+\code{PutObject}, \code{GetObject} và \code{HeadBucket} trên một bucket.
+Quyền tối thiểu ở đây là một user MinIO với policy giới hạn vào
+\code{arn:aws:s3:::ts-submissions/*}; trên AWS là một IAM role gắn với
+ServiceAccount của pod (IRSA) để không tồn tại khóa tĩnh nào. Người
+phỏng vấn hỏi ``service của bạn xác thực với S3 thế nào?'' đang nghe
+xem bạn nói ``một IAM role'' hay ``một key trong biến môi trường'' ---
+và, nếu là vế sau, bạn có biết đó là câu trả lời yếu hơn không.
+
+\section{Chuyện gì gãy}
+
+\begin{pitfall}[service không chịu khởi động khi thiếu bucket]
+Triệu chứng: course-service \code{CrashLoopBackOff} trên cụm mới; log
+kết thúc bằng \code{Error creating bean with name 's3StorageService'}
+với một \code{Connection refused} nằm sâu vài tầng nguyên nhân. Nguyên
+nhân: kiểm tra bucket trong \code{@PostConstruct} coi mọi thất bại
+ngoài ``thiếu bucket'' là chí mạng, mà pod MinIO vẫn đang kéo image.
+Back-off khởi động lại của kubelet cuối cùng rơi vào lúc MinIO sẵn sàng,
+nên nó tự lành --- chậm. Sửa: bắt cả \code{SdkClientException}, log
+cảnh báo, và để readiness probe (Chương~17) giữ lưu lượng tránh xa cho
+tới lần \code{headBucket} thành công đầu tiên; một phụ thuộc lưu trữ
+nên làm suy giảm tính năng file, không phải cả service.
+\end{pitfall}
+
+\begin{pitfall}[object mồ côi]
+Triệu chứng: bucket chứa nhiều object hơn số key khác null trong bảng
+\code{submission}; không ai để ý suốt một năm; claim 5\,GB đầy. Nguyên
+nhân: dual write trong \code{submit}. Upload trước, insert sau: insert
+hỏng là object mồ côi. Insert trước, upload sau: upload hỏng để lại
+dòng trỏ vào khoảng không, và học sinh thấy ``đã đính kèm file'' với
+một link chết. Thứ tự nào cũng không tự an toàn. Cách giải chuẩn là làm
+một phía lũy đẳng và phía kia đối chiếu được: insert dòng với trạng
+thái \code{PENDING\_FILE} và key đã chọn, upload, rồi lật trạng thái
+sang \code{SUBMITTED} trong transaction thứ hai; một job hằng đêm xóa
+object dưới các key mà dòng vẫn \code{PENDING\_FILE} sau một giờ, và
+liệt kê tiền tố để tìm key không dòng nào gọi tên.
+Mục~\ref{sec:presigned-put} gấp điều này vào luồng mới, nơi nó gần như
+miễn phí.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Pod MinIO biến mất --- node khởi động lại, claim chưa gắn lại. Đi qua
+từng endpoint:
+
+\begin{itemize}
+  \item \textbf{Bài nộp dạng text và link} vẫn chạy: \code{upload} chỉ
+  được gọi khi có file, và \code{save} chỉ chạm Postgres.
+  \item \textbf{Bài nộp có file} thất bại với 500 sau ngân sách retry
+  của SDK --- vài giây giữ thread mỗi lượt. Dưới tải, các thread này
+  tích tụ và bỏ đói cả các bài nộp text lẽ ra đã thành công. Đây là lập
+  luận của Chương~17 cho một bulkhead: một executor riêng, có giới hạn,
+  cho các lời gọi lưu trữ.
+  \item \textbf{Liệt kê bài nộp} chạy và thậm chí trả về link tải
+  xuống. Ký là thuần tính toán; không request nào được gửi. Link chỉ
+  hỏng khi bấm, và đó là cách hỏng đúng --- metadata là thật, byte tạm
+  thời không sẵn có.
+  \item \textbf{Khởi động lại course-service} trong lúc sự cố thì không
+  lên được, vì lý do trong cạm bẫy ở trên. Một sự cố của kho file đã
+  thành sự cố của chấm điểm, ghi danh, và mọi thứ khác service làm.
+\end{itemize}
+
+Giờ chiều ngược lại: Postgres chết và MinIO bình thường. Mọi thứ thất
+bại, kể cả các upload lẽ ra đã thành công ở tầng lưu trữ --- và mỗi
+upload chạm tới \co{1} trong \code{submit} rồi hỏng ở \co{2} để lại một
+object mồ côi. Một cú chớp cơ sở dữ liệu lúc 3 giờ sáng sinh ra một
+đống nhỏ object vô chủ, và đó là lý do cụ thể job đối chiếu tồn tại.
+
+\section{Nâng cấp giải pháp: presigned PUT}
+\label{sec:presigned-put}
+
+Bản nâng cấp đưa byte ra khỏi service và đóng cửa sổ mồ côi cùng lúc.
+Ba lời gọi thay cho một:
+
+\begin{enumerate}
+  \item \code{POST /assignments/\{id\}/submissions/upload-url} ---
+  service kiểm tra học sinh được nộp, chọn key, ký một PUT, và insert
+  một dòng \code{PENDING\_FILE}.
+  \item Trình duyệt PUT file lên MinIO với URL đó.
+  \item \code{POST /assignments/\{id\}/submissions} kèm key --- service
+  xác nhận object tồn tại bằng một \code{HEAD}, rồi hoàn tất dòng.
+\end{enumerate}
+
+Storage service có thêm hai phương thức. Cả hai đều trọn vẹn:
+
+\begin{lstlisting}[language=Java]
+/** Sign a PUT for a key we chose; the browser must send exactly this
+ *  content type, because it is part of the signature. */
+public String presignedUploadUrl(String key, String contentType,
+                                 long contentLength) {
+    PutObjectRequest put = PutObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .contentType(contentType)
+            .contentLength(contentLength)                  (*@\co{1}@*)
+            .build();
+    PutObjectPresignRequest req = PutObjectPresignRequest.builder()
+            .signatureDuration(Duration.ofMinutes(10))
+            .putObjectRequest(put)
+            .build();
+    return s3Presigner.presignPutObject(req).url().toString();
+}
+
+/** Confirm an object exists and report its size; empty if missing. */
+public Optional<Long> objectSize(String key) {
+    try {
+        HeadObjectResponse head = s3Client.headObject(
+                HeadObjectRequest.builder().bucket(bucket).key(key).build());
+        return Optional.of(head.contentLength());
+    } catch (NoSuchKeyException e) {                        (*@\co{2}@*)
+        return Optional.empty();
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Ký \code{Content-Length} và \code{Content-Type} biến
+  chúng thành hợp đồng: trình duyệt gửi kích thước hay loại khác sẽ nhận
+  \code{403}. Đó là cách giới hạn 20\,MB sống sót khi rời khỏi service.
+  \item[\co{2}] \code{HEAD} tốn một vòng đi-về và không byte nào. Đó là
+  bằng chứng rẻ nhất có thể rằng bước~2 đã xảy ra.
+\end{description}
+
+Submission service tách phương thức cũ làm hai. Tiền tố key được dựng
+từ dữ kiện phía server, nên client không thể nhận vơ upload của người
+khác:
+
+\begin{lstlisting}[language=Java]
+public UploadTicket prepareUpload(Long assignmentId, Long studentUserId,
+                                  String fileName, String contentType,
+                                  long size) {
+    Assignment assignment = requireOpenAssignment(assignmentId);
+    Student student = requireEnrolled(assignment, studentUserId);
+    if (size > MAX_FILE_BYTES) {
+        throw new ApiException(413, "File exceeds 20 MB");
+    }
+    String key = "submissions/%d/%d/%s-%s".formatted(
+            assignmentId, student.getId(), UUID.randomUUID(),
+            safeName(fileName));                            (*@\co{1}@*)
+    Submission pending = Submission.builder()
+            .assignment(assignment).student(student)
+            .attemptNumber(nextAttempt(assignmentId, student.getId()))
+            .fileObjectKey(key).fileName(fileName)
+            .status("PENDING_FILE")                         (*@\co{2}@*)
+            .build();
+    submissionRepository.save(pending);
+    String url = s3StorageService.presignedUploadUrl(key, contentType,
+            size);
+    return new UploadTicket(pending.getId(), key, url);
+}
+
+public SubmissionResponse completeUpload(Long submissionId,
+                                         Long studentUserId) {
+    Submission s = findOrThrow(submissionId);
+    if (!s.getStudent().getUserId().equals(studentUserId)
+            || !"PENDING_FILE".equals(s.getStatus())) {
+        throw new ApiException(409, "Nothing to complete");
+    }
+    long size = s3StorageService.objectSize(s.getFileObjectKey())
+            .orElseThrow(() -> new ApiException(400,
+                    "Upload not found; request a new upload URL")); (*@\co{3}@*)
+    if (size > MAX_FILE_BYTES) {
+        throw new ApiException(413, "File exceeds 20 MB");
+    }
+    s.setStatus("SUBMITTED");
+    return toResponse(submissionRepository.save(s));
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{safeName} bỏ dấu phân cách đường dẫn và ký tự
+  ngoài ASCII; tên hiển thị ở lại trong \code{file\_name}.
+  \item[\co{2}] Dòng tồn tại \emph{trước} byte. Crash ở bất kỳ đâu sau
+  điểm này để lại một dòng \code{PENDING\_FILE} mà job dọn dẹp tìm
+  được, thay vì một object không ai tìm được.
+  \item[\co{3}] Con đường duy nhất tới \code{SUBMITTED} là qua một
+  \code{HEAD} thành công. Dòng không bao giờ nhận có một file không ở
+  đó.
+\end{description}
+
+Job dọn dẹp giờ là một truy vấn, không phải một lượt quét bucket:
+
+\begin{lstlisting}[language=Java]
+@Scheduled(cron = "0 15 * * * *")   // hourly, at :15
+public void reapAbandonedUploads() {
+    List<Submission> stale = submissionRepository
+            .findByStatusAndSubmittedAtBefore("PENDING_FILE",
+                    LocalDateTime.now().minusHours(1));
+    for (Submission s : stale) {
+        s3StorageService.deleteQuietly(s.getFileObjectKey()); // idempotent
+        submissionRepository.delete(s);
+    }
+}
+\end{lstlisting}
+
+MinIO phải cho phép PUT cross-origin từ trình duyệt. Quy tắc CORS của
+bucket được đặt một lần bằng MinIO client:
+
+\begin{lstlisting}[language=bash]
+$ mc cors set local/ts-submissions cors.json
+# cors.json: allow PUT from the frontend origin, expose ETag
+{ "CORSRules": [ { "AllowedOrigins": ["http://localhost:3000"],
+    "AllowedMethods": ["PUT", "GET"],
+    "AllowedHeaders": ["Content-Type", "Content-Length"],
+    "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 3600 } ] }
+\end{lstlisting}
+
+Và phía frontend là một \code{fetch} trơn; không instance axios, không
+gateway, không JWT --- URL \emph{chính là} thông tin xác thực:
+
+\begin{lstlisting}
+const ticket = await api.post(
+  `/assignments/${id}/submissions/upload-url`,
+  { fileName: file.name, contentType: file.type, size: file.size });
+
+const put = await fetch(ticket.url, {
+  method: 'PUT',
+  headers: { 'Content-Type': file.type },   // must match the signature
+  body: file,
+});
+if (!put.ok) throw new Error(`upload failed: ${put.status}`);
+
+await api.post(`/submissions/${ticket.submissionId}/complete`);
+\end{lstlisting}
+
+\begin{decision}[presigned PUT so với upload qua proxy]
+Đi qua proxy khi service phải thấy byte trước khi lưu --- quét virus,
+mã hóa lại ảnh, nhận diện content-type --- hoặc khi client không thể
+với tới endpoint lưu trữ. Presign khi file lớn hoặc nhiều và service
+chẳng thêm gì cho lượt truyền: thread pool, giới hạn body ở ingress, và
+chặng mạng kép đều biến mất. Trường hợp của dự án là vế thứ hai, với
+một lưu ý quyết định thứ tự công việc: presigned upload đòi một origin
+MinIO trình duyệt với tới được, thứ cụm chưa có. Cạm bẫy ở trên và bản
+nâng cấp này chung một điều kiện tiên quyết --- một hostname công khai
+cho file --- và nên được lên lịch cùng nhau.
+\end{decision}
+
+\section{Ngoài dự án}
+
+Trên AWS, cùng đoạn code chạy với S3 khi bỏ endpoint override và thay
+khóa tĩnh bằng IAM role; CloudFront signed URL đóng vai presigner với
+một CDN đứng trước, và \emph{S3 POST policy} là người anh em cũ hơn,
+thân thiện với form trình duyệt, của presigned PUT, có sẵn điều kiện
+\code{content-length-range}. Google Cloud Storage và Azure Blob Storage
+có cùng ba ý tưởng dưới tên khác --- signed URL, SAS token, resumable
+upload. MinIO production chạy dạng phân tán với erasure coding qua nhiều
+ổ đĩa và node; một container với một claim là hình hài để phát triển,
+và SDK không phân biệt được, đó chính là ý nghĩa của chuẩn. Phiên bản
+phỏng vấn của chương này là một câu hỏi --- ``người dùng upload một
+video 2\,GB; dẫn tôi đi qua'' --- và câu trả lời senior nêu presigned
+hoặc multipart upload, hợp đồng kích thước và loại trong chữ ký, một
+bước xác nhận, một job dọn mồ côi, và một quy tắc lifecycle cho các
+phần dang dở, theo gần đúng thứ tự đó.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Người dùng bắt đầu upload video 1\,GB và service hết bộ nhớ. Sửa đi.}
+
+Trước hết xác định byte là vấn đề, không phải metadata: một heap dump
+giữa lúc upload cho thấy các buffer multipart hay một
+\code{ByteArrayOutputStream}, và giới hạn bộ nhớ của pod (Chương~17) là
+thứ giết nó. Sửa ngắn hạn là bảo đảm Spring đổ ra đĩa
+(\code{file-size-threshold} nhỏ, một volume tạm đủ chỗ) và stream tới
+kho với \code{Content-Length} biết trước, như
+\code{S3StorageService.upload} đã làm --- đưa bạn tới hàng trăm MB mà
+heap không phình, nhưng vẫn một thread và một file tạm mỗi upload. Sửa
+thật là đưa service ra khỏi đường đi: presigned PUT cho mọi thứ dưới
+khoảng 100\,MB, và multipart upload với \code{S3TransferManager} hoặc
+chia phần phía trình duyệt cho phần trên, kèm quy tắc lifecycle hủy
+upload dang dở sau bảy ngày. Khi đó bộ nhớ của service độc lập với kích
+thước file theo cấu trúc, và \code{max-file-size} trở thành một
+\code{Content-Length} đã ký thay vì một cấu hình servlet.
+
+\subsection*{Q: Chúng ta cần phục vụ mười nghìn lượt tải xuống mỗi giây. Làm sao, mà không chạm vào service?}
+
+Presigned GET đã nghĩa là service không làm I/O nào mỗi lượt tải, chỉ
+một chữ ký --- vài micro giây, không mạng. Mười nghìn mỗi giây vì thế
+là câu hỏi về kho và biên. Kho đối tượng mở rộng đọc theo chiều ngang
+bằng cách phân bố tiền tố key; một CDN phía trước (CloudFront với signed
+URL, hay CDN nào kéo từ origin là bucket) phục vụ object lặp lại từ
+cache và hấp thụ fan-out. Giữ việc ký rẻ bằng cách không cache gì ---
+chữ ký là phi trạng thái --- và đặt hạn dùng khớp cửa sổ cache của CDN
+để một object đã cache không sống lâu hơn quyền của nó bao nhiêu. Cái
+bẫy là ký trong mỗi lời gọi liệt kê: \code{toResponse} trong dự án ký
+cho mỗi dòng của mỗi danh sách, ổn với hạn 15 phút nhưng nghĩa là một
+danh sách nghìn bài nộp tính nghìn chuỗi HMAC. Ký lười, ở một endpoint
+``lấy link'' riêng, khi lưu lượng biện minh cho nó.
+
+\subsection*{Q: Object có trong bucket nhưng dòng thì thiếu, hoặc dòng có mà object không. Đối chiếu thế nào?}
+
+Nói trước rằng cả hai là kết quả tất yếu của dual write và cách sửa là
+thiết kế, không phải một script. Thiết kế: ghi dòng ở trạng thái
+\code{PENDING} với key trước khi upload, xác nhận bằng \code{HEAD} trước
+khi đánh dấu hoàn tất, và không bao giờ để dòng nhận một file nó chưa
+xác minh. Đối chiếu khi đó có hai nửa rẻ. Dòng kẹt ở \code{PENDING} lâu
+hơn hạn presign bị xóa cùng object của chúng --- một truy vấn, không
+phải quét. Object không dòng được tìm bằng cách liệt kê tiền tố và
+anti-join với bảng, việc bạn kham nổi hằng đêm vì tiền tố là theo bài
+tập; trên AWS một báo cáo S3 Inventory thay cho lượt liệt kê. Làm gì
+thì làm, hãy để lệnh xóa object lũy đẳng để job chạy lại được.
+
+\subsection*{Q: Bảo vệ một presigned URL thế nào?}
+
+Bốn núm vặn, và câu trả lời senior gọi tên cả bốn. \emph{Phạm vi}: ký
+một phương thức trên một key; URL GET không dùng để PUT được, và URL
+PUT không dùng cho key khác được vì URI chuẩn hóa được ký. \emph{Hạn
+dùng}: phút, không phải ngày; dự án dùng 15 cho tải xuống và 10 là đủ
+cho tải lên --- đủ dài cho kết nối chậm, đủ ngắn để một link rò rỉ
+trong log chat đã chết khi ai đó để ý. \emph{Hợp đồng nội dung}: ký
+\code{Content-Type} và \code{Content-Length} khi upload để client không
+đổi được điều nó đã khai. \emph{Danh tính người ký}: thông tin xác thực
+đằng sau chữ ký nên là một user quyền tối thiểu trên đúng bucket đó, để
+ngay cả người ký bị chiếm cũng không liệt kê hay xóa được. Và nói điều
+người ta hay quên: presigned URL là một bearer credential --- không log
+ở đâu, chỉ trả về qua HTTPS, và không bao giờ đặt vào một redirect mà
+proxy có thể cache.
+
+\subsection*{Q: Chuyển từ MinIO sang AWS S3 không gián đoạn.}
+
+Vì code nói API S3, cuộc di cư là một lần chuyển dữ liệu cộng một thay
+đổi cấu hình, và mẹo nằm ở thứ tự. Thiết lập bucket replication hoặc
+chạy \code{mc mirror --watch} từ MinIO sang bucket S3 cho tới khi độ
+trễ chỉ còn vài giây. Chuyển \emph{ghi} trước bằng cách đổi
+\code{APP\_S3\_ENDPOINT} và thông tin xác thực (giờ là một IAM role)
+trên một rolling restart --- object mới hạ cánh ở S3, mirroring tiếp
+tục chép bất kỳ thứ gì còn hạ cánh ở MinIO từ các pod chưa khởi động
+lại. Chuyển \emph{public endpoint} sau cùng, sau một lượt mirror cuối,
+để link tải xuống chỉ bao giờ được ký cho host có object. Key không
+đổi, nên cơ sở dữ liệu không cần migration. Giữ MinIO chỉ-đọc một tuần
+làm phương án lùi, rồi ngừng. Thứ gãy là cách địa chỉ: kiểu virtual-host
+trở nên khả dụng, kiểu path vẫn chạy, và đoạn code nào ghép URL bằng tay
+thay vì hỏi SDK chính là nơi bạn sẽ tìm thấy lỗi.
+
+\subsection*{Q: Chi phí lưu trữ tăng mỗi tháng. Làm gì?}
+
+Đo theo tiền tố trước --- bài tập nào, năm nào. Rồi dùng công cụ của
+chính kho thay vì logic ứng dụng: một quy tắc lifecycle chuyển object
+cũ hơn một học kỳ sang tầng ít truy cập, và cũ hơn chính sách lưu giữ
+sang lưu trữ lạnh hoặc xóa; một quy tắc hủy multipart upload dang dở,
+thứ vô hình mà vẫn tính tiền; và tắt versioning, hoặc có hạn, trừ khi
+nhu cầu tuân thủ nói khác. Trong ứng dụng, ngừng lưu thứ tái tạo được
+(thumbnail, bản chuyển mã) và khử trùng lặp theo mã băm nội dung nếu
+học sinh upload cùng một mẫu. Ở dự án này con số nhỏ --- 250 lượt
+upload 20\,MB là đầy claim 5\,GB --- nhưng cùng bộ quy tắc đó là thứ
+giữ hóa đơn S3 phẳng ở quy mô gấp nghìn lần.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Hai bean, \code{S3Client} và \code{S3Presigner}, chung thông tin
+  xác thực và region, khác nhau một dòng. Nêu dòng đó, và giải thích
+  chuyện gì sai nếu presigner dùng endpoint nội bộ.
+  \item Một đồng nghiệp đề xuất giữ một endpoint và để gateway viết lại
+  \code{minio:9000} thành host công khai trong JSON trả về. Dùng cấu
+  trúc chữ ký Version 4, giải thích vì sao link đã viết lại trả về 403.
+  \item Trong \code{SubmissionService.submit}, upload diễn ra bên trong
+  một phương thức \code{@Transactional}. Nêu transaction bao phủ và
+  không bao phủ điều gì, và mô tả thứ để lại khi \code{save} thất bại.
+  \item Bố cục key là
+  \code{submissions/\{assignment\}/\{student\}/\{uuid\}-\{name\}}. Nêu
+  một thao tác bố cục này làm rẻ và một thao tác nó làm đắt, và nói vì
+  sao UUID khiến versioning của bucket không cần thiết cho an toàn.
+  \item MinIO chết lúc 3 giờ sáng. Trong các việc này, việc nào vẫn
+  thành công: nộp câu trả lời text, liệt kê bài nộp, mở link tải xuống,
+  khởi động lại course-service? Giải thích mỗi việc trong một mệnh đề.
+  \item Trong luồng presigned PUT, kẻ tấn công lấy được một URL upload
+  hợp lệ từ phiên của chính mình và cố gắn object đó vào bài nộp của
+  học sinh khác. Chỉ ra hai kiểm tra chặn họ.
+\end{enumerate}
+\end{quiz}

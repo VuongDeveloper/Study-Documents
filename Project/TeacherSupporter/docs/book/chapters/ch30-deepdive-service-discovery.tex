@@ -1,0 +1,564 @@
+\chapter{Deep Dive: Service Discovery --- Eureka Internals, Failure Modes, and the Kubernetes Alternative}
+\label{ch:dd-discovery}
+
+Chapter~3 explained Eureka in four bullet points --- register, heartbeat,
+cache, self-preserve --- and Chapter~27 sketched its retirement in two
+lines. Between those two lies everything an operator actually meets: the
+timers that decide how long a dead instance keeps receiving traffic, the
+threshold that switches the registry into a mode where it stops telling
+the truth, and the awkward fact that on Kubernetes the project runs two
+discovery systems at once and only one of them is consulted by the
+gateway. This chapter measures those things, breaks them, and then shows
+the exact configuration that removes Eureka without breaking Compose.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{What does a registry solve that DNS does not}, and why
+  did the classic stack put the lookup on the \emph{client}?
+  \item \textbf{How stale can the registry be} --- in seconds, with the
+  arithmetic --- and what does staleness do during a deploy?
+  \item \textbf{What replaces each Eureka feature} when the platform is
+  Kubernetes, and how do you migrate without a flag day?
+\end{enumerate}
+
+\section{Why a registry, and why on the client}
+
+The problem is addressing. Instances have IPs that change with every
+restart; callers need a stable name. Three families of answer exist:
+
+\begin{itemize}
+  \item \textbf{Server-side load balancer.} Callers dial one fixed
+  address (an nginx, an AWS ELB); it knows the instances. Simple for
+  callers, but every hop adds latency and the balancer must itself be
+  kept current.
+  \item \textbf{Client-side registry} (Eureka, Consul). Each instance
+  registers; each caller downloads the list and balances locally. No
+  extra hop, no balancer to scale, callers survive a registry outage on
+  their cache --- and every caller must embed a client library.
+  \item \textbf{Platform DNS} (Kubernetes Services). The platform
+  watches pod readiness and keeps a virtual IP's endpoint list current;
+  callers use plain DNS and know nothing. No library, no registry
+  process, but only inside that platform.
+\end{itemize}
+
+Netflix built the second in 2012 because it ran on EC2 with no platform
+DNS to lean on and thousands of JVM callers that could carry a library.
+Spring Cloud inherited it, and this project inherits it from Spring
+Cloud. That history is the honest answer to ``why Eureka'': not because
+it is the best fit for a Kubernetes cluster in 2026, but because the
+classic stack is still what most Java shops run and what most Java
+interviews ask about.
+
+\begin{decision}[client-side, then platform-side]
+The project keeps Eureka through Compose and the first Kubernetes
+milestones for two reasons: Compose has no readiness-gated DNS, so a
+registry is the only way for the gateway to skip a service that is up
+but not ready; and running both systems side by side is how you learn
+what the platform replaces. The moment Compose stops being a deployment
+target --- it is already only a dev tool --- the registry is pure cost:
+one more JVM, one more startup dependency, and a second opinion about
+which pods are alive that disagrees with the kubelet's for up to four
+minutes. Section~\ref{sec:discovery-enhance} makes the switch.
+\end{decision}
+
+\section{Reading the real configuration}
+
+The server is a port and an annotation. All the behaviour lives in
+defaults the project never sets, so read the client side first:
+
+\begin{lstlisting}[language=yaml]
+# course-service/src/main/resources/application.yml
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/     (*@\co{1}@*)
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/course-service.yaml (env excerpt)
+- { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE,
+    value: "http://discovery-server:8761/eureka/" }  (*@\co{2}@*)
+- { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" } (*@\co{3}@*)
+\end{lstlisting}
+
+And the consumer, the gateway's routes:
+
+\begin{lstlisting}[language=yaml]
+# configurations/api-gateway.yml (excerpt)
+- id: course-service-courses
+  uri: lb://course-service                          (*@\co{4}@*)
+  predicates:
+    - Path=/api/courses/**
+  filters:
+    - StripPrefix=2
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The only address a client is told. Everything else ---
+  where course-service is, where auth-service is --- comes back from
+  this URL as a registry document.
+  \item[\co{2}] On Kubernetes \code{discovery-server} is resolved by
+  \emph{platform DNS} to a ClusterIP. The registry itself is found by
+  the mechanism it is about to duplicate.
+  \item[\co{3}] Register the pod IP, not the pod name (Chapter~3). The
+  registered address is what the gateway will dial, bypassing the
+  \code{course-service} Service entirely.
+  \item[\co{4}] \code{lb://} hands the name to Spring Cloud LoadBalancer,
+  which asks the Eureka client's local cache for instances and picks one
+  round-robin. The Kubernetes Service \code{course-service:8082} is never
+  consulted on this path.
+\end{description}
+
+Point \co{4} is the sentence to remember from this chapter. On the
+cluster, \emph{readiness probes protect the Kubernetes Service, and the
+gateway does not use the Kubernetes Service}. The only thing between
+the gateway and a pod that is not ready is the Eureka status --- which
+the pod reports about itself.
+
+\subsection{The timers}
+
+Everything below is a default the project inherits. Each is a property
+you can set; each has a reason for its value.
+
+\begin{center}
+\begin{tabular}{@{}p{0.44\linewidth}rp{0.36\linewidth}@{}}
+\toprule
+\textbf{Property (\code{eureka.*})} & \textbf{Default} & \textbf{Meaning} \\
+\midrule
+\code{instance.lease-renewal-interval-in-seconds} & 30\,s & heartbeat period \\
+\code{instance.lease-expiration-duration-in-seconds} & 90\,s & no heartbeat for this long = expired \\
+\code{server.eviction-interval-timer-in-ms} & 60\,s & how often the server sweeps expired leases \\
+\code{server.response-cache-update-interval-ms} & 30\,s & server's read-only registry cache refresh \\
+\code{client.registry-fetch-interval-seconds} & 30\,s & client re-downloads the registry \\
+\code{spring.cloud.loadbalancer.cache.ttl} & 35\,s & LoadBalancer's own instance-list cache \\
+\code{server.renewal-percent-threshold} & 0.85 & self-preservation trigger \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Now the arithmetic an interviewer wants.
+
+\textbf{A new instance receiving traffic.} Spring Cloud registers as
+soon as the web server starts (the raw Netflix client would wait 40\,s;
+Spring's \code{EurekaAutoServiceRegistration} forces an on-demand
+registration). The server's read-only cache may be up to 30\,s stale, the
+gateway's registry fetch up to 30\,s behind that, and its LoadBalancer
+cache up to 35\,s behind that. Worst case: about
+\textbf{95 seconds} between ``Tomcat is listening'' and ``the gateway
+knows''. Typical: half that.
+
+\textbf{A dead instance no longer receiving traffic.} The pod is killed
+without a graceful shutdown (OOM, node loss). The lease expires after
+90\,s without a heartbeat; the eviction sweep runs every 60\,s, so up to
+150\,s after death the server still lists it; add the same 30 + 30 +
+35\,s of caches: up to \textbf{245 seconds} --- four minutes --- during
+which the gateway keeps dialing an IP that no longer answers. A graceful
+shutdown sends a DELETE on the way out and skips the first 150\,s, leaving
+up to 95\,s of stale caches.
+
+\textbf{Self-preservation.} Every minute the server compares heartbeats
+received against heartbeats expected: instances $\times$ 2 (one per
+30\,s) $\times$ 0.85. Below the line, it stops evicting anything and the
+dashboard shows the red banner. The project registers five clients:
+expected $5 \times 2 = 10$, threshold $\lfloor 10 \times 0.85 \rfloor =
+8$, and the condition is ``more than 8''. Kill \emph{one} service and
+the count drops to 8 --- not more than 8 --- and the registry enters
+self-preservation. On this stack, a single crashed service means
+\emph{no} instance is ever evicted again until it comes back. Netflix
+tuned that threshold for hundreds of instances, where losing 15\,\% in a
+minute really does mean a network partition; on five, it means Tuesday.
+
+\begin{handson}[watch a dead instance stay alive]
+In Compose, stop course-service without letting it deregister, then
+ask the registry about it a minute later:
+\begin{lstlisting}[language=bash]
+$ docker compose kill course-service
+$ sleep 60
+$ curl -s -H 'Accept: application/json' \
+    http://localhost:8761/eureka/apps/COURSE-SERVICE | \
+    python -c "import sys,json; a=json.load(sys.stdin)['application']; \
+      print([i['status'] for i in a['instance']])"
+['UP']
+\end{lstlisting}
+Now open \code{http://localhost:8761}. After the next sweep, the
+instance is either gone --- or, because four remaining clients send 8
+renewals a minute, the page carries the banner \textsc{emergency! eureka
+may be incorrectly claiming instances are up when they're not}, and
+course-service stays \code{UP} for as long as you care to wait. Meanwhile
+\code{curl localhost:8080/api/courses} returns a 503 from the gateway on
+every attempt that picks the dead address.
+\end{handson}
+
+\section{Pros and cons, honestly}
+
+\begin{itemize}
+  \item \textbf{For.} No extra network hop; callers keep working through
+  a registry outage on their cache; one mechanism that is identical on a
+  laptop, in Compose, and in the cluster; a dashboard that shows who is
+  registered; and an instance can mark itself \code{OUT\_OF\_SERVICE}
+  for a controlled drain.
+  \item \textbf{Against, in this project.} A second source of truth about
+  liveness that lags the kubelet's by up to four minutes; readiness
+  probes bypassed on the gateway path (\co{4} above); self-preservation
+  tuned for a fleet a hundred times larger; a 512\,Mi JVM that does
+  nothing for traffic; \code{prefer-ip-address} as a platform-specific
+  workaround every manifest must carry; and every service compiled
+  against a client library whose upstream is in maintenance mode.
+  \item \textbf{Neutral.} Eureka is AP by design: it prefers answering
+  with stale data to not answering. That is the right choice for a
+  registry --- a caller with a slightly wrong list can retry; a caller
+  with no list can do nothing --- and it is also why every number above
+  is ``up to''.
+\end{itemize}
+
+\section{What breaks}
+
+\begin{pitfall}[rolling deploy, thirty seconds of 503s]
+Symptom: \code{kubectl rollout restart deployment/course-service}
+succeeds, readiness passes, and for half a minute the gateway returns
+\code{503 Service Unavailable} on \code{/api/courses}. Cause: the old
+pod deregistered on SIGTERM and exited; the new pod registered with a
+new IP; but the gateway's LoadBalancer still holds the old IP for up to
+95\,s of cache. The Kubernetes Service switched instantly and nobody
+asked it. Fix, in ascending cost: a \code{preStop} hook that sleeps
+20--30\,s so the old pod keeps answering while caches drain
+(\code{terminationGracePeriodSeconds} must exceed it); shorter caches
+(\code{registry-fetch-interval-seconds: 5},
+\code{spring.cloud.loadbalancer.cache.ttl: 5s}) at the price of
+registry load; or a gateway \code{Retry} filter on connection errors so
+the second attempt lands on the live IP. Or remove the registry from the
+path (Section~\ref{sec:discovery-enhance}) and let the Service do what it
+is for.
+\end{pitfall}
+
+\begin{pitfall}[registered, UP, and returning errors]
+Symptom: the dashboard shows course-service \code{UP}; requests fail
+with database errors. Cause: Eureka status is self-reported, and by
+default it is \code{UP} the moment registration succeeds --- it does not
+consult the actuator health. Flyway may have failed after registration,
+Postgres may have gone away, and the instance still says \code{UP}
+every 30\,s. Fix: \code{eureka.client.healthcheck.enabled: true}
+propagates actuator health to the registry status, so a \code{DOWN}
+health check becomes \code{DOWN} in Eureka on the next heartbeat --- 30\,s
+later, plus caches. Kubernetes readiness would have pulled the pod in
+5\,s; on the gateway path, it did not get the chance.
+\end{pitfall}
+
+\begin{pitfall}[two Eureka replicas, two answers]
+Symptom: after scaling discovery-server to two replicas for
+availability, some callers see an instance the others do not. Cause:
+peers replicate registrations to each other asynchronously; a client
+whose \code{defaultZone} lists both addresses talks to the first that
+answers and may read a replica that has not yet received the
+replication. Each server also counts renewals independently, so one may
+enter self-preservation while the other evicts. Fix: list both peers in
+every client's \code{defaultZone} and in each server's
+\code{defaultZone} (they must register with \emph{each other}), accept
+seconds of inconsistency as the price of AP, and never scale a registry
+you are about to remove.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+The discovery-server pod dies at 3\,a.m.; nothing else does.
+
+\begin{itemize}
+  \item \textbf{Gateway traffic: unaffected.} The gateway's Eureka client
+  keeps its last registry in memory and the LoadBalancer keeps routing
+  to it. The registry fetch fails every 30\,s and logs a warning; the
+  cache does not expire. This is the AP promise kept.
+  \item \textbf{Heartbeats: fail silently.} Every client logs a renewal
+  failure each 30\,s. Nothing else changes; leases are a server concept
+  and the server is gone.
+  \item \textbf{A service restarted during the outage: invisible.} It
+  boots, registration fails, it retries in the background --- and it
+  serves nothing through the gateway until the registry returns and the
+  95\,s of caches drain. Its Kubernetes Service has it as an endpoint
+  within seconds; nobody uses that Service.
+  \item \textbf{A service that died during the outage: still routed to.}
+  No server, no eviction. The gateway keeps the dead IP until the
+  registry is back \emph{and} has evicted it \emph{and} the caches have
+  turned over: the full 245\,s, starting from when the server returns.
+  \item \textbf{When discovery-server returns: a cold registry.} It
+  starts empty. For its first \code{wait-time-in-ms-when-sync-empty}
+  (5 minutes by default) it refuses to serve a registry it considers
+  incomplete, returning what it has; clients re-register on their next
+  heartbeat within 30\,s. Full recovery: about a minute after the pod is
+  Ready.
+\end{itemize}
+
+Compare with the platform path: a Service's endpoint list is maintained
+by the control plane, which is replicated and which every other
+component already depends on. There is no separate 3\,a.m. story for
+Kubernetes DNS because it has no separate process to lose.
+
+\section{Enhancing the resolution}
+\label{sec:discovery-enhance}
+
+The goal: on Kubernetes, route by Service DNS and let readiness probes
+gate traffic; in Compose, keep Eureka so the developer experience is
+unchanged. A Spring profile splits the two, and the config-server serves
+the profile document on top of the base one.
+
+\subsection{Step 1: a profile document for the gateway}
+
+The base \code{api-gateway.yml} keeps its \code{lb://} routes. A new
+\code{api-gateway-k8s.yml} beside it replaces them --- the whole list,
+because YAML lists override by index and a partial override is a trap:
+
+\begin{lstlisting}[language=yaml]
+# configurations/api-gateway-k8s.yml -- served when profile k8s is active
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: auth-service
+          uri: http://auth-service:8081               (*@\co{1}@*)
+          predicates:
+            - Path=/api/auth/**
+          filters:
+            - StripPrefix=2
+        - id: auth-oauth2
+          uri: http://auth-service:8081
+          predicates:
+            - Path=/oauth2/**
+        - id: auth-oauth2-callback
+          uri: http://auth-service:8081
+          predicates:
+            - Path=/login/oauth2/**
+        - id: course-service
+          uri: http://course-service:8082
+          predicates:
+            - Path=/api/courses/**,/api/students/**,/api/assignments/**,/api/enrollments/**,/api/submissions/**
+          filters:
+            - StripPrefix=2
+        - id: dictionary-service
+          uri: http://dictionary-service:8083
+          predicates:
+            - Path=/api/dictionary/**
+          filters:
+            - StripPrefix=2
+      httpclient:
+        connect-timeout: 2000                          (*@\co{2}@*)
+        response-timeout: 10s
+eureka:
+  client:
+    enabled: false                                     (*@\co{3}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A Service name and port. CoreDNS resolves it to the
+  ClusterIP; kube-proxy balances across Ready endpoints. Readiness
+  probes are now on the gateway's path.
+  \item[\co{2}] With no registry to consult, the gateway's only defence
+  against a dead endpoint is a fast connect timeout; kube-proxy will
+  have removed the endpoint within seconds anyway.
+  \item[\co{3}] The Eureka client stays on the classpath but does
+  nothing: no registration, no fetch, no heartbeat warnings. This is
+  what lets one image serve both environments.
+\end{description}
+
+\subsection{Step 2: Feign without the registry}
+
+course-service's \code{AuthServiceClient} resolves \code{auth-service}
+through the LoadBalancer. Give it an optional fixed URL:
+
+\begin{lstlisting}[language=Java]
+// course-service/.../client/AuthServiceClient.java
+@FeignClient(
+        name = "auth-service",
+        url = "${app.clients.auth-service:}",   // empty -> use lb://
+        fallback = AuthServiceFallback.class)
+public interface AuthServiceClient {
+    @GetMapping("/users/{id}")
+    UserDto getUserById(@PathVariable Long id);
+}
+\end{lstlisting}
+
+When \code{url} resolves to an empty string Feign falls back to
+load-balanced resolution by \code{name}; when it resolves to
+\code{http://auth-service:8081} the LoadBalancer is bypassed. The
+profile document for course-service sets it:
+
+\begin{lstlisting}[language=yaml]
+# configurations/course-service-k8s.yml
+app:
+  clients:
+    auth-service: http://auth-service:8081
+eureka:
+  client:
+    enabled: false
+\end{lstlisting}
+
+\subsection{Step 3: the manifests}
+
+The diff against \code{deploy/k8s/base/api-gateway.yaml}; every service
+manifest changes the same way:
+
+\begin{lstlisting}
+ env:
++  - { name: SPRING_PROFILES_ACTIVE, value: "k8s" }
+   - { name: SPRING_CONFIG_IMPORT,
+       value: "configserver:http://config-server:8888" }
+-  - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE,
+-      value: "http://discovery-server:8761/eureka/" }
+-  - { name: EUREKA_INSTANCE_PREFER_IP_ADDRESS, value: "true" }
+\end{lstlisting}
+
+And in \code{kustomization.yaml}:
+
+\begin{lstlisting}
+ resources:
+   - config-server.yaml
+-  - discovery-server.yaml
+   - api-gateway.yaml
+\end{lstlisting}
+
+Compose is untouched: no profile, the base documents, \code{lb://},
+Eureka. The same images run in both. When Compose is finally retired,
+delete \code{spring-cloud-starter-netflix-eureka-client} from every
+\code{pom.xml}, the \code{discovery-server} module, and the base
+documents' \code{lb://} routes --- in that order, each a separate commit
+the pipeline can verify.
+
+\begin{handson}[prove the platform path]
+After applying the profile, confirm the gateway no longer dials pod IPs
+directly --- it dials the Service, whose endpoints follow readiness:
+\begin{lstlisting}[language=bash]
+$ kubectl -n ts get endpoints course-service
+NAME             ENDPOINTS         AGE
+course-service   10.42.0.57:8082   3d
+$ kubectl -n ts rollout restart deployment/course-service
+$ while true; do curl -s -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $TOKEN" \
+    http://ts.local/api/courses; sleep 1; done
+200
+200
+200   # no 503 window: the endpoint switched with readiness
+\end{lstlisting}
+Run the same loop before the change and count the 503s.
+\end{handson}
+
+\section{Outside the project}
+
+Consul is the registry you meet outside the JVM: an agent per host runs
+health checks itself instead of trusting self-reported heartbeats, and
+serves the result over DNS as well as HTTP, so callers need no library.
+Service meshes (Istio, Linkerd) go one step further and put a sidecar
+proxy next to every pod that does discovery, retries, timeouts, and
+mTLS, leaving the application with \code{http://course-service}. In
+Spring, \code{spring-cloud-kubernetes} lets \code{lb://} names resolve
+against the Kubernetes API instead of Eureka --- useful during a
+migration, unnecessary at its end. And AWS Cloud Map, the managed
+descendant of Eureka's idea, exists mostly for ECS, where there is no
+kube-proxy to make it redundant.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: Your gateway keeps sending traffic to an instance that
+died ninety seconds ago. Why, and how do you cut that down?}
+
+Because nothing on the path noticed. Eureka learns of an ungraceful
+death only by a missing heartbeat: 90\,s lease expiry, then a sweep that
+runs every 60\,s, then a 30\,s server cache, a 30\,s client fetch, and a
+35\,s LoadBalancer cache --- up to four minutes end to end, and if the
+registry has slipped into self-preservation, forever. First cut the
+tail: shorten \code{registry-fetch-interval-seconds} and the
+LoadBalancer TTL to 5\,s, which costs registry traffic you can afford
+below a few hundred instances. Then cut the head: make death graceful
+(SIGTERM handling, \code{terminationGracePeriodSeconds} long enough) so
+the DELETE goes out and the 150\,s of lease logic never runs. Then make
+the caller resilient regardless: a \code{Retry} filter on connect
+failures, so a stale address costs one retry, not an error. The senior
+answer ends with ``or stop routing by registry on Kubernetes, because
+kube-proxy removes the endpoint within seconds of the readiness probe
+failing''.
+
+\subsection*{Q: How does a new instance start receiving traffic during a
+rolling deploy with zero errors?}
+
+Two conditions and an overlap. The new instance must not receive
+traffic before it can serve: on Kubernetes that is the readiness
+probe, on Eureka it is registering only after the context is fully up
+--- Spring does this, but a health check that passes before Flyway
+finishes would not, so probe something that depends on the database.
+The old instance must keep serving until every caller has stopped
+sending: on Kubernetes the endpoint is removed at SIGTERM but in-flight
+requests finish inside the grace period, and a \code{preStop} sleep
+covers callers with stale caches. The overlap is
+\code{maxSurge: 1, maxUnavailable: 0}: bring the new one up, wait for
+Ready, then take the old one down. Errors during a rollout are almost
+always one of three things --- a probe that lies, a cache that
+outlives the pod, or a grace period shorter than the slowest request
+--- and you name which one from the shape of the error.
+
+\subsection*{Q: Eureka versus Kubernetes DNS. One minute.}
+
+Both map a name to a set of addresses; they differ in who maintains the
+set and who does the lookup. Eureka: the instances register themselves,
+report their own health, and every caller carries a client that
+downloads and caches the list --- no platform needed, works on VMs,
+AP with minutes of staleness, and every caller is a JVM with a
+library. Kubernetes: the control plane maintains a Service's endpoints
+from label selectors and readiness probes it runs itself, kube-proxy
+balances, callers use DNS and know nothing --- seconds of staleness,
+no library, no registry process, but only inside the cluster. On
+Kubernetes, Eureka is a second, slower opinion about liveness. Keep it
+only if you must run the same code somewhere the platform is not.
+
+\subsection*{Q: You run two Eureka replicas and they disagree about
+whether an instance is alive. What now?}
+
+Expect it; design for it. Peer replication is asynchronous and each
+replica evicts and self-preserves on its own counters, so a window of
+disagreement is inherent --- Eureka is AP and the disagreement is the
+cost of answering during a partition. What matters is that clients
+tolerate it: every client lists both replicas, retries the second on
+failure, and treats the registry as a hint that a connect timeout can
+override. If the disagreement persists past a few minutes, one replica
+is in self-preservation and the other is not; check the renewal
+threshold against the actual instance count, and on a small fleet
+lower \code{renewal-percent-threshold} or disable self-preservation
+outright. The wrong answer is trying to make the registry consistent;
+the right one is making callers indifferent to which replica they read.
+
+\subsection*{Q: Two hundred services, each fetching the registry every
+thirty seconds. The registry is melting. What do you change?}
+
+Four hundred fetches a minute of a document listing two hundred
+applications is the first bottleneck, and Eureka's answer is delta
+fetches: clients ask for \code{/apps/delta} after the first full
+download, which is on by default and only fails when the server's
+delta queue is disabled. Second, the read-only response cache exists
+precisely so the server serializes the registry once per 30\,s, not
+once per request --- keep it. Third, split by zone: Eureka's
+\code{availability-zone} configuration lets clients prefer a local
+registry and a local instance, so each server carries a fraction of
+the fetches. Beyond a thousand instances, Netflix's own answer was
+more Eureka servers behind DNS, and today's answer is that at that
+size you are on a platform that does discovery for you.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Compute the worst-case delay before the gateway routes to a
+  freshly started course-service pod, naming each cache in the chain
+  and its default.
+  \item An instance is killed by the OOM killer. List the timers that
+  must elapse before the gateway stops dialing it, and state which of
+  them a graceful shutdown would skip.
+  \item With five registered clients, show why the loss of one puts the
+  registry into self-preservation, and give the one-line configuration
+  that changes that on a small fleet.
+  \item On Kubernetes, which mechanism gates traffic to a pod on the
+  gateway path today, and why do readiness probes not? What single
+  configuration change puts readiness back on the path?
+  \item After \code{eureka.client.enabled: false} under the \code{k8s}
+  profile, explain how the same course-service image still registers
+  with Eureka in Compose, and what \code{url = "\${app.clients.auth-service:}"}
+  does in each environment.
+  \item Interview: ``Why does a registry keep serving a dead instance
+  while a Kubernetes Service does not?'' Answer in terms of who
+  observes liveness and how.
+\end{enumerate}
+\end{quiz}

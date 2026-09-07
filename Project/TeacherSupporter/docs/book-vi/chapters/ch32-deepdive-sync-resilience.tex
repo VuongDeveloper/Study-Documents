@@ -1,0 +1,694 @@
+\chapter{Đào sâu: Gọi đồng bộ --- OpenFeign, Resilience4j và lỗi dây chuyền}
+\label{ch:dd-resilience}
+
+Chương~6 vạch ranh giới giữa hai cách service nói chuyện: HTTP khi bên
+gọi cần câu trả lời ngay, sự kiện khi nó cần một sự thật được ghi
+nhận. Chương này ở lại phía HTTP và hỏi câu hỏi mà mọi hệ thống phân
+tán rồi cũng hỏi lúc 3 giờ sáng: khi service tôi đang gọi chậm, chuyện
+gì xảy ra với \emph{tôi}? Dự án có đúng thư viện trên classpath ---
+OpenFeign cho lời gọi, Resilience4j cho sự bảo vệ --- và, như bạn sẽ
+thấy, đã nối chúng theo cách không bảo vệ được gì. Điều đó khiến nó
+thành ca dạy học tốt hơn một ca hoàn chỉnh.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Một lời gọi đồng bộ tốn gì} ngoài độ trễ của nó --- và
+  vì sao một phụ thuộc chậm tệ hơn một phụ thuộc chết?
+  \item \textbf{Circuit breaker quyết định thế nào}, với các con số
+  thật của dự án, và timeout, retry và breaker tương tác ra sao?
+  \item \textbf{Fallback nên trả về gì}, và khi nào lời gọi không nên
+  tồn tại?
+\end{enumerate}
+
+\section{Vì sao Feign, và nó giải quyết gì}
+
+course-service thỉnh thoảng cần biết một user là ai --- một cái tên để
+in lên bài nộp, một vai trò để kiểm tra. auth-service sở hữu dữ liệu
+đó. Các lựa chọn là: gọi auth-service qua HTTP, chép dữ liệu sang
+course-service qua sự kiện, hoặc đặt cả hai vào một cơ sở dữ liệu. Dự
+án giữ các cơ sở dữ liệu tách biệt (Chương~7) và dành sự kiện cho các
+sự thật đã xảy ra; tra cứu theo id là một câu hỏi, nên nó là một lời
+gọi.
+
+OpenFeign biến lời gọi đó thành một interface:
+
+\begin{lstlisting}[language=Java]
+@FeignClient(name = "auth-service",
+             fallback = AuthServiceFallback.class)          (*@\co{1}@*)
+public interface AuthServiceClient {
+
+    @GetMapping("/users/{id}")                              (*@\co{2}@*)
+    UserDto getUserById(@PathVariable("id") Long id);        (*@\co{3}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{name} là tên ứng dụng trên Eureka. Feign hỏi
+  discovery client các instance của \code{auth-service} và cân bằng
+  tải giữa chúng ở phía client --- không gateway, không host cứng.
+  \code{fallback} nêu tên lớp sẽ được gọi thay khi lời gọi thất bại.
+  Giữ ý đó lại.
+  \item[\co{2}] Cùng các annotation Spring MVC như một controller, đọc
+  ngược lại: đây là thứ cần \emph{gửi}. Path là của chính service
+  (\code{/users/\{id\}}), không phải của gateway
+  (\code{/api/auth/users}), vì lời gọi service-tới-service bỏ qua
+  gateway.
+  \item[\co{3}] Kiểu trả về là một record từ \code{common}. Record đó
+  là \emph{hợp đồng}: auth-service phải sinh JSON giải tuần tự được
+  thành nó.
+\end{description}
+
+Thứ Feign giải quyết là mã lặp và sự ràng buộc vào địa chỉ. Thứ nó
+không giải quyết là tính chất duy nhất quan trọng dưới tải: mỗi lời gọi
+giữ một thread Tomcat trong course-service lâu bằng thời gian
+auth-service cần để trả lời.
+
+\begin{decision}[một lời gọi, không phải một bản sao --- tạm thời]
+Với một tra cứu theo id hiếm khi xảy ra và câu trả lời hiếm khi đổi,
+một lời gọi là thứ đúng đơn giản nhất, và Feign làm nó trong hai dòng.
+Quyết định sẽ lật khi bất kỳ điều nào trong ba điều thành sự thật: tra
+cứu nằm trên đường nóng (mọi danh sách khóa học cần tên giáo viên), dữ
+liệu cần có trong lúc auth-service chết (chấm bài không được dừng vì
+đăng nhập hỏng), hoặc hình dạng của \code{UserDto} bắt đầu đổi theo các
+bản phát hành của auth-service. Khi đó course-service nên giữ bản sao
+riêng của những trường nó cần, nuôi bằng các sự kiện auth-service đã
+phát (\code{ts.user.registered}, \code{ts.user.activated}) --- mẫu mà
+Chương~7 đã áp dụng cho học sinh.
+\end{decision}
+
+\section{Hợp đồng trong \code{common}, và rủi ro phiên bản của nó}
+
+\code{UserDto} là một record với năm trường: \code{id}, \code{email},
+\code{firstName}, \code{lastName}, \code{role}. \code{UserController}
+của auth-service không trả về nó --- nó trả về \code{UserResponse} của
+riêng mình. Hai lớp hôm nay khớp nhau nhờ trùng hợp tên trường, và mặc
+định bỏ qua thuộc tính lạ của Jackson che đi khoảng hở: auth-service
+có thể thêm trường thoải mái, và course-service sẽ không nhận ra. Nó
+\emph{sẽ} nhận ra một lần đổi tên. Đổi \code{firstName} thành
+\code{givenName} trong \code{UserResponse} biên dịch được ở cả hai
+phía, deploy được ở cả hai phía, và để course-service đọc tên là
+\code{null} --- không ngoại lệ, không dòng log. Phiên bản phỏng vấn:
+``bạn đánh phiên bản một API nội bộ thế nào?'' và câu trả lời là: chỉ
+thay đổi có tính bổ sung, không bao giờ đổi tên hay xóa; DTO của bên
+tiêu thụ bỏ qua thuộc tính lạ; một consumer-driven contract test
+(Spring Cloud Contract, Pact) trong build của auth-service thất bại khi
+\code{UserResponse} không còn thỏa \code{UserDto}. Phiên bản trong URL
+(\code{/v2/users}) dành cho thay đổi phá vỡ không tránh được, và nó
+nghĩa là chạy cả hai chừng nào còn bên tiêu thụ nào chưa theo kịp.
+
+\section{Circuit breaker, với các con số của dự án}
+\label{sec:cb-math}
+
+Breaker của Resilience4j là một máy trạng thái trên một \emph{cửa sổ
+trượt} các kết quả gọi gần đây. Cấu hình của dự án trong
+\code{course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+resilience4j:
+  circuitbreaker:
+    instances:
+      authService:
+        sliding-window-size: 10                    (*@\co{1}@*)
+        failure-rate-threshold: 50                 (*@\co{2}@*)
+        wait-duration-in-open-state: 10s           (*@\co{3}@*)
+        permitted-number-of-calls-in-half-open-state: 3  (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{figure}[htb]
+\centering
+\begin{tikzpicture}[node distance=13mm and 14mm]
+  \node[boxfill] (closed) {CLOSED\\lời gọi đi qua, kết quả được ghi};
+  \node[boxdark, right=of closed] (open) {OPEN\\từ chối tức thì};
+  \node[box, below=of $(closed)!0.5!(open)$] (half) {HALF\_OPEN\\3 lời gọi thử};
+  \draw[flow] (closed) -- node[lbl,above]{$\ge$5 trong 10 lỗi} (open);
+  \draw[flow] (open.east) -- ++(6mm,0) |- node[lbl,above,pos=0.75]{sau 10\,s} (half.east);
+  \draw[flow] (half.north west) -- node[lbl,above,sloped]{thử ổn} (closed.south);
+  \draw[flowdash] (half.north east) -- node[lbl,above,sloped]{thử lỗi} (open.south);
+\end{tikzpicture}
+\caption{Ba trạng thái của breaker với các ngưỡng của dự án này. Lời
+gọi bị từ chối ở OPEN đi tới fallback mà không chạm mạng.}
+\label{fig:cb-states}
+\end{figure}
+
+\begin{description}
+  \item[\co{1}] Cửa sổ giữ 10 kết quả gần nhất (theo số lượng; phương
+  án kia là theo thời gian, ``60 giây gần nhất''). Breaker không đánh
+  giá cho tới khi cửa sổ có đủ \code{minimum-number-of-calls} kết quả
+  --- không đặt ở đây, nên mặc định bằng cỡ cửa sổ. Dịch ra: 9 lời gọi
+  đầu sau khởi động có thể \emph{toàn bộ} thất bại mà breaker vẫn
+  CLOSED.
+  \item[\co{2}] Ở 10 kết quả, nếu 5 trở lên thất bại, breaker mở. Một
+  ``thất bại'' là một ngoại lệ breaker không bỏ qua. Để ý thứ
+  \emph{không} được cấu hình: \code{slow-call-duration-threshold}. Mặc
+  định của nó là 60\,s, nên một lời gọi mất 30\,s là một \emph{thành
+  công} với breaker này. Phụ thuộc chậm --- trường hợp phổ biến ---
+  không bao giờ làm nó nhảy.
+  \item[\co{3}] OPEN trong 10\,s: mọi lời gọi bị từ chối bằng
+  \code{CallNotPermittedException} trong micro giây và chuyển tới
+  fallback. auth-service được nghỉ 10 giây.
+  \item[\co{4}] Rồi HALF\_OPEN: 3 lời gọi được cho qua làm thăm dò. Nếu
+  tỷ lệ thất bại của chúng $\ge$ 50\,\% (2 trong 3), quay lại OPEN thêm
+  10\,s; nếu không, CLOSED với cửa sổ mới.
+\end{description}
+
+Giờ tới phần khiến chương này thẳng thắn. Instance \code{authService}
+đó không gắn với \emph{gì cả}. Không phương thức nào mang
+\code{@CircuitBreaker(name = "authService")}, và tích hợp riêng của
+Feign --- thứ sẽ bọc \code{getUserById} trong một breaker tên
+\code{AuthServiceClient\#getUserById(Long)} --- đang tắt, vì công tắc
+\code{openfeign.circuitbreaker.enabled} mặc định là \code{false}, và
+starter cung cấp \code{CircuitBreakerFactory} nó cần (starter
+\code{circuitbreaker-resilience4j}) không có trên classpath. Với công
+tắc đó tắt, thuộc tính \code{fallback} ở \co{1} bị lặng lẽ bỏ qua. Và
+\code{AuthServiceClient} hôm nay không được gọi từ lớp service nào. Dự
+án có một breaker cấu hình cho một lời gọi không xảy ra, bảo vệ không
+gì cả, với một fallback sẽ không chạy. Đó là mẫu vật hoàn hảo của cách
+khả năng chịu lỗi thường bị cấu hình sai trong production: mọi mảnh có
+mặt, không mảnh nào được nối.
+
+\section{Timeout xếp chồng}
+
+Khi lời gọi được nối đúng, ba bộ đếm giờ bao quanh nó, và chúng phải
+được sắp thứ tự nếu không các bộ bên ngoài chỉ là trang trí.
+
+\begin{itemize}
+  \item \textbf{Timeout socket của Feign.} \code{connectTimeout} và
+  \code{readTimeout} trên HTTP client. Không đặt trong dự án, nên mặc
+  định áp dụng: 10\,s để kết nối, \textbf{60\,s} để đọc. Một
+  auth-service treo ghim một thread course-service suốt một phút.
+  \item \textbf{TimeLimiter của Resilience4j.} Một hạn chót cho toàn
+  bộ lời gọi được bọc, độc lập với socket. Nó chỉ áp dụng cho kiểu trả
+  về bất đồng bộ (\code{CompletableFuture}), đó là lý do lời gọi Feign
+  đồng bộ phải dựa vào timeout socket.
+  \item \textbf{Hạn chót của bên gọi.} \code{response-timeout} của
+  gateway (Chương~31), và phía sau nó là sự kiên nhẫn của trình duyệt.
+  Nếu gateway bỏ cuộc ở 5\,s trong khi Feign đợi 60\,s, người dùng thấy
+  lỗi ở 5\,s và course-service giữ một thread bận thêm 55 giây để phục
+  vụ không ai.
+\end{itemize}
+
+Quy tắc: timeout của mỗi chặng \emph{ngắn hơn} chặng trước nó. Trình
+duyệt 10\,s $>$ gateway 5\,s $>$ Feign read của course-service 2\,s.
+Một timeout nổ bên trong một request đã bị bỏ rơi là công sức lãng
+phí; một timeout nổ muộn hơn của bên gọi là một chỗ rò.
+
+\section{Retry: chỉ cho lời gọi lặp lại được}
+
+\code{@Retry} của Resilience4j phát lại một lời gọi thất bại. Trên
+\code{GET /users/\{id\}} thì vô hại: đọc hai lần cũng như đọc một lần.
+Trên \code{POST /enrollments} thì là một lần ghi danh trùng, vì timeout
+không cho bạn biết request đầu đã được xử lý hay chưa. Vì thế retry chỉ
+dành cho thao tác \emph{lũy đẳng} (idempotent), hoặc thao tác được làm
+cho lũy đẳng bằng một khóa client cung cấp mà server khử trùng lặp
+theo đó. Thêm hai quy tắc từ production: retry với \emph{lùi theo hàm
+mũ có jitter}, nếu không mọi client retry cùng một khoảnh khắc và đợt
+sóng thứ hai lớn hơn đợt đầu (``bão retry''); và retry \emph{bên trong}
+breaker, để một breaker đang mở chặn retry ngay từ đầu. Thứ tự aspect
+mặc định của Resilience4j --- Retry ngoài cùng, rồi CircuitBreaker,
+rồi TimeLimiter, rồi Bulkhead --- làm đúng điều này: mỗi lần retry đi
+qua breaker, và lời gọi bị từ chối thì không được retry.
+
+\section{Bulkhead: giới hạn vùng nổ}
+
+Bulkhead giới hạn số lời gọi đồng thời được phép đang bay tới một phụ
+thuộc. Bulkhead semaphore: một bộ đếm; lời gọi đồng thời thứ 26 bị từ
+chối ngay. Bulkhead thread pool: lời gọi chạy trên một pool riêng để
+thread của bên gọi không bao giờ là kẻ đứng chờ --- cần thiết với một
+ứng dụng servlet có pool Tomcat hữu hạn. course-service chạy Tomcat với
+200 thread. Không có bulkhead, 200 lời gọi auth-service chậm tiêu sạch
+từng thread, và course-service không trả lời nổi một probe sức khỏe,
+nói gì tới danh sách khóa học. Với bulkhead semaphore 25, tối đa 25
+thread từng chờ auth-service và 175 còn lại cho mọi thứ khác. Đó là sự
+cô lập mà tiêu đề chương hứa hẹn.
+
+\section{Fallback trả về gì}
+
+\begin{lstlisting}[language=Java]
+@Component
+public class AuthServiceFallback implements AuthServiceClient {
+    @Override
+    public UserDto getUserById(Long id) {
+        return null;                                       (*@\co{1}@*)
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một \code{null} mà bên gọi phải nhớ kiểm tra. Mọi nơi
+  tiêu thụ \code{getUserById} giờ có một nhánh ẩn, và một lần quên kiểm
+  tra là một \code{NullPointerException} chỉ nổ khi auth-service chết
+  --- đúng lúc bạn ít muốn một lỗi mới nhất.
+\end{description}
+
+Một fallback có bốn lựa chọn trung thực, theo thứ tự ưu tiên: một giá
+trị \emph{đã cache} từ lời gọi thành công gần nhất (cũ nhưng thật);
+một giá trị \emph{suy giảm} mà UI hiển thị được (``Giáo viên không
+rõ'') và được định kiểu rõ là như vậy; một kết quả \emph{rỗng} nơi
+miền cho phép; hoặc một \emph{lỗi có kiểu} mà bên gọi ánh xạ được thành
+503 với \code{Retry-After}. \code{null} không phải cái nào trong số đó.
+Nó là sự vắng mặt của một quyết định, đẩy sang mọi bên gọi. Fallback
+cũng cần \emph{nguyên nhân}: một phương thức fallback hai tham số
+(\code{Throwable last}) phân biệt được một lần breaker từ chối với một
+404, và 404 --- user không tồn tại --- \emph{không} được biến thành
+``thử lại sau''.
+
+\section{Ưu và nhược, thẳng thắn}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.46\linewidth}p{0.46\linewidth}@{}}
+\toprule
+Dự án có gì & Thiếu gì \\
+\midrule
+Client khai báo, phân giải qua Eureka & Client không bao giờ được gọi \\
+Một instance breaker với ngưỡng hợp lý & Không gì gắn vào nó; công tắc breaker của Feign đang tắt \\
+Một lớp fallback đã đăng ký & Bị bỏ qua; và nó trả về \code{null} \\
+Resilience4j trên classpath & Không timeout, không retry, không bulkhead, không ngưỡng chậm \\
+Actuator đã mở & Endpoint breaker không nằm trong danh sách mở \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Và thêm một khoảng hở không liên quan tới khả năng chịu lỗi:
+\code{SecurityConfig} của auth-service chỉ cho phép các đường dẫn công
+khai; \code{/users/\{id\}} cần một ngữ cảnh đã xác thực, thứ
+\code{GatewayHeaderAuthFilter} của nó dựng từ \code{X-User-Id}. Feign
+không gửi header nào như vậy. Lời gọi, một khi được nối, sẽ trả 401 ở
+mọi lần thử --- và 401 là một ngoại lệ, nên mười lần sẽ mở breaker
+chống lại một service hoàn toàn khỏe mạnh.
+
+\section{Cái gì gãy}
+
+\begin{pitfall}[fallback không bao giờ chạy]
+Triệu chứng: auth-service bị dừng, và thay vì \code{null} của fallback,
+course-service ném \code{FeignException} với stack trace xuyên qua load
+balancer, và request trả về 500. Nguyên nhân:
+\code{@FeignClient(fallback = ...)} chỉ được tôn trọng khi
+\code{spring.cloud.openfeign.circuitbreaker.enabled=true} \emph{và} có
+một bean \code{CircuitBreakerFactory}, thứ cần dependency
+\code{spring-cloud-starter-circuitbreaker-resilience4j}. Thiếu một
+trong hai, Spring không log gì và thuộc tính trở nên trơ. Sửa ở
+Mục~\ref{sec:res-enhance}.
+\end{pitfall}
+
+\begin{pitfall}[service khỏe, breaker mở]
+Triệu chứng: sau một lần deploy auth-service, breaker của course-service
+mở và cứ mở, quay vòng OPEN $\to$ HALF\_OPEN $\to$ OPEN, dù
+auth-service trả lời \code{curl} bình thường. Nguyên nhân: mọi lời gọi
+nhận 401 (thiếu header danh tính), hoặc 404 cho một user đã xóa, và cả
+hai đều tính là thất bại. Sửa: lan truyền danh tính trên lời gọi
+service-tới-service (một \code{RequestInterceptor}, bên dưới), và bảo
+breaker ngoại lệ nào \emph{không} phải lỗi phụ thuộc bằng
+\code{ignore-exceptions} --- lỗi phía client nghĩa là request sai, không
+phải service chết.
+\end{pitfall}
+
+\begin{pitfall}[thread 60 giây]
+Triệu chứng: auth-service treo (deadlock, GC kẹt); CPU của
+course-service rảnh, vậy mà nó ngừng trả lời \emph{mọi} request, và
+readiness probe của nó thất bại nên Kubernetes ngừng route tới nó.
+Nguyên nhân: read timeout mặc định 60\,s của Feign nhân với 200 thread
+của Tomcat. Mỗi tra cứu treo giữ một thread một phút; với tốc độ
+request vừa phải, mọi thread đều đứng chờ trong vài giây. Breaker không
+giúp được --- với ngưỡng chậm mặc định, lời gọi treo không phải thất
+bại cho tới khi hết timeout. Sửa: read timeout 2\,s, một ngưỡng chậm,
+và bulkhead 25.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Postgres của auth-service bắt đầu một đợt vacuum dài;
+\code{/users/\{id\}} đi từ 20\,ms lên 2\,s. Giả sử lời gọi Feign đã
+được nối vào endpoint danh sách khóa học, như thiết kế của dự án mời
+gọi, và không gì khác thay đổi.
+
+\begin{enumerate}
+  \item Mỗi danh sách khóa học giờ mất 2\,s thay vì 20\,ms. Thread
+  Tomcat trong course-service bận lâu hơn 100$\times$ cho mỗi request.
+  \item Ở 50 danh sách mỗi giây, 100 thread đang chờ auth-service tại
+  bất kỳ thời điểm nào. Ở 100 mỗi giây, cả 200 đều chờ, và request xếp
+  hàng trong backlog accept của Tomcat.
+  \item Readiness probe của course-service (\code{/actuator/health}
+  thậm chí không được mở ở đây --- Chương~17 dùng probe TCP) vẫn qua,
+  vì socket vẫn nhận kết nối. Gateway tiếp tục gửi lưu lượng.
+  \item Connection pool của gateway tới course-service đầy; route
+  \code{/api/courses} của nó suy giảm cho tất cả mọi người, kể cả các
+  request chưa từng cần auth-service. Chuỗi lỗi của Chương~31 bắt đầu
+  cao hơn một chặng.
+  \item auth-service, trong khi đó, nhận 100 request mỗi giây từ một
+  bên gọi sẽ vứt câu trả lời sau timeout của gateway --- tải khiến sự
+  tranh chấp của đợt vacuum tệ hơn.
+  \item Breaker không bao giờ mở: 2\,s dưới mặc định chậm 60\,s, và
+  không lời gọi nào thất bại. Cơ chế duy nhất có thể cắt tải đang nhìn
+  vào sai tín hiệu.
+\end{enumerate}
+
+Với cấu hình bên dưới: lời gọi bị cắt ở 2\,s (Feign read timeout) và
+tính là chậm trên 1\,s; sau mười kết quả với $\ge$80\,\% chậm, breaker
+mở; danh sách trả về với tên giáo viên đã cache hoặc suy giảm dưới một
+mili giây; tối đa 25 thread từng đứng chờ; tải của auth-service giảm
+còn ba lời gọi thăm dò mỗi mười giây; và thay đổi trạng thái của
+breaker nằm trên một dashboard.
+
+\section{Nâng cấp giải pháp}
+\label{sec:res-enhance}
+
+Dependency trước: thêm \code{spring-cloud-starter-circuitbreaker-resilience4j}
+vào POM của course-service (nó mang tới \code{CircuitBreakerFactory} mà
+Feign cần; \code{resilience4j-spring-boot3} giữ lại cho annotation và
+metric). Rồi \code{course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    openfeign:
+      circuitbreaker:
+        enabled: true                            (*@\co{1}@*)
+      client:
+        config:
+          auth-service:                          (*@\co{2}@*)
+            connect-timeout: 1000
+            read-timeout: 2000
+            logger-level: basic
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      authService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 1s         (*@\co{3}@*)
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true          (*@\co{4}@*)
+        ignore-exceptions:                       (*@\co{5}@*)
+          - feign.FeignException.NotFound
+          - feign.FeignException.BadRequest
+  retry:
+    instances:
+      authService:
+        max-attempts: 3                          (*@\co{6}@*)
+        wait-duration: 200ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
+        retry-exceptions:
+          - java.net.SocketTimeoutException
+          - feign.RetryableException
+        ignore-exceptions:
+          - feign.FeignException.FeignClientException
+  bulkhead:
+    instances:
+      authService:
+        max-concurrent-calls: 25                 (*@\co{7}@*)
+        max-wait-duration: 0
+  timelimiter:
+    instances:
+      authService:
+        timeout-duration: 3s                     (*@\co{8}@*)
+        cancel-running-future: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,circuitbreakers,circuitbreakerevents
+  health:
+    circuitbreakers:
+      enabled: true
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Công tắc khiến \code{fallback = ...} thành thật. Feign
+  giờ bọc mỗi phương thức trong một breaker tên
+  \code{AuthServiceClient\#getUserById(Long)}; các annotation tường
+  minh bên dưới dùng instance \code{authService} cho chính sách phía
+  bên gọi.
+  \item[\co{2}] Timeout theo từng client, khóa theo \code{name} của
+  Feign. Hai giây là rộng rãi cho một tra cứu theo id bình thường mất
+  20\,ms, và ngắn hơn hẳn 5\,s của gateway.
+  \item[\co{3}] Chậm giờ được tính. Trên 1\,s là ``chậm hơn thiết kế'';
+  khi 80\,\% cửa sổ là chậm, breaker mở dù mọi lời gọi rồi cũng thành
+  công.
+  \item[\co{4}] Trạng thái breaker xuất hiện trong
+  \code{/actuator/health} và dưới dạng một gauge Micrometer
+  (\code{circuitbreaker.state}) --- thứ bạn đặt cảnh báo.
+  \item[\co{5}] Một user không tồn tại là một câu trả lời, không phải
+  sự cố. Phản hồi 4xx không tính là thất bại cũng không kích hoạt
+  fallback.
+  \item[\co{6}] Ba lần thử với 200\,ms, rồi 400\,ms, mỗi lần jitter
+  $\pm$50\,\%. Chỉ lỗi vận chuyển được retry; bất kỳ HTTP 4xx nào là
+  chung cuộc. Tổng trường hợp xấu nhất:
+  $3 \times 2\,\text{s} + 0{,}6\,\text{s}$, vẫn có giới hạn và vẫn dưới
+  một phút --- nhưng dài hơn 5\,s của gateway, đó là lý lẽ cho tối đa 2
+  lần thử trên đường request và 3 chỉ trong công việc nền.
+  \item[\co{7}] Hai mươi lăm thread được phép chờ auth-service; lời gọi
+  thứ 26 thất bại ngay với \code{BulkheadFullException} và đi
+  fallback. \code{max-wait-duration: 0} nghĩa là không xếp hàng --- xếp
+  hàng chính là thứ ta đang tránh.
+  \item[\co{8}] Chỉ dùng bởi biến thể \code{CompletableFuture} bên
+  dưới; vô hại nếu không.
+\end{description}
+
+Lớp bọc phía service, với lan truyền danh tính và một fallback nói rõ
+nó là gì:
+
+\begin{lstlisting}[language=Java]
+/** Forwards the caller's identity on service-to-service calls so
+ *  auth-service's GatewayHeaderAuthFilter accepts them. */
+@Configuration
+public class FeignIdentityConfig {
+    @Bean
+    public RequestInterceptor identityPropagation() {
+        return template -> {
+            var auth = SecurityContextHolder.getContext()
+                    .getAuthentication();
+            if (auth != null && auth.getPrincipal() instanceof Long id) {
+                template.header(JwtConstants.HEADER_USER_ID, id.toString());
+                auth.getAuthorities().stream().findFirst().ifPresent(a ->
+                    template.header(JwtConstants.HEADER_USER_ROLE,
+                        a.getAuthority().replace("ROLE_", "")));
+            }
+        };
+    }
+}
+
+/** The one place course-service asks who a user is. */
+@Service
+@RequiredArgsConstructor
+public class UserLookupService {
+
+    private final AuthServiceClient authServiceClient;
+    private final Map<Long, UserDto> lastKnown =
+            new ConcurrentHashMap<>();                     (*@\co{1}@*)
+
+    @Retry(name = "authService")
+    @CircuitBreaker(name = "authService", fallbackMethod = "degraded")
+    @Bulkhead(name = "authService")
+    public UserDto findUser(Long id) {
+        UserDto user = authServiceClient.getUserById(id);
+        lastKnown.put(id, user);
+        return user;
+    }
+
+    /** Same signature plus the cause; called for breaker rejections,
+     *  bulkhead rejections, timeouts and 5xx -- never for 4xx. */
+    private UserDto degraded(Long id, Throwable cause) {   (*@\co{2}@*)
+        UserDto cached = lastKnown.get(id);
+        if (cached != null) {
+            return cached;                                 // stale, real
+        }
+        return new UserDto(id, null, "Unknown", "user", null);
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một cache giá-trị-tốt-gần-nhất. Với một replica, một
+  map là đủ; với nhiều replica, cùng ý tưởng đó thuộc về Redis với TTL,
+  hoặc --- cách sửa thật --- một bảng cục bộ nuôi bằng sự kiện user.
+  \item[\co{2}] Fallback có kiểu và nhìn thấy được: bên gọi nhận một
+  \code{UserDto} có tên nói ``Unknown'', không bao giờ \code{null}.
+  \code{Throwable} cho bạn log \emph{vì sao} (breaker mở hay timeout)
+  ở mức WARN một lần mỗi lần đổi trạng thái thay vì mỗi lời gọi.
+\end{description}
+
+Các metric cần theo dõi, tất cả đã xuất sang Prometheus bởi thiết lập
+Actuator sẵn có: \code{resilience4j\_circuitbreaker\_state} (một gauge
+theo từng trạng thái từng instance; cảnh báo khi \code{state="open"}
+bằng 1 quá một phút), \code{resilience4j\_circuitbreaker\_calls\_seconds}
+theo \code{kind} (successful, failed, ignored) cho tốc độ,
+\code{resilience4j\_bulkhead\_available\_concurrent\_calls} tiến về
+không như chỉ báo sớm, và \code{http\_client\_requests\_seconds} của
+chính Feign cho độ trễ thô đã khởi đầu tất cả.
+
+\begin{decision}[khi nào lời gọi không nên tồn tại]
+Giữ lời gọi đồng bộ chừng nào nó nằm ngoài đường nóng, hiếm, và chịu
+được câu trả lời cũ. Thay nó bằng bản sao cục bộ nuôi bằng sự kiện khi
+một trang danh sách cần nó (độ trễ và ràng buộc), khi việc chấm bài
+phải chạy trong lúc auth-service chết (tính sẵn sàng), hoặc khi hai đội
+phát hành theo nhịp khác nhau (trôi hợp đồng). Thay nó bằng một cache
+TTL ngắn đặt trước lời gọi khi dữ liệu nóng nhưng không được cũ quá một
+phút và nhất quán cuối cùng qua sự kiện không đáng một consumer mới.
+Bản năng senior là đếm số phụ thuộc đồng bộ trên mỗi request và coi mỗi
+cái là một phép nhân xác suất lỗi: ba phụ thuộc 99,9\,\% nối tiếp là
+một endpoint 99,7\,\%.
+\end{decision}
+
+\begin{handson}[xem breaker mở]
+Với phần nâng cấp đã áp dụng và stack đang chạy, dừng auth-service và
+gọi một endpoint dùng \code{UserLookupService} mười hai lần:
+\begin{lstlisting}[language=bash]
+$ docker compose stop auth-service
+$ for i in $(seq 1 12); do
+    curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+      -H "Authorization: Bearer $TOKEN" \
+      http://localhost:8080/api/courses/courses/1
+  done
+200 1.04s   ... (10 slow lines: retries then fallback)
+200 0.01s   <- breaker open: fallback without a network call
+200 0.01s
+$ curl -s http://localhost:8082/actuator/circuitbreakers | jq
+{ "circuitBreakers": { "authService": {
+    "failureRate": "100.0%", "slowCallRate": "0.0%",
+    "bufferedCalls": 10, "failedCalls": 10, "state": "OPEN" } } }
+\end{lstlisting}
+Mọi phản hồi đều là 200 với ``Unknown user'' làm giáo viên --- trang
+suy giảm thay vì thất bại. Khởi động lại auth-service, đợi 10\,s, và
+\code{/actuator/circuitbreakerevents} cho thấy ba lời gọi thăm dò
+HALF\_OPEN thành công và trạng thái trở về CLOSED.
+\end{handson}
+
+\section{Ngoài dự án}
+
+Cùng bộ máy dưới những cái tên khác: Hystrix là bản gốc của Netflix và
+đã nghỉ hưu; Resilience4j là kẻ kế nhiệm trong thế giới Java; Envoy và
+Istio hiện thực timeout, retry có ngân sách, và loại trừ outlier trong
+sidecar để code ứng dụng không chứa gì trong số đó, hướng đi mà các đội
+tàu lớn đã chọn. gRPC mang hạn chót (deadline) trong giao thức --- hạn
+chót của bên gọi lan truyền tới mọi chặng, giải quyết bài toán
+``timeout xếp chồng'' ngay từ cấu trúc. SDK cloud (AWS, GCP) đi kèm lùi
+theo hàm mũ có jitter sẵn vì cùng lý do chương này khuyến nghị. Từ vựng
+là phổ quát; một người phỏng vấn nói ``bulkhead'' hay ``retry budget''
+có ý đúng như chương này.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Độ trễ auth-service đi từ 20\,ms lên 2\,s. Đi qua với tôi chuyện gì xảy ra trong course-service, và bạn chặn nó thế nào.}
+
+Mỗi request chạm auth-service giờ giữ một thread Tomcat lâu gấp trăm
+lần. Ở tốc độ vừa phải, pool 200 bão hòa trong vài giây, hàng đợi
+accept đầy, và course-service ngừng trả lời mọi thứ --- kể cả các
+endpoint chưa từng gọi auth-service và readiness probe. Ở thượng nguồn,
+pool theo host của gateway tới course-service đầy và route của nó suy
+giảm cho mọi user. Không gì trong cấu hình mặc định chặn được điều này:
+Feign đợi 60\,s, và một lời gọi 2\,s không phải chậm với một breaker có
+ngưỡng chậm 60\,s. Để chặn, theo thứ tự đòn bẩy: read timeout 2\,s để
+không thread nào đợi lâu hơn hạn chót của gateway; bulkhead khoảng 25
+để 175 thread còn lại tiếp tục phục vụ; ngưỡng chậm 1\,s ở 80\,\% để
+breaker mở theo độ trễ, không chỉ theo lỗi; và một fallback trả về tên
+đã biết gần nhất thay vì \code{null}. Rồi, nếu tra cứu nằm trên đường
+nóng, bỏ hẳn lời gọi bằng bản sao cục bộ nuôi bằng sự kiện user. Cách
+đặt vấn đề senior: mục tiêu là độ trễ của auth-service hiện ra dưới
+dạng một cái tên cũ trên trang, không phải một sự cố của khóa học.
+
+\subsection*{Q: Bạn định cỡ timeout qua ba chặng thế nào?}
+
+Từ ngoài vào trong, mỗi cái ngắn hơn cái trước. Trình duyệt hay client
+di động là ngân sách ngoài cùng --- chẳng hạn 10\,s trước khi người
+dùng bỏ cuộc. Timeout phản hồi của gateway phải nằm trong đó, 5\,s, để
+client nhận 503 sạch sẽ thay vì treo. Feign read timeout của
+course-service phải nằm trong \emph{cái đó} và chừa chỗ cho retry:
+2\,s với tối đa một lần retry giữ trường hợp xấu nhất quanh 4\,s. Bất
+kỳ timeout nào dài hơn của bên gọi là một chỗ rò --- công sức bỏ ra cho
+một request đã bị bỏ rơi --- và bất kỳ chính sách retry nào cũng phải
+tính vào phép cộng, vì ba lần thử ở 2\,s là 6\,s cộng backoff. Trong
+production bạn cũng đặt timeout \emph{kết nối} riêng và ngắn hơn nhiều
+(1\,s), vì không kết nối được thì chẩn đoán trong một vòng đi-về. Các
+hệ thống tốt nhất lan truyền một header hạn chót từ biên để mỗi chặng
+tự tính ngân sách còn lại; gRPC làm điều này ngay trong giao thức.
+
+\subsection*{Q: Bão retry --- bạn ngăn thế nào?}
+
+Ba biện pháp, cần tất cả. Thứ nhất, jitter: lùi theo hàm mũ đơn thuần
+để mọi client thất bại cùng lúc retry cùng lúc, nên đợt sóng thứ hai
+đồng bộ và lớn hơn; ngẫu nhiên hóa thời gian chờ $\pm$50\,\% dàn nó
+ra. Thứ hai, ngân sách retry: retry theo phần trăm lưu lượng (mặc định
+của Envoy là 20\,\%), để khi một phụ thuộc thực sự chết, retry không
+thể nhân ba tải của nó. Resilience4j xấp xỉ điều này bằng cách đặt
+Retry ngoài breaker --- một breaker đang mở từ chối các lần thử trước
+khi chúng thành retry. Thứ ba, tính lũy đẳng: chỉ retry \code{GET} và
+các thao tác mang khóa lũy đẳng mà server khử trùng lặp; nếu không một
+timeout trên \code{POST} thành một lần ghi danh trùng. Và chỉ retry lỗi
+vận chuyển và 503 --- một 400 hay 404 là tất định và sẽ lỗi lại. Dấu
+hiệu của bão trong metric là một phụ thuộc có tốc độ request tăng khi
+tỷ lệ thành công của nó giảm.
+
+\subsection*{Q: Breaker đang mở, nhưng user cần dữ liệu. Fallback của bạn trả về gì?}
+
+Thứ trung thực nhất có sẵn, định kiểu để bên gọi không nhầm nó với giá
+trị thật. Thứ tự ưu tiên: giá trị thành công gần nhất từ một cache sống
+ngắn (cũ nhưng thật --- tên giáo viên của mười phút trước là ổn); một
+giá trị thay thế suy giảm rõ ràng mà UI render được (``Giáo viên không
+rõ'') không bao giờ giả dạng dữ liệu; một tập rỗng nơi miền cho phép;
+hoặc một ngoại lệ có kiểu trở thành 503 với \code{Retry-After}. Không
+bao giờ \code{null}, thứ biến một sự kiện chịu lỗi thành
+\code{NullPointerException} ở đâu đó khác. Fallback cũng phải thấy
+nguyên nhân: 404 nghĩa là user không tồn tại và nên hiện ra như thế,
+không bị nuốt vào ``thử lại sau''. Và fallback phải rẻ và cục bộ ---
+một fallback gọi service khác là một phụ thuộc thứ hai trên đường lỗi.
+
+\subsection*{Q: Làm sao bạn biết breaker đang mở lúc 3 giờ sáng?}
+
+Vì nó là một metric có cảnh báo, không phải một dòng log. Resilience4j
+xuất \code{resilience4j\_circuitbreaker\_state} như một gauge theo từng
+trạng thái; một rule như ``\code{state="open"} bằng 1 quá 60 giây''
+gọi ai đó với tên phụ thuộc trong cảnh báo. Ghép với các chỉ báo sớm:
+\code{slow\_call\_rate} tăng trước khi breaker nhảy, số chỗ trống
+bulkhead tiến về không, và p99 của phụ thuộc từ
+\code{http\_client\_requests\_seconds}. Breaker cũng nuôi
+\code{/actuator/health} khi bật \code{register-health-indicator}, nên
+readiness probe có thể phản ánh nó --- dù thường bạn \emph{không} muốn
+một breaker mở kéo service ra khỏi vòng xoay, vì nó đang phục vụ
+fallback chính là để ở lại. Và log \emph{lần chuyển trạng thái} ở WARN
+một lần, không phải mỗi lời gọi bị từ chối, nếu không log thành sự cố
+kế tiếp.
+
+\subsection*{Q: Bạn đặt breaker ở gateway hay ở service?}
+
+Cả hai, cho hai loại lỗi khác nhau. Breaker của gateway (Chương~31)
+bảo vệ user khỏi cả một service chậm; nó mở theo route và phục vụ một
+body fallback. Breaker của service bảo vệ thread pool của chính service
+khỏi một trong các phụ thuộc của nó và là nơi fallback hiểu miền sống
+--- chỉ course-service biết một tên giáo viên thiếu là sống được.
+Gateway không thể biết điều đó. Sai lầm là chỉ có cái ở biên và cho
+rằng các service phía sau vì thế an toàn; chuỗi lỗi mà chương này đi
+qua diễn ra hoàn toàn phía sau gateway.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Dự án cấu hình một breaker tên \code{authService}. Liệt kê ba
+  lý do riêng biệt khiến nó hiện không bảo vệ lời gọi nào, và thay đổi
+  một dòng sửa từng lý do.
+  \item Với \code{sliding-window-size: 10} và các mặc định còn lại, bao
+  nhiêu lần thất bại liên tiếp có thể xảy ra sau khởi động trước khi
+  breaker mở, và vì sao một lời gọi mất 30\,s không được tính?
+  \item Sắp thứ tự và biện minh: timeout phản hồi của gateway, timeout
+  của trình duyệt, Feign read timeout, số lần retry.
+  \item \code{AuthServiceFallback.getUserById} trả về \code{null}. Nêu
+  hai khiếm khuyết cụ thể kéo theo và chữ ký hai tham số sửa được cái
+  tinh vi hơn.
+  \item auth-service trả 401 cho mọi lời gọi Feign. Giải thích nguyên
+  nhân trong cấu hình bảo mật của dự án, tác động lên breaker, và hai
+  thay đổi giải quyết nó.
+  \item Ba phụ thuộc đồng bộ mỗi cái 99,9\,\% sẵn sàng nối tiếp trên
+  một endpoint. Tính sẵn sàng của nó là bao nhiêu, và hai thay đổi thiết
+  kế nào nâng nó lên mà không đụng tới các phụ thuộc?
+\end{enumerate}
+\end{quiz}

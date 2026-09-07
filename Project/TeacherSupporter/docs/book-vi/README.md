@@ -23,6 +23,12 @@ Kết quả: `main.pdf`. Bản PDF được theo dõi trong git là
 - Tiêu đề các hộp: quyết định / cạm bẫy / thực hành / trên phần cứng này /
   tự kiểm tra.
 
+## Phần VIII — Đào sâu
+
+Từ chương 28 trở đi là các chương nghiên cứu sâu: lấy một thiết kế đã có
+trong dự án, hỏi vì sao chọn nó, nó giải quyết gì, ưu nhược điểm, đẩy tới
+khi gãy, rồi nâng cấp giải pháp. Cùng cấu trúc file với `docs/book/`.
+
 ## Cập nhật
 
 Khi một chương trong `docs/book/chapters/` thay đổi, dịch lại đúng file đó

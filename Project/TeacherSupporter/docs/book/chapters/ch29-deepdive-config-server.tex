@@ -1,0 +1,590 @@
+\chapter{Deep Dive: Configuration --- Config Server, Secrets, and Refresh at Scale}
+\label{ch:dd-config}
+
+Chapter~2 introduced the config-server as ``one more property source in
+the stack'': a small HTTP service that hands each application its YAML at
+startup. That description is complete for a laptop and dangerously
+incomplete for anything else. This chapter takes the project's
+configuration path apart --- what the server actually serves, who can
+read it, what happens when it changes, and what happens when it is not
+there --- and then rebuilds it two different ways.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{What problem does centralized configuration solve}, and
+  which of its three backends (native, git, platform) solves it best for
+  which system?
+  \item \textbf{What is the blast radius of a configuration file} ---
+  who reads it, what precedence rules apply, and what a default value in
+  a git-tracked file really means?
+  \item \textbf{What breaks} when the server is down, when a value must
+  change at runtime, and when a secret must rotate?
+\end{enumerate}
+
+\section{Why centralize, and what it solves}
+
+The twelve-factor rule is \emph{strict separation of config from code}:
+an image is built once and promoted unchanged through environments; only
+the configuration around it differs. Every configuration mechanism is a
+way of satisfying that rule, and the config-server is the first one the
+Spring ecosystem produced. It solves three concrete problems at once:
+
+\begin{itemize}
+  \item \textbf{Duplication.} Five services share Kafka addresses,
+  tracing endpoints, logging patterns. One document per service in one
+  place beats five copies that drift.
+  \item \textbf{Environment awareness.} The same service asks for
+  \code{/course-service/prod} or \code{/course-service/default} and gets
+  the right document, from the same image.
+  \item \textbf{Change without rebuild.} With a git backend, a config
+  change is a commit --- reviewed, audited, revertible --- and takes
+  effect on the next restart or refresh, with no image rebuilt.
+\end{itemize}
+
+The project gets the first benefit fully, the second not at all (there
+is one profile, \code{default}), and the third only in principle: with
+the \code{native} backend the documents are inside the config-server's
+own jar, so changing a value \emph{does} mean a rebuild.
+
+\begin{decision}[three backends, three systems]
+\textbf{Native classpath} (this project): config and code in one repo,
+one pipeline, one version. Right when one team owns everything and every
+config change ships with a code change anyway. \textbf{Git backend}:
+config in its own repository with its own history; right when
+operations and development are different people, when the same service
+runs in many environments, or when an auditor asks ``who changed the
+timeout and when''. \textbf{Platform-native} (ConfigMap and Secret, no
+server): right when every deployment target is Kubernetes, because the
+platform already offers versioned, mountable, RBAC-protected
+configuration and one fewer JVM to run. The project sits on the first
+and is heading for the third (Section~\ref{sec:config-enhance}); the
+second is what most enterprises you interview at actually run.
+\end{decision}
+
+\section{Reading the real path}
+
+Follow one property, \code{spring.datasource.url} for course-service,
+from the file to the running pod. It starts in the config-server's jar:
+
+\begin{lstlisting}[language=yaml]
+# config-server/src/main/resources/configurations/course-service.yml
+server:
+  port: 8082
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ts_course   (*@\co{1}@*)
+    username: postgres
+    password: root                                     (*@\co{2}@*)
+app:
+  s3:
+    endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}  (*@\co{3}@*)
+    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+\end{lstlisting}
+
+The service's packaged \code{application.yml} says where to fetch that
+document from:
+
+\begin{lstlisting}[language=yaml]
+# course-service/src/main/resources/application.yml
+spring:
+  application:
+    name: course-service                                (*@\co{4}@*)
+  config:
+    import: optional:configserver:http://localhost:8888 (*@\co{5}@*)
+\end{lstlisting}
+
+And the container overrides both the address and the value:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/course-service.yaml (env excerpt)
+- { name: SPRING_CONFIG_IMPORT,
+    value: "configserver:http://config-server:8888" }    (*@\co{6}@*)
+- { name: SPRING_DATASOURCE_URL,
+    value: "jdbc:postgresql://postgres-course:5432/ts_course" }
+envFrom:
+  - secretRef: { name: postgres-course-app }            (*@\co{7}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A literal, not a placeholder: the served document says
+  \code{localhost}. It is correct only on a laptop.
+  \item[\co{2}] A database password in cleartext, in a git-tracked
+  file, served over HTTP. Dev-only in intent; nothing in the file says
+  so.
+  \item[\co{3}] The \code{\${VAR:default}} idiom: the config-server
+  serves the placeholder \emph{unresolved}; each client resolves it
+  against its own environment at startup. This is why the same document
+  works in Compose and in Kubernetes --- and why a default in it is a
+  value every environment will silently use unless told otherwise.
+  \item[\co{4}] The lookup key. The server maps
+  \code{course-service} to \code{course-service.yml}.
+  \item[\co{5}] \code{optional:} --- if nothing answers on 8888, boot
+  anyway from the packaged file. Right for a developer running one
+  service in an IDE; wrong for a container.
+  \item[\co{6}] The container replaces the whole import line: new host,
+  and \emph{no} \code{optional:}. An unreachable config-server is now
+  fatal at startup. Compose masks this with
+  \code{depends\_on: condition: service\_healthy}; Kubernetes does not,
+  and the pod crash-loops until the server is Ready (Chapter~15).
+  \item[\co{7}] The password from \co{2} is overridden by the Secret's
+  \code{SPRING\_DATASOURCE\_PASSWORD}. The cleartext default is
+  therefore harmless in the cluster --- \emph{as long as} the Secret
+  exists. Remove it and the service does not fail; it connects with
+  \code{root}.
+\end{description}
+
+\subsection{Precedence, precisely}
+
+Spring Boot builds one \code{Environment} from an ordered list of
+property sources; the first source that defines a key wins. For this
+project the order that matters, highest first:
+
+\begin{enumerate}
+  \item Command-line arguments and \code{SPRING\_APPLICATION\_JSON}
+  (unused here).
+  \item OS environment variables --- the Deployment's \code{env} and
+  \code{envFrom}, with relaxed binding turning
+  \code{SPRING\_DATASOURCE\_URL} into \code{spring.datasource.url}.
+  \item The document imported from the config-server.
+  \item The packaged \code{application.yml} that did the importing.
+\end{enumerate}
+
+Two consequences are easy to get wrong in an interview. First, an
+imported document outranks the file that imports it: the config-server
+can override anything packaged in the jar, but never anything set by
+the platform. Second, a \code{\${VAR:default}} placeholder is
+\emph{not} a precedence rule; it is resolved after precedence has
+already chosen the document. The env var \code{APP\_S3\_SECRET\_KEY}
+wins over the default not because env vars outrank the config-server,
+but because the config-server's own text asked for it.
+
+\begin{handson}[read what the server serves]
+The config-server has no authentication and Compose publishes its port.
+Ask it for course-service's document exactly as the client does:
+\begin{lstlisting}[language=bash]
+$ curl -s http://localhost:8888/course-service/default | \
+    python -m json.tool | head -20
+{
+    "name": "course-service",
+    "profiles": ["default"],
+    "label": null,
+    "version": null,
+    "propertySources": [
+        {
+            "name": "classpath:/configurations/course-service.yml",
+            "source": {
+                "server.port": 8082,
+                "spring.datasource.url": "jdbc:postgresql://localhost...",
+                "spring.datasource.username": "postgres",
+                "spring.datasource.password": "root",
+\end{lstlisting}
+Note \code{version: null} --- the native backend has no commit id to
+report. A git backend fills it with the SHA, which is how you answer
+``which config is this pod running?'' in production.
+\end{handson}
+
+\section{Pros and cons, honestly}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.62\linewidth}@{}}
+\toprule
+\textbf{Strength} & \textbf{In this project} \\
+\midrule
+One document per service & Real: five files, zero duplication of Kafka or Zipkin addresses. \\
+Environment placeholders & Real: the same files serve Compose and Kubernetes untouched. \\
+Startup-time fetch, no runtime dependency & Real: once up, a service never talks to the server again. \\
+\midrule
+\textbf{Weakness} & \\
+\midrule
+No authentication & Anyone reaching 8888 reads every document, defaults and passwords included. \\
+Native = rebuild to change & A timeout tweak is a config-server image build and rollout. \\
+Working defaults for secrets & \code{JWT\_SECRET} and \code{root} have usable fallbacks in git. \\
+Ordering constraint & Every pod depends on one pod that has nothing to do after boot. \\
+One profile only & \code{default} everywhere; environments differ by env var alone. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The last row is worth a sentence. Spring profiles were designed for
+exactly the dev/staging/prod split, and the config-server serves
+\code{course-service-prod.yml} on top of \code{course-service.yml}
+automatically when \code{SPRING\_PROFILES\_ACTIVE=prod}. The project
+never uses this; every environmental difference is an env var. That is
+a defensible simplification --- one mechanism instead of two --- but it
+means the served documents can never say ``this value is for
+development only''.
+
+\section{What breaks}
+
+\begin{pitfall}[the signing key is in the repository]
+Symptom: none, which is the point. Open the served
+\code{api-gateway.yml} and \code{auth-service.yml}:
+\begin{lstlisting}[language=yaml]
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecretKeyThatIsAtLeast256Bits...}
+\end{lstlisting}
+Cause: the default is a \emph{valid} HS256 key, committed to a public
+repository, and \code{create-secrets.sh} defaults \code{JWT\_SECRET} to
+the same string. Any deployment that forgets to set the variable signs
+tokens with a key the whole internet can read --- and with HS256
+(Chapter~28) reading the key means minting tokens for any user. The
+fix has two halves: remove the default so a missing variable fails at
+startup (\code{\${JWT\_SECRET}} with no colon --- Spring refuses to
+resolve it), and treat every \code{\${VAR:value}} in a served document
+as a question: ``would I be fine if production ran with this?''
+Passwords and keys never pass that test; ports and hostnames usually do.
+\end{pitfall}
+
+\begin{pitfall}[refreshed one service, broke all of them]
+Symptom: after ``rotating the JWT secret'' with \code{POST
+/actuator/refresh} on auth-service, every request through the gateway
+returns 401 until the gateway is restarted. Cause: refresh is
+\emph{per instance}. Auth-service rebuilt its \code{@RefreshScope}
+beans and now signs with the new key; the gateway still verifies with
+the old one. Even if both are refreshed, there is no overlap window ---
+every token issued before the refresh is invalid the moment the
+gateway refreshes. A symmetric key shared by a signer and a verifier
+cannot be hot-swapped at all; it needs the \code{kid}-based ceremony
+of Chapter~28. The general rule: refresh is for values whose old and new
+readings can coexist (a feature flag, a log level, a timeout), not for
+values that two parties must agree on.
+\end{pitfall}
+
+\begin{pitfall}[healthy but wrong]
+Symptom: config-server reports \code{UP}, services start, the wrong
+values are in effect. Cause: the config-server's health indicator
+checks that the \emph{backend} answers --- for native, that the
+classpath directory exists. It says nothing about content. A typo in a
+YAML key name (\code{acess-key}) is served happily and ignored happily
+by the client, which then uses its default. Neither side logs an error.
+The defence is in the client: bind configuration to a
+\code{@ConfigurationProperties} record with
+\code{@Validated} and \code{@NotBlank} on required fields, so a missing
+or misspelled key fails at startup with the property name in the
+message.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+The config-server pod is evicted at 3\,a.m.; nothing else is.
+
+\begin{itemize}
+  \item \textbf{Running services: nothing.} Each fetched its document
+  once at boot and holds it in memory. No request path touches the
+  config-server. This is the property that justifies a single replica.
+  \item \textbf{A service that restarts during the outage: crash loop.}
+  Its import is non-optional; the fetch fails; the JVM exits; kubelet
+  restarts it with exponential back-off (Chapter~24). When the
+  config-server returns, the next restart succeeds --- after up to five
+  minutes of back-off delay. The system converges; it does not
+  converge quickly.
+  \item \textbf{A rolling update during the outage: stalls.} The new
+  pod never becomes Ready, the old pod keeps serving (Chapter~15's
+  \code{maxUnavailable}), and the rollout waits. Correct behaviour, but
+  a deploy pipeline will report a timeout.
+  \item \textbf{With \code{optional:} restored: worse.} The restarting
+  pod boots from packaged defaults --- \code{localhost:5432},
+  \code{localhost:9092} --- becomes Ready (its probe is
+  \code{/v3/api-docs}, which needs no database), receives traffic, and
+  fails every request. An outage that looked like ``config-server down''
+  is now ``course-service returning 500s'', two hops from the cause.
+\end{itemize}
+
+Retry with back-off is the middle ground: keep the import mandatory,
+but let the client try for a while before dying. It needs
+\code{spring-retry} and \code{spring-boot-starter-aop} on the classpath,
+then:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    config:
+      fail-fast: true          # unreachable server is fatal ...
+      retry:
+        max-attempts: 20       # ... after 20 tries
+        initial-interval: 2000 # 2 s, then x1.5 each time
+        multiplier: 1.5
+        max-interval: 15000    # capped at 15 s: ~4 minutes total
+\end{lstlisting}
+
+Compare with letting kubelet do the retrying: the JVM restart costs
+twenty seconds of class loading each time and the back-off grows to
+five minutes; in-process retry costs nothing and caps at fifteen
+seconds. Both converge; one wastes a CPU the two-core box does not have.
+
+\section{Enhancing the resolution}
+\label{sec:config-enhance}
+
+Two upgrades, in the order an enterprise would do them.
+
+\subsection{Upgrade 1: git backend with encrypted values}
+
+Keep the config-server, move its documents to a repository, and stop
+committing secrets in cleartext. The server side:
+
+\begin{lstlisting}[language=yaml]
+# config-server/src/main/resources/application.yml
+server:
+  port: 8888
+spring:
+  application:
+    name: config-server
+  profiles:
+    active: git                                        (*@\co{1}@*)
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://git.example.com/ts/config-repo.git
+          default-label: main                          (*@\co{2}@*)
+          search-paths: '{application}'                (*@\co{3}@*)
+          clone-on-start: true                         (*@\co{4}@*)
+          username: ${CONFIG_GIT_USER}
+          password: ${CONFIG_GIT_TOKEN}
+encrypt:
+  key: ${CONFIG_ENCRYPT_KEY}                           (*@\co{5}@*)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The profile selects the backend. \code{native} and
+  \code{git} are the two built in; Vault and JDBC exist as well.
+  \item[\co{2}] The label is a branch or tag. Pin a production
+  environment to \code{release-2026.09} and a config change is a merge,
+  not an edit.
+  \item[\co{3}] One folder per service in the repository:
+  \code{course-service/application.yml}. The same file names as today,
+  one directory deeper.
+  \item[\co{4}] Clone at startup rather than on first request, so the
+  health check proves the credentials work before any client asks.
+  \item[\co{5}] A symmetric key for the \code{/encrypt} and
+  \code{/decrypt} endpoints. It is the one secret the config-server must
+  hold, and it must come from the platform (a Kubernetes Secret), never
+  from a file in either repository.
+\end{description}
+
+With the key in place, encrypting a value is one request, and the
+repository stores only the ciphertext:
+
+\begin{lstlisting}[language=bash]
+$ curl -s -X POST http://localhost:8888/encrypt \
+       -d 'a-real-256-bit-signing-key-generated-with-openssl'
+AQBt3s6...b3f0e   # ciphertext; safe to commit
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml]
+# config-repo/api-gateway/application.yml
+app:
+  jwt:
+    secret: '{cipher}AQBt3s6...b3f0e'   # decrypted by the server on serve
+\end{lstlisting}
+
+The \code{\{cipher\}} prefix tells the server to decrypt before serving.
+The repository now holds no usable secret, the default-value trap is
+gone (there is no default), and \code{git log -- api-gateway/} answers
+who changed the key and when. What it does \emph{not} fix: the served
+document still crosses the network in cleartext to an unauthenticated
+endpoint. Add \code{spring-boot-starter-security} to the config-server
+with HTTP basic credentials, and give each client
+\code{spring.cloud.config.username/password} from its own Secret.
+
+\subsection{Upgrade 2: retire the server}
+
+On Kubernetes the platform can serve the documents itself. Kustomize
+generates a ConfigMap per service straight from the existing files, so
+the git history is unchanged:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/kustomization.yaml (excerpt)
+configMapGenerator:
+  - name: course-service-config
+    files:
+      # key in the ConfigMap = application.yml, value = the file
+      - application.yml=../../config-server/src/main/resources/configurations/course-service.yml
+generatorOptions:
+  disableNameSuffixHash: false   # hash suffix: a changed file = a
+                                 # new ConfigMap name = a rollout
+\end{lstlisting}
+
+The Deployment mounts it as a directory and points Spring at the
+directory instead of the server:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/course-service.yaml (excerpt)
+spec:
+  template:
+    spec:
+      containers:
+        - name: course-service
+          env:
+            # replaces configserver:http://config-server:8888
+            - { name: SPRING_CONFIG_IMPORT, value: "file:/config/" }
+            - { name: SPRING_DATASOURCE_URL,
+                value: "jdbc:postgresql://postgres-course:5432/ts_course" }
+          envFrom:
+            - secretRef: { name: postgres-course-app }
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: course-service-config }
+\end{lstlisting}
+
+Spring Boot treats a trailing slash as a directory import and loads
+\code{application.yml} from it, with exactly the precedence the
+config-server document had: above the packaged file, below env vars.
+Nothing in the service's code or jar changes; Compose keeps working
+because the packaged \code{optional:configserver:} import still points
+at the (still running, in Compose) server. Then delete
+\code{config-server.yaml} from the base, and the cluster has one fewer
+JVM, one fewer startup dependency, and one fewer unauthenticated
+endpoint.
+
+The name-suffix hash is the detail that makes this better than the
+server, not merely equivalent. A ConfigMap named
+\code{course-service-config-7b9c4} changes name when its content
+changes; the Deployment referencing the new name is a new pod
+template; Kubernetes rolls the pods. Config change, rollout, and
+rollback are the same operation as a code change --- which is what
+Chapter~27's GitOps section wants.
+
+\begin{decision}[when to drop the config-server entirely]
+Drop it when three things are true: every runtime is Kubernetes, no
+service needs a value to change without a pod restart, and secrets
+already live in the platform (they do --- Chapter~16). Keep it when any
+is false: services on VMs or in Compose in production, a genuine
+runtime-refresh requirement (rare; feature flags are better served by a
+purpose-built system), or an organization whose configuration audit
+trail must be independent of the deployment repository. An interviewer
+who asks ``would you use Spring Cloud Config on Kubernetes?'' is
+listening for this list, and for the sentence ``the platform already
+provides it''.
+\end{decision}
+
+\section{Outside the project}
+
+The git-backed config-server with \code{\{cipher\}} values was the
+standard from about 2015 to 2020 and is still what you will find in
+most Java shops. Two things have replaced parts of it. HashiCorp Vault
+(and its cloud equivalents, AWS Secrets Manager, Azure Key Vault) holds
+secrets with leases and rotation; Spring Cloud Vault or the External
+Secrets Operator delivers them into pods, and the config repository
+holds only references. Feature-flag services (LaunchDarkly, Unleash,
+OpenFeature) took over the runtime-refresh use case with targeting
+rules and audit that \code{@RefreshScope} never had. What survived
+unchanged is the discipline: config outside the image, precedence you
+can state from memory, and no working secret in any file you commit.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: You have to rotate a database password across fifty
+services with no downtime. Walk me through it.}
+
+Rotation is never a single write; it is an overlap. First, create the
+new credential in the database while the old one still works ---
+Postgres lets two roles or two passwords coexist, and managed services
+(RDS, Cloud SQL) expose ``dual password'' for exactly this. Second, put
+the new value into the platform Secret (or the config repository as a
+\code{\{cipher\}} value) and trigger the consumers: on Kubernetes that
+is a \code{rollout restart} per Deployment, which the ConfigMap
+name-hash trick does for you; with Spring Cloud Bus it is one
+\code{POST /actuator/busrefresh} that every instance receives over
+Kafka. Third, watch the database's connection log until no session uses
+the old role, then revoke it. The project's pitfall in Chapter~16 ---
+``changed the Secret, nothing happened'' --- is what step two prevents.
+The senior answer names the overlap explicitly and says which step is
+allowed to fail: revocation, which you simply postpone.
+
+\subsection*{Q: A config change must reach every instance within a
+minute. Restarting is too slow. What do you do?}
+
+Distinguish the value kinds first. A log level, a rate limit, a feature
+flag: mark the bean \code{@RefreshScope}, expose
+\code{/actuator/busrefresh}, add \code{spring-cloud-starter-bus-kafka}
+--- the project already has Kafka --- and one POST broadcasts a
+\code{RefreshRemoteApplicationEvent}; each instance re-fetches its
+document and rebuilds refresh-scoped beans within seconds. A database
+URL, a Kafka bootstrap address, a signing key: do \emph{not} refresh
+those, because the connection pool, the producer, or the verifier
+holds the old value in objects that are not rebuilt cleanly; restart
+instead. If the ask is really ``flags for product experiments'', say
+that a feature-flag service (Unleash, LaunchDarkly) with an SDK that
+polls every few seconds is the purpose-built tool, and
+\code{@RefreshScope} is the ten-year-old workaround.
+
+\subsection*{Q: The config server is a single point of failure. How do
+you handle that?}
+
+Start by narrowing what it is a SPOF \emph{for}: startup, not traffic.
+A running service never calls it again, so a config-server outage
+affects only restarts and scale-outs. Then reduce even that: two
+replicas behind the Service (it is stateless with a native or git
+backend --- a git clone per replica is fine), \code{fail-fast} with
+retry so a booting pod waits up to a few minutes instead of dying, and
+a readiness probe on the config-server so the Service never routes to
+a replica still cloning. The strongest answer removes the dependency:
+serve the documents from ConfigMaps, and the ``SPOF'' becomes the
+Kubernetes API server, which you already depend on for everything else.
+
+\subsection*{Q: How do you keep secrets out of git while still having
+config in git?}
+
+Three layers, each acceptable at a different size. Smallest: the
+config-server's \code{/encrypt} with a symmetric key held only by the
+server; git stores \code{\{cipher\}} text, and a leaked repository is
+useless without the key. Middle: Kubernetes Secrets created out of band
+(the project's \code{create-secrets.sh}) and referenced by name in the
+manifests, so git holds the shape but never the value. Largest: a
+secrets manager --- Vault, AWS Secrets Manager --- with the External
+Secrets Operator synchronizing into Kubernetes Secrets, so rotation and
+audit live where the secret does. The trap to name: a
+\code{\${VAR:default}} with a working default is a secret in git no
+matter which layer you chose.
+
+\subsection*{Q: Two pods of the same service are running with different
+configuration. How did that happen, and how do you prevent it?}
+
+The usual causes: a rolling update that stalled halfway (old pod on the
+old document, new pod on the new one --- normal and temporary); a
+config-server whose git clone is stale on one replica because
+\code{clone-on-start} was off and one replica never refreshed; or, the
+subtle one, a \code{/actuator/refresh} sent to one instance through a
+load balancer that happened to pick it. Prevention is to make
+configuration part of the pod template: mount it from a ConfigMap
+whose name carries a content hash, so ``which config'' is answered by
+``which ReplicaSet''. Detection is to expose the config version ---
+the git SHA the config-server returns as \code{version}, or the
+ConfigMap name --- in \code{/actuator/info}, and to compare across
+pods before believing any ``it works on one of them'' report.
+
+\begin{quiz}
+\begin{enumerate}
+  \item The served \code{course-service.yml} says
+  \code{password: root} and the Deployment's Secret says otherwise. State
+  which wins and why, then describe what happens if the Secret is
+  deleted and the pod restarts.
+  \item Explain why \code{\${APP\_S3\_SECRET\_KEY:minioadmin}} in a
+  served document is not a precedence rule, and what the config-server
+  actually sends to the client for that key.
+  \item A colleague runs \code{POST /actuator/refresh} on both
+  auth-service and api-gateway after changing \code{JWT\_SECRET}. List
+  the two distinct failure windows and name the mechanism from
+  Chapter~28 that a hot rotation actually requires.
+  \item The config-server dies; course-service is scaled from one to
+  two replicas during the outage. Describe what the new pod does with
+  \code{configserver:} (non-optional), with \code{optional:configserver:},
+  and with \code{fail-fast} plus retry.
+  \item After the ConfigMap migration, what causes pods to restart when
+  a value changes, and why does that make the migration \emph{more}
+  capable than the server it replaced rather than merely equivalent?
+  \item Interview: ``Would you deploy Spring Cloud Config on Kubernetes?''
+  Give the three conditions under which you would remove it and the
+  one condition under which you would keep it.
+\end{enumerate}
+\end{quiz}

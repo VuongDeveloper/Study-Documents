@@ -1,0 +1,655 @@
+\chapter{Đào sâu: Trình duyệt gặp gateway --- nơi cất token, luồng refresh và CORS}
+\label{ch:dd-frontend-auth}
+
+Chương~26 đặt ứng dụng React lên cùng origin với API và ghi chú, gần
+như thoáng qua, rằng CORS ``đơn giản là không bao giờ được hỏi tới''.
+Chương~28 đẩy thiết kế token từ phía server. Chương đào sâu này lấy đầu
+kia của đường dây: trình duyệt, runtime duy nhất trong hệ thống mà bạn
+không kiểm soát, nơi chạy code do bất kỳ ai chèn được thẻ script vào
+trang của bạn, và sẵn lòng gửi cookie tới form của kẻ tấn công. Mọi
+quyết định về nơi một token sống là quyết định về mối đe dọa nào trong
+số đó bạn chấp nhận.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Token sống ở đâu} trong trình duyệt, và mỗi chỗ ở
+  phơi nó ra trước đòn tấn công nào?
+  \item \textbf{Chuyện gì xảy ra khi hết hạn} --- luồng refresh chạy
+  thế nào, và vì sao mười tab phải sinh ra đúng một lời gọi refresh?
+  \item \textbf{CORS bảo vệ cái gì}, nó tốn gì mỗi request, và vì sao
+  một origin làm nó biến mất?
+\end{enumerate}
+
+\section{Vì sao chọn nó, và nó giải quyết gì}
+
+Server phát hai thông tin xác thực (Chương~5): một JWT access token 15
+phút và một refresh token mờ 7 ngày. Trình duyệt phải giữ cả hai qua
+các lần tải lại trang, đính cái thứ nhất vào mọi lời gọi API, và đổi
+cái thứ hai lấy cái thứ nhất mới khi hết hạn --- mà người dùng không
+nhận ra. Câu trả lời của dự án là một store Zustand với middleware
+\code{persist} và một interceptor của axios. Đọc store trước:
+
+\begin{lstlisting}
+export const useAuthStore = create<AuthState>()(
+  persist(                                            (*@\co{1}@*)
+    (set) => ({
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      isAuthenticated: false,
+      setTokens: (accessToken, refreshToken) =>
+        set({ accessToken, refreshToken, isAuthenticated: true }),
+      setUser: (user) => set({ user }),
+      logout: () =>
+        set({ accessToken: null, refreshToken: null,
+              user: null, isAuthenticated: false }),
+    }),
+    { name: 'auth-storage' }                          (*@\co{2}@*)
+  )
+);
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{persist} ghi toàn bộ state vào storage ở mỗi
+  thay đổi và nạp lại khi tải trang. Đó là thứ sống sót qua một lần
+  tải lại; không có nó, mỗi lần làm mới trang là một lần đăng xuất.
+  \item[\co{2}] Khóa lưu trữ. Backend mặc định là \code{localStorage},
+  nên mở DevTools, Application, Local Storage, và chúng ở đó: cả hai
+  token, dạng chữ thường, dưới \code{auth-storage}. Bất kỳ script nào
+  chạy trên trang đọc được chúng bằng một dòng.
+\end{description}
+
+\begin{decision}[localStorage, cho phiên bản đầu]
+Dự án cất cả hai token trong \code{localStorage} vì đó là thứ đơn giản
+nhất sống sót qua tải lại trang, hoạt động giống hệt trên
+\code{localhost:3000} và \code{ts.local}, không cần cấu hình cookie ở
+server, và né hẳn CSRF --- một token do JavaScript tự tay đính vào
+không bao giờ được trình duyệt tự gửi. Cái giá là token chỉ an toàn
+đúng bằng mọi script trên trang. Điều đó chấp nhận được khi trang chỉ
+tải bundle của chính nó. Nó hết chấp nhận được vào ngày một script bên
+thứ ba (một thẻ analytics, một widget chat, một dependency npm bị
+chiếm) chạy trên cùng origin: bất kỳ cái nào cũng đọc được
+\code{auth-storage} và chuyển một refresh token 7 ngày đi nơi khác.
+Nâng cấp ở Mục~\ref{sec:fe-enhance} chuyển refresh token vào cookie
+\code{HttpOnly} và giữ access token trong bộ nhớ --- nhiều bộ phận
+chuyển động hơn, nhưng script không còn trộm được thông tin xác thực
+sống dài.
+\end{decision}
+
+\section{Luồng refresh, như đã viết}
+
+\subsection{Interceptor}
+
+Mọi lời gọi API đi qua một instance axios:
+
+\begin{lstlisting}
+const apiClient = axios.create({ baseURL: '/api' });   (*@\co{1}@*)
+
+apiClient.interceptors.request.use((config) => {
+  const token = useAuthStore.getState().accessToken;
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;                                        (*@\co{2}@*)
+});
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+    if (error.response?.status === 401
+        && !originalRequest._retry) {                   (*@\co{3}@*)
+      originalRequest._retry = true;
+      const refreshToken = useAuthStore.getState().refreshToken;
+      if (refreshToken) {
+        try {
+          const { data } = await axios.post(            (*@\co{4}@*)
+              '/api/auth/refresh', { refreshToken });
+          useAuthStore.getState()
+              .setTokens(data.accessToken, data.refreshToken);
+          originalRequest.headers.Authorization =
+              `Bearer ${data.accessToken}`;
+          return apiClient(originalRequest);            (*@\co{5}@*)
+        } catch {
+          useAuthStore.getState().logout();
+          window.location.href = '/login';
+        }
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Base URL tương đối. Khi phát triển, proxy của Vite
+  chuyển \code{/api} tới \code{localhost:8080}; trong cụm Traefik làm
+  việc đó (Chương~26). Trình duyệt không bao giờ thấy origin thứ hai.
+  \item[\co{2}] Header bearer do code đính vào mọi request. Đây là sự
+  miễn nhiễm CSRF nhắc ở trên: một form trên \code{evil.example} không
+  thể khiến trình duyệt thêm header này.
+  \item[\co{3}] Một 401 từ gateway kích hoạt một lần thử lại cho mỗi
+  request; body JSON ``Invalid or expired token'' đến từ filter
+  \code{JwtAuthenticationFilter} của gateway. Cờ được đánh dấu trên
+  object config để 401 thứ hai rơi xuống bên gọi.
+  \item[\co{4}] Lời gọi refresh cố ý dùng \code{axios} \emph{trần},
+  không phải \code{apiClient}: nếu không, một 401 từ chính
+  \code{/refresh} sẽ vào lại interceptor này và lặp.
+  \item[\co{5}] Request gốc được phát lại với token mới. \code{await}
+  của bên gọi hoàn tất như thể không có gì xảy ra.
+\end{description}
+
+Điều này đúng cho một request. Nó sai cho một trang.
+
+\subsection{Bài toán single-flight}
+
+\code{DashboardPage} mount và TanStack Query bắn các truy vấn song
+song: khóa học, bài tập, hồ sơ người dùng, số đếm từ điển. Nếu access
+token hết hạn khi laptop đóng nắp, tất cả trả 401 trong cùng vài mili
+giây, và mỗi cái chạy interceptor độc lập. Bốn request, bốn lời gọi tới
+\code{/api/auth/refresh}, bốn access token mới, và --- vì
+\code{setTokens} chạy bốn lần --- phản hồi nào tới sau cùng thì thắng.
+Hôm nay điều đó vô hại vì auth-service trả cùng một refresh token mỗi
+lần (Chương~28 đã chỉ ra đây là việc xoay vòng còn thiếu). Thêm xoay
+vòng, điều bạn nên làm, và cuộc đua thành chí mạng: lần refresh đầu vô
+hiệu token mà ba cái kia sắp đưa ra, chúng thất bại, và người dùng bị
+đăng xuất bởi chính cơ chế lẽ ra giữ họ lại.
+
+Cách sửa là refresh \emph{single-flight}: 401 đầu tiên khởi động một
+lần refresh và lưu promise của nó; mọi 401 đồng thời await cùng
+promise đó thay vì tự khởi động; khi nó hoàn tất, tất cả phát lại với
+cùng token mới. Mục~\ref{sec:fe-enhance} có code đầy đủ. Người phỏng
+vấn hỏi câu này dưới dạng ``mười tab gặp 401 cùng lúc --- bao nhiêu lời
+gọi refresh?'' và câu trả lời senior là ``mỗi tab một nếu không phối
+hợp, tổng cộng một nếu có khóa xuyên tab'', theo sau là gọi tên công cụ
+cho trường hợp xuyên tab: \code{Web Locks} API hoặc một
+\code{BroadcastChannel}, vì mỗi tab có heap JavaScript riêng và không
+thấy promise đang chờ của tab khác.
+
+\subsection{Đăng xuất và trang callback OAuth}
+
+\code{Header.handleLogout} POST refresh token tới
+\code{/api/auth/logout}, nơi xóa dòng của nó, rồi dọn store và điều
+hướng tới \code{/login}. Việc đó thu hồi thông tin xác thực 7 ngày ngay
+lập tức. Access token 15 phút không bị thu hồi --- không thể, theo
+Chương~28 --- nên một bản sao lấy trước khi đăng xuất vẫn hoạt động cho
+tới khi hết hạn. ``Làm sao đăng xuất một người dùng ở mọi nơi?'' có
+cùng câu trả lời với thêm một bước: xóa \emph{tất cả} dòng refresh
+token của người dùng, không chỉ dòng trình duyệt này giữ, và chấp nhận
+cửa sổ 15 phút hoặc thêm deny-list theo \code{jti}.
+
+Đăng nhập Google hạ cánh ở \code{OAuthCallbackPage} với cả hai token
+là tham số truy vấn --- \code{OAuth2LoginSuccessHandler} dựng redirect
+theo cách đó. Trang đọc chúng, cất chúng, và điều hướng với
+\code{replace: true} để URL chứa token không nằm lại trong lịch sử.
+Chi tiết cuối quan trọng hơn vẻ ngoài: một URL được chép vào lịch sử
+trình duyệt, vào header \code{Referer} của bất kỳ tài nguyên nào trang
+tải tiếp theo, và vào access log của server. \code{replace} rút ngắn
+thời gian phơi nhiễm; nó không xóa được khỏi access log của gateway
+và auth-service, nơi giờ chứa một refresh token hợp lệ dạng chữ
+thường.
+
+\section{CORS: chính sách bạn không đang dùng}
+
+Chính sách same-origin là quy tắc của trình duyệt rằng một script tải
+từ origin A không được \emph{đọc} phản hồi từ origin B. CORS là giao
+thức để B nới lỏng quy tắc đó theo từng origin. Gateway của dự án có
+một \code{CorsConfig} liệt kê \code{localhost:3000} và
+\code{localhost:5173}, cho phép mọi method và header, và đặt
+\code{allowCredentials(true)}. Đọc nó đối chiếu với hai cách ứng dụng
+thực sự được phục vụ:
+
+\begin{itemize}
+  \item \textbf{Phát triển.} Vite phục vụ trang ở \code{:3000} và
+  \emph{proxy} \code{/api} tới \code{:8080}. Trình duyệt gửi request
+  tới \code{:3000}; Vite chuyển tiếp phía server. Không tồn tại request
+  cross-origin, nên không preflight, nên \code{CorsConfig} không bao
+  giờ được dùng.
+  \item \textbf{Cụm.} Traefik định tuyến \code{/api} tới gateway và
+  mọi thứ khác tới nginx trên cùng host (Chương~26). Lại cùng origin.
+\end{itemize}
+
+\code{CorsConfig} vì thế phục vụ đúng một kịch bản: ai đó chạy bundle
+đã build từ một origin khác --- chẳng hạn mở \code{dist/index.html}
+qua một static server ở \code{:5173} không có proxy. Nó là lưới an
+toàn, và là lưới rộng rãi: \code{addAllowedHeader("*")} cộng
+credentials là chính sách rộng nhất Spring chấp nhận mà không ném lỗi.
+
+CORS sẽ tốn gì nếu nó hoạt động là điều đáng biết cho phỏng vấn. Một
+request với body JSON và header \code{Authorization} không phải
+``request đơn giản'', nên trình duyệt gửi trước một preflight
+\code{OPTIONS} hỏi method và header có được phép không. Đó là thêm một
+vòng đi-về mỗi request khác nhau, có thể cache bằng
+\code{Access-Control-Max-Age}, thứ cấu hình của dự án không đặt --- nên
+mọi lời gọi sẽ preflight. Trên đường truyền 40\,ms, mọi lời gọi API
+thành 80\,ms trước khi có việc gì được làm. Một origin loại bỏ hoàn
+toàn chi phí đó, và đó là lý lẽ hiệu năng cho thiết kế của Chương~26
+bên cạnh lý lẽ bảo mật.
+
+\section{Ưu và nhược}
+
+\begin{center}
+\begin{tabular}{@{}p{0.30\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+ & \textbf{localStorage + bearer (hôm nay)} & \textbf{Cookie HttpOnly} \\
+\midrule
+XSS trộm token & có, cả hai token, một dòng JS & không --- script không
+đọc được cookie \\
+CSRF & miễn nhiễm: header do code đính & phơi nhiễm trừ khi có
+\code{SameSite} + token CSRF hoặc kiểm tra header tùy biến \\
+Sống qua tải lại & có, qua \code{persist} & có, trình duyệt giữ nó \\
+Nhiều tab & mỗi tab đọc storage; refresh đua nhau & cùng cookie ở mọi
+tab; refresh vẫn đua \\
+Chạy cross-origin & có & cần \code{Allow-Credentials} và danh sách
+origin chính xác \\
+Thay đổi server & không & set-cookie khi đăng nhập, đọc cookie khi
+refresh \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Tóm tắt thành thật mà một kỹ sư senior đưa ra: bearer-trong-storage
+đổi một bài toán CSRF bạn giải được lấy một bài toán XSS bạn không giải
+được. Bất kỳ script bị chèn nào đánh bại nó hoàn toàn. Cookie đổi
+theo chiều ngược lại, và bài toán của nó có cách sửa cơ học đã biết.
+
+\section{Cái gì gãy}
+
+\begin{pitfall}[bốn lần refresh, một người thắng]
+Triệu chứng: sau khi để ứng dụng mở qua đêm, cú click đầu tiên chạy,
+rồi người dùng bị đưa tới \code{/login} dù tài khoản không có gì sai.
+Nguyên nhân: các 401 song song mỗi cái chạy interceptor; với xoay vòng
+refresh token ở server, lần refresh thứ hai đưa ra token mà lần đầu
+vừa vô hiệu, và nhánh \code{catch} đăng xuất người dùng. Cách sửa:
+interceptor single-flight ở Mục~\ref{sec:fe-enhance}. Không có xoay
+vòng, triệu chứng chỉ là lời gọi lãng phí --- đó là lý do cuộc đua vô
+hình hôm nay.
+\end{pitfall}
+
+\begin{pitfall}[token trong URL]
+Triệu chứng: một refresh token xuất hiện trong access log của gateway,
+trong log của Traefik, và trong lịch sử trình duyệt của một máy dùng
+chung. Nguyên nhân: \code{OAuth2LoginSuccessHandler} truyền cả hai
+token làm tham số truy vấn của redirect tới \code{/oauth/callback}.
+Cách sửa: đặt token vào \emph{fragment} của URL
+(\code{\#accessToken=...}) --- fragment không bao giờ được gửi tới
+server nào --- hoặc tốt hơn, chỉ trả về một mã dùng một lần mà trang
+đổi lấy token bằng POST. Thiết kế cookie bên dưới loại refresh token
+khỏi URL hoàn toàn.
+\end{pitfall}
+
+\begin{pitfall}[một 401 không liên quan tới token]
+Triệu chứng: mật khẩu sai ở trang đăng nhập làm khung ứng dụng lóe lên
+chốc lát, rồi quay về \code{/login}. Nguyên nhân: auth-service trả lời
+đăng nhập sai bằng 401; interceptor coi \emph{mọi} 401 là ``token hết
+hạn'' và, nếu một refresh token cũ còn trong storage từ phiên trước,
+thử refresh, thất bại, rồi chạy \code{logout()} cộng chuyển hướng
+cứng. Cách sửa: miễn các endpoint auth khỏi đường refresh
+(\code{originalRequest.url} bắt đầu bằng \code{/auth/}), và dọn store
+khi trang đăng nhập mount.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Ba sự cố chỉ client thấy.
+
+\begin{itemize}
+  \item \textbf{Laptop đóng nắp tám ngày.} Khi quay lại, access token
+  đã chết từ lâu và refresh token hết hạn hôm qua. Request đầu nhận
+  401, refresh nhận 401 (auth-service xóa dòng hết hạn và ném lỗi),
+  interceptor đăng xuất người dùng. Hành vi đúng --- nhưng mọi truy
+  vấn đang bay trên trang thất bại trước, và TanStack Query có thể thử
+  lại mỗi cái ba lần trước khi chuyển hướng tới nơi. Đặt
+  \code{retry: false} cho 401 trong tùy chọn mặc định của query client,
+  nếu không người dùng nhìn vòng xoay mười giây trước khi được đưa tới
+  đăng nhập.
+  \item \textbf{Đồng hồ client lệch.} Dự án không bao giờ kiểm tra
+  \code{exp} ở client, và thế là đúng: đồng hồ client không đáng tin
+  và gateway quyết định. Một client ``thông minh'' chủ động refresh khi
+  \code{exp} sắp tới sẽ, trên máy có đồng hồ nhanh 20 phút, refresh ở
+  mọi request --- hoặc, chậm 20 phút, không bao giờ refresh và vẫn
+  nhận 401. Hãy để 401 của server là tín hiệu.
+  \item \textbf{CORS cấu hình sai chỉ ở production.} Triệu chứng là lỗi
+  console ``No Access-Control-Allow-Origin header'' trên một request
+  trả 200 trong tab network. Trình duyệt nhận được phản hồi và từ chối
+  trao nó cho script. Nó xảy ra khi trang và API ở hai origin khác nhau
+  trong production (CDN cho bundle, gateway ở host khác) và danh sách
+  cho phép của gateway vẫn ghi \code{localhost}. Cách kiểm tra luôn
+  giống nhau: so header request \code{Origin} với danh sách
+  \code{allowedOrigins}, từng ký tự, cả scheme và cổng. Và để ý hình
+  dạng của lỗi: nó không bao giờ hiện với server, nơi log ghi một
+  request thành công.
+\end{itemize}
+
+\section{Nâng cấp giải pháp}
+\label{sec:fe-enhance}
+
+Thiết kế đích: access token chỉ sống trong bộ nhớ JavaScript (mất khi
+tải lại, khôi phục bằng một lần refresh âm thầm); refresh token sống
+trong cookie \code{HttpOnly} mà JavaScript không đọc được và trình
+duyệt chỉ gửi tới endpoint refresh.
+
+\textbf{1. Auth-service đặt cookie.} Khi đăng nhập, xác minh 2FA, và
+refresh, controller trả access token trong body và refresh token trong
+cookie:
+
+\begin{lstlisting}[language=Java]
+private ResponseCookie refreshCookie(String value, long maxAgeSec) {
+    return ResponseCookie.from("refresh_token", value)
+            .httpOnly(true)       // no document.cookie access
+            .secure(true)         // HTTPS only; false on plain localhost
+            .sameSite("Strict")   // never sent from another site
+            .path("/api/auth/refresh")   // only this endpoint sees it
+            .maxAge(maxAgeSec)
+            .build();
+}
+
+@PostMapping("/login")
+public ResponseEntity<LoginResponse> login(
+        @Valid @RequestBody LoginRequest request) {
+    LoginResponse r = authService.login(request);
+    if (r.refreshToken() == null) {          // 2FA or password change
+        return ResponseEntity.ok(r);
+    }
+    return ResponseEntity.ok()
+            .header(HttpHeaders.SET_COOKIE, refreshCookie(
+                    r.refreshToken(),
+                    jwtService.getRefreshTokenExpiryMs() / 1000).toString())
+            .body(new LoginResponse(r.accessToken(), null,
+                    false, false, null));    // token not in the body
+}
+
+@PostMapping("/refresh")
+public ResponseEntity<LoginResponse> refresh(
+        @CookieValue(name = "refresh_token", required = false)
+        String cookie) {
+    if (cookie == null) {
+        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+    }
+    LoginResponse r = authService.refreshToken(
+            new TokenRefreshRequest(cookie));
+    return ResponseEntity.ok()
+            .header(HttpHeaders.SET_COOKIE, refreshCookie(
+                    r.refreshToken(),
+                    jwtService.getRefreshTokenExpiryMs() / 1000).toString())
+            .body(new LoginResponse(r.accessToken(), null,
+                    false, false, null));
+}
+
+@PostMapping("/logout")
+public ResponseEntity<Void> logout(
+        @CookieValue(name = "refresh_token", required = false)
+        String cookie) {
+    if (cookie != null) authService.logout(cookie);
+    return ResponseEntity.noContent()
+            .header(HttpHeaders.SET_COOKIE,
+                    refreshCookie("", 0).toString())   // delete it
+            .build();
+}
+\end{lstlisting}
+
+\code{path} của cookie là thuộc tính mạnh nhất trong bốn: ngay cả khi
+một endpoint nào khác có lỗ hổng, trình duyệt không bao giờ đính cookie
+này vào nó. Để ý path là góc nhìn của \emph{gateway}
+(\code{/api/auth/refresh}), vì trình duyệt nói chuyện với gateway;
+gateway bỏ tiền tố sau đó. \code{SameSite=Strict} là phòng thủ CSRF:
+một form POST xuyên site không mang cookie chút nào. Yêu cầu body JSON
+trên \code{/refresh} là lớp thứ hai --- một form HTML thuần không gửi
+được \code{application/json} mà không có preflight, thứ thiết kế
+same-origin sẽ không cấp cho site khác.
+
+\textbf{2. Client giữ access token trong bộ nhớ.} Store bỏ
+\code{persist} và refresh token hoàn toàn:
+
+\begin{lstlisting}
+export const useAuthStore = create<AuthState>()((set) => ({
+  accessToken: null,          // memory only: gone on reload, by design
+  user: null,
+  isAuthenticated: false,
+  setAccessToken: (accessToken) =>
+    set({ accessToken, isAuthenticated: true }),
+  setUser: (user) => set({ user }),
+  logout: () =>
+    set({ accessToken: null, user: null, isAuthenticated: false }),
+}));
+\end{lstlisting}
+
+Khi tải trang, bộ nhớ trống; ứng dụng thực hiện một lần refresh âm
+thầm trước khi render các route được bảo vệ. Một lần tải lại vì thế tốn
+một vòng đi-về tới \code{/api/auth/refresh}, và nếu cookie không còn,
+người dùng ở \code{/login} --- cùng hành vi như phiên hết hạn.
+
+\textbf{3. Refresh single-flight với phát lại.} Interceptor giữ một
+promise đang chờ và một hàng đợi request chờ nó:
+
+\begin{lstlisting}
+let refreshing: Promise<string> | null = null;   // module-level lock
+
+async function refreshAccessToken(): Promise<string> {
+  if (!refreshing) {                              // first 401 starts it
+    refreshing = axios
+      .post('/api/auth/refresh', null, { withCredentials: true })
+      .then(({ data }) => {
+        useAuthStore.getState().setAccessToken(data.accessToken);
+        return data.accessToken as string;
+      })
+      .finally(() => { refreshing = null; });     // release the lock
+  }
+  return refreshing;                              // others await it
+}
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const original = error.config;
+    const isAuthCall = original.url?.startsWith('/auth/');
+    if (error.response?.status !== 401 || original._retry
+        || isAuthCall) {
+      return Promise.reject(error);
+    }
+    original._retry = true;
+    try {
+      const token = await refreshAccessToken();    // shared promise
+      original.headers.Authorization = `Bearer ${token}`;
+      return apiClient(original);                  // replay
+    } catch {
+      useAuthStore.getState().logout();
+      window.location.href = '/login';
+      return Promise.reject(error);
+    }
+  }
+);
+\end{lstlisting}
+
+Mười 401 đồng thời giờ sinh ra một POST; chín cái kia \code{await}
+cùng promise và phát lại với token nó trả về. \code{withCredentials:
+true} là thứ khiến axios gửi cookie --- và là thứ khiến request thành
+\emph{credentialed} với CORS. Để phối hợp xuyên tab, bọc thân của
+\code{refreshAccessToken} trong \code{navigator.locks.request('refresh',
+...)}: Web Locks API là toàn tiến trình, nên các tab thay phiên, và lần
+refresh của tab thứ hai thấy cookie đã được xoay bởi tab đầu và đơn
+giản là thành công.
+
+\textbf{4. Gateway, nếu có ngày xuất hiện origin thứ hai.} Request
+credentialed cấm wildcard; origin phải được liệt kê chính xác và
+preflight được cache:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowed-origins:
+              - https://app.teachersupporter.example   # exact, with scheme
+            allowed-methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+            allowed-headers: [Authorization, Content-Type]
+            allow-credentials: true                   # cookies cross-origin
+            max-age: 3600                             # cache the preflight
+\end{lstlisting}
+
+Với \code{SameSite=Strict} cookie vẫn không đi tới một site khác, nên
+một triển khai thực sự xuyên site cần \code{SameSite=None; Secure} và
+chấp nhận phơi nhiễm CSRF đi kèm --- lý do thiết kế same-origin của
+Chương~26 là thứ nên giữ.
+
+\begin{handson}[xem cookie làm việc của nó]
+Sau khi triển khai phiên bản cookie, đăng nhập qua UI, rồi kiểm tra
+trình duyệt giữ gì và gửi gì:
+\begin{lstlisting}[language=bash]
+$ curl -si -c jar.txt -X POST http://localhost:8080/api/auth/login \
+    -H 'Content-Type: application/json' \
+    -d '{"email":"teacher@ts.local","password":"secret"}' | grep -i set-cookie
+Set-Cookie: refresh_token=3f9c...; Path=/api/auth/refresh; Max-Age=604800;
+  HttpOnly; SameSite=Strict
+$ curl -s -b jar.txt -X POST http://localhost:8080/api/auth/refresh \
+    | jq .accessToken
+"eyJhbGciOiJIUzI1NiJ9..."
+$ curl -s -b jar.txt -o /dev/null -w '%{http_code}\n' \
+    http://localhost:8080/api/courses
+401
+\end{lstlisting}
+Dòng cuối là thuộc tính \code{path} đang làm việc: cookie tồn tại
+trong jar nhưng curl, giống trình duyệt, không gửi nó tới
+\code{/api/courses}. Trong DevTools cùng cookie đó hiện ổ khóa ở cột
+HttpOnly và \code{document.cookie} trả về chuỗi rỗng.
+\end{handson}
+
+\section{Ngoài dự án}
+
+Mẫu ở trên --- access token trong bộ nhớ, refresh token trong cookie
+\code{HttpOnly}, refresh âm thầm khi tải --- là thứ SPA SDK của Auth0,
+của Okta, và phần lớn ứng dụng web ngân hàng hiện thực, thường kèm xoay
+vòng refresh và phát hiện tái sử dụng ở server. Phương án thay thế loại
+trình duyệt khỏi việc xử lý token hoàn toàn là
+\emph{backend-for-frontend}: một server nhỏ (hoặc chính gateway) giữ
+token trong session phía server, và trình duyệt chỉ mang một cookie
+session bình thường; Spring Cloud Gateway hỗ trợ điều này với filter
+\code{TokenRelay} và đăng nhập OIDC. Người phỏng vấn hỏi ``bạn cất JWT
+ở đâu trong trình duyệt?'' mong đợi ``không ở đâu mà script đọc được,
+và refresh token không bao giờ trong URL'' theo sau là bảng đánh đổi ở
+trên. ``Còn XSS thì sao?'' có một câu trả lời không hề về nơi cất: một
+Content Security Policy ngăn script lạ chạy ngay từ đầu, thứ phòng thủ
+mà mọi lựa chọn nơi cất vẫn phụ thuộc vào.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Bạn cất JWT ở đâu trong trình duyệt, và vì sao?}
+
+Bắt đầu bằng tách hai token, vì chúng có thời gian sống và bán kính
+thiệt hại khác nhau. Access token 15 phút có thể sống trong bộ nhớ
+JavaScript: mất nó khi tải lại tốn một lần refresh âm thầm, và script
+trộm được nó có mười lăm phút. Refresh token là thông tin xác thực
+quan trọng --- bảy ngày ở đây --- và nó thuộc về một cookie
+\code{HttpOnly}, \code{Secure}, \code{SameSite=Strict} giới hạn bằng
+\code{Path} tới endpoint refresh, để không script nào đọc được và trình
+duyệt chỉ gửi nó tới một URL. \code{localStorage}, thứ dự án dùng hôm
+nay, bào chữa được cho phiên bản đầu và không bào chữa được khi bất kỳ
+script bên thứ ba nào chạy trên trang: cách một \code{JSON.parse} là
+một tuần truy cập. Câu kết senior là nơi cất là tuyến thứ hai; tuyến
+đầu là Content Security Policy ngăn script bị chèn thực thi ngay từ
+đầu.
+
+\subsection*{Q: Mười tab nhận 401 cùng một khoảnh khắc. Bao nhiêu lời gọi refresh xảy ra?}
+
+Với interceptor như đã viết, mười --- mỗi tab có bộ nhớ riêng và
+request đang chờ riêng, và trong một tab mỗi truy vấn song song chạy
+interceptor riêng rẽ, nên có thể hơn mười. Với xoay vòng refresh token
+ở server đó không phải lãng phí, đó là sự cố: lần refresh đầu xoay
+token, chín cái kia đưa ra token cũ và bị từ chối, và cơ chế phát hiện
+tái sử dụng mà server tốt hiện thực thu hồi cả họ token. Trong một tab
+cách sửa là promise dùng chung --- 401 đầu khởi động refresh, các 401
+sau await nó, tất cả phát lại với kết quả. Xuyên tab là
+\code{navigator.locks}: các tab lấy khóa lần lượt, và tab thứ hai thấy
+cookie đã xoay và thành công với một lần refresh bình thường. Điều đáng
+chủ động nói thêm là server nên khoan dung một cửa sổ ân hạn ngắn trên
+token trước đó, vài giây, vì việc mạng đảo thứ tự nghĩa là token ``cũ''
+có thể tới hợp lệ sau lần xoay.
+
+\subsection*{Q: XSS so với CSRF --- mỗi lựa chọn nơi cất phơi bạn ra trước cái nào?}
+
+Bearer token trong storage: miễn nhiễm CSRF, vì trình duyệt không bao
+giờ tự đính header \code{Authorization}, và phơi nhiễm hoàn toàn trước
+XSS, vì bất kỳ script nào trên origin đọc được storage. Cookie: miễn
+nhiễm việc XSS đọc khi \code{HttpOnly}, và phơi nhiễm trước CSRF vì
+trình duyệt đính cookie vào bất kỳ request nào tới host đó, kể cả từ
+trang của kẻ tấn công --- trừ khi \code{SameSite=Strict} hay
+\code{Lax} chặn nó, và một kiểm tra header tùy biến hay token hỗ trợ
+cho client cũ. Vậy lựa chọn thật là giữa một bài toán có cách sửa cơ
+học (CSRF) và một bài toán không có (XSS). Kỹ sư senior thêm rằng XSS
+trên trang có cookie \code{HttpOnly} vẫn có thể \emph{dùng} phiên trong
+lúc trang mở --- chỉ là không rút được thông tin xác thực ra --- và đó
+là lý do access token ngắn và thu hồi phía server vẫn quan trọng.
+
+\subsection*{Q: Người dùng đóng laptop tám ngày rồi quay lại. Chuyện gì xảy ra?}
+
+Cả hai thông tin xác thực đều chết: access token từ mười lăm phút,
+refresh token từ một ngày. Lời gọi API đầu nhận 401, interceptor gọi
+refresh, auth-service thấy dòng hết hạn, xóa nó và trả 401, client
+đăng xuất và chuyển hướng tới \code{/login}. Đó là kết quả đúng; câu
+hỏi chất lượng là người dùng thấy gì trên đường đi. Mọi truy vấn đang
+bay thất bại trước, và nếu query client thử lại request thất bại ba lần
+với backoff --- mặc định của TanStack Query --- chuyển hướng đến sau vài
+giây vòng xoay và các 401 lặp lại trong log. Cấu hình query client
+không thử lại với 401, chạy một lần refresh khi ứng dụng mount trước
+khi render route được bảo vệ, và cú quay lại sau tám ngày là một lần
+bật sạch về đăng nhập với route dự định được giữ cho sau đó.
+
+\subsection*{Q: Làm sao đăng xuất một người dùng ở mọi nơi?}
+
+Phía refresh là một thao tác cơ sở dữ liệu: xóa mọi dòng trong
+\code{refresh\_tokens} của người dùng đó, không chỉ dòng trình duyệt
+hiện tại đưa ra. Mọi thiết bị khác thất bại ở lần refresh kế tiếp và
+về trang đăng nhập trong vòng mười lăm phút. Phía access là bài toán
+của Chương~28 --- token đã ký không thể thu hồi --- nên hãy nói thật về
+cửa sổ và nêu hai cách đóng nó: một deny-list theo \code{jti} trong
+Redis được gateway kiểm tra, hoặc access token ngắn hơn. Trong dự án
+này thay đổi cụ thể là một phương thức repository,
+\code{deleteAllByUser(user)}, gọi từ một endpoint
+\code{/auth/logout-all} mới và từ hành động vô hiệu người dùng của
+admin. Nhắc cái bẫy phỏng vấn: một ``đăng xuất'' phía client chỉ dọn
+storage không thu hồi gì cả --- token vẫn hợp lệ ở bất kỳ ai đã sao
+chép nó.
+
+\subsection*{Q: Lỗi CORS xuất hiện ở production nhưng không bao giờ ở development. Bạn kiểm tra gì?}
+
+Trước hết, request có cross-origin ở production mà không ở development
+hay không --- trong dự án này proxy của Vite và Traefik đều giữ trang
+và API trên một origin, nên lỗi CORS ở production nghĩa là việc triển
+khai đã tách chúng: CDN cho bundle, host hay cổng khác cho gateway. Rồi
+so header \code{Origin} trình duyệt gửi, từng byte kể cả scheme và
+cổng, với danh sách cho phép của gateway; \code{https://app.example}
+và \code{https://app.example:443} là hai chuỗi khác nhau với Spring.
+Rồi quy tắc credentials: với cookie hay \code{withCredentials},
+origin wildcard bị trình duyệt từ chối ngay cả khi server gửi nó, và
+\code{Access-Control-Allow-Credentials: true} phải có mặt. Rồi
+preflight: một \code{OPTIONS} rơi vào route bỏ tiền tố và chuyển tiếp
+tới service sẽ trả 401 của service đó thay vì các header CORS, nên CORS
+phải được trả lời tại gateway trước khi định tuyến --- điều
+\code{CorsWebFilter} làm. Cuối cùng, nhìn log server và mong đợi không
+thấy gì: request ở đó thành công; trình duyệt mới là bên từ chối, và đó
+là hình dạng của mọi bài toán CORS.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Mở DevTools trên ứng dụng đang chạy và nêu tên khóa storage giữ
+  cả hai token. Viết biểu thức JavaScript một dòng mà một script bị
+  chèn sẽ dùng để đọc refresh token, và nói nó làm được gì với token
+  đó trong bảy ngày tới.
+  \item Interceptor gọi \code{axios} trần cho lần refresh thay vì
+  \code{apiClient}. Giải thích vòng lặp sẽ xảy ra nếu không, từng bước,
+  bắt đầu từ một 401 trên \code{/refresh}.
+  \item Với xoay vòng refresh token bật ở server, lần theo bốn 401 song
+  song qua interceptor như đã viết và cho biết ở bước nào người dùng bị
+  đăng xuất. Rồi giải thích vì sao phiên bản single-flight tránh được.
+  \item Thiết kế cookie đặt \code{Path=/api/auth/refresh}. Nêu hai đòn
+  tấn công khác nhau mà thuộc tính này làm cùn, và giải thích vì sao
+  path được viết theo góc nhìn của gateway chứ không phải auth-service.
+  \item \code{CorsConfig} liệt kê hai origin và cho phép credentials.
+  Trong mode triển khai nào trong hai mode của dự án nó được hỏi tới,
+  và một thay đổi triển khai duy nhất nào sẽ khiến nó quan trọng?
+  \item Người dùng báo lỗi CORS; log gateway cho thấy request trả 200.
+  Giải thích vì sao cả hai quan sát đúng cùng lúc, và liệt kê ba giá
+  trị header bạn sẽ so sánh trước tiên.
+\end{enumerate}
+\end{quiz}

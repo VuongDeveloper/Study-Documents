@@ -1,0 +1,583 @@
+\chapter{Đào sâu: Cấu hình --- Config Server, Secret và refresh ở quy mô lớn}
+\label{ch:dd-config}
+
+Chương~2 giới thiệu config-server như ``thêm một nguồn thuộc tính trong
+chồng'': một service HTTP nhỏ trao cho mỗi ứng dụng file YAML của nó lúc
+khởi động. Mô tả đó đầy đủ cho một chiếc laptop và thiếu sót nguy hiểm
+cho bất kỳ thứ gì khác. Chương này tháo rời đường đi cấu hình của dự án
+--- server thực sự phục vụ gì, ai đọc được, chuyện gì xảy ra khi nó thay
+đổi, và chuyện gì xảy ra khi nó không có mặt --- rồi xây lại theo hai
+cách khác nhau.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Cấu hình tập trung giải quyết vấn đề gì}, và trong ba
+  backend của nó (native, git, nền tảng) cái nào giải quyết tốt nhất cho
+  hệ thống nào?
+  \item \textbf{Bán kính thiệt hại của một file cấu hình là gì} --- ai
+  đọc nó, quy tắc ưu tiên nào áp dụng, và một giá trị mặc định trong
+  file được git theo dõi thực sự có nghĩa gì?
+  \item \textbf{Cái gì gãy} khi server chết, khi một giá trị phải đổi
+  lúc chạy, và khi một secret phải xoay?
+\end{enumerate}
+
+\section{Vì sao tập trung, và nó giải quyết gì}
+
+Quy tắc twelve-factor là \emph{tách bạch nghiêm ngặt cấu hình khỏi
+code}: một image được build một lần và thăng cấp nguyên vẹn qua các môi
+trường; chỉ cấu hình bao quanh nó khác đi. Mọi cơ chế cấu hình đều là
+một cách thỏa mãn quy tắc đó, và config-server là cơ chế đầu tiên hệ
+sinh thái Spring sinh ra. Nó giải quyết ba vấn đề cụ thể cùng lúc:
+
+\begin{itemize}
+  \item \textbf{Trùng lặp.} Năm service dùng chung địa chỉ Kafka,
+  endpoint tracing, mẫu log. Một tài liệu cho mỗi service ở một chỗ tốt
+  hơn năm bản sao trôi dạt.
+  \item \textbf{Nhận biết môi trường.} Cùng một service hỏi
+  \code{/course-service/prod} hay \code{/course-service/default} và nhận
+  đúng tài liệu, từ cùng một image.
+  \item \textbf{Thay đổi không cần build lại.} Với backend git, một thay
+  đổi cấu hình là một commit --- được review, có audit, hoàn tác được ---
+  và có hiệu lực ở lần khởi động hay refresh kế tiếp, không build lại
+  image nào.
+\end{itemize}
+
+Dự án nhận trọn lợi ích đầu, không nhận lợi ích thứ hai (chỉ có một
+profile, \code{default}), và lợi ích thứ ba chỉ trên nguyên tắc: với
+backend \code{native} các tài liệu nằm trong chính jar của
+config-server, nên đổi một giá trị \emph{đúng là} phải build lại.
+
+\begin{decision}[ba backend, ba hệ thống]
+\textbf{Native classpath} (dự án này): cấu hình và code trong một repo,
+một pipeline, một phiên bản. Đúng khi một đội sở hữu mọi thứ và mọi
+thay đổi cấu hình đằng nào cũng đi cùng thay đổi code. \textbf{Backend
+git}: cấu hình trong repository riêng với lịch sử riêng; đúng khi vận
+hành và phát triển là những người khác nhau, khi cùng một service chạy
+ở nhiều môi trường, hay khi kiểm toán viên hỏi ``ai đổi timeout và khi
+nào''. \textbf{Nền tảng} (ConfigMap và Secret, không server): đúng khi
+mọi đích triển khai đều là Kubernetes, vì nền tảng đã cung cấp cấu hình
+có phiên bản, mount được, bảo vệ bằng RBAC và bớt một JVM phải chạy. Dự
+án đang ở cái đầu và hướng tới cái thứ ba
+(Mục~\ref{sec:config-enhance}); cái thứ hai là thứ phần lớn doanh
+nghiệp bạn phỏng vấn thực sự đang chạy.
+\end{decision}
+
+\section{Đọc đường đi thật}
+
+Theo dõi một thuộc tính, \code{spring.datasource.url} của
+course-service, từ file tới pod đang chạy. Nó bắt đầu trong jar của
+config-server:
+
+\begin{lstlisting}[language=yaml]
+# config-server/src/main/resources/configurations/course-service.yml
+server:
+  port: 8082
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ts_course   (*@\co{1}@*)
+    username: postgres
+    password: root                                     (*@\co{2}@*)
+app:
+  s3:
+    endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}  (*@\co{3}@*)
+    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+\end{lstlisting}
+
+File \code{application.yml} đóng gói của service nói lấy tài liệu đó ở
+đâu:
+
+\begin{lstlisting}[language=yaml]
+# course-service/src/main/resources/application.yml
+spring:
+  application:
+    name: course-service                                (*@\co{4}@*)
+  config:
+    import: optional:configserver:http://localhost:8888 (*@\co{5}@*)
+\end{lstlisting}
+
+Và container ghi đè cả địa chỉ lẫn giá trị:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/course-service.yaml (env excerpt)
+- { name: SPRING_CONFIG_IMPORT,
+    value: "configserver:http://config-server:8888" }    (*@\co{6}@*)
+- { name: SPRING_DATASOURCE_URL,
+    value: "jdbc:postgresql://postgres-course:5432/ts_course" }
+envFrom:
+  - secretRef: { name: postgres-course-app }            (*@\co{7}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Một giá trị cứng, không phải placeholder: tài liệu được
+  phục vụ nói \code{localhost}. Nó chỉ đúng trên laptop.
+  \item[\co{2}] Mật khẩu cơ sở dữ liệu dạng cleartext, trong một file
+  git theo dõi, phục vụ qua HTTP. Ý định là chỉ cho dev; không gì trong
+  file nói thế.
+  \item[\co{3}] Thành ngữ \code{\${VAR:default}}: config-server phục vụ
+  placeholder \emph{chưa phân giải}; mỗi client tự phân giải với môi
+  trường của mình lúc khởi động. Đó là lý do cùng một tài liệu chạy
+  được trong Compose và Kubernetes --- và là lý do một giá trị mặc định
+  trong đó là giá trị mọi môi trường sẽ lặng lẽ dùng trừ khi được bảo
+  khác.
+  \item[\co{4}] Khóa tra cứu. Server ánh xạ \code{course-service} sang
+  \code{course-service.yml}.
+  \item[\co{5}] \code{optional:} --- nếu không gì trả lời ở 8888, cứ
+  khởi động từ file đóng gói. Đúng cho một dev chạy một service trong
+  IDE; sai cho một container.
+  \item[\co{6}] Container thay cả dòng import: host mới, và
+  \emph{không} có \code{optional:}. Config-server không với tới được giờ
+  là chết người lúc khởi động. Compose che việc này bằng
+  \code{depends\_on: condition: service\_healthy}; Kubernetes thì không,
+  và pod crash-loop cho tới khi server Ready (Chương~15).
+  \item[\co{7}] Mật khẩu ở \co{2} bị Secret ghi đè bằng
+  \code{SPRING\_DATASOURCE\_PASSWORD}. Giá trị mặc định cleartext vì thế
+  vô hại trong cụm --- \emph{chừng nào} Secret còn tồn tại. Xóa nó đi
+  và service không thất bại; nó kết nối bằng \code{root}.
+\end{description}
+
+\subsection{Ưu tiên, chính xác}
+
+Spring Boot dựng một \code{Environment} từ một danh sách có thứ tự các
+nguồn thuộc tính; nguồn đầu tiên định nghĩa một khóa sẽ thắng. Với dự
+án này thứ tự quan trọng, cao nhất trước:
+
+\begin{enumerate}
+  \item Tham số dòng lệnh và \code{SPRING\_APPLICATION\_JSON} (không
+  dùng ở đây).
+  \item Biến môi trường của OS --- \code{env} và \code{envFrom} của
+  Deployment, với relaxed binding biến \code{SPRING\_DATASOURCE\_URL}
+  thành \code{spring.datasource.url}.
+  \item Tài liệu import từ config-server.
+  \item File \code{application.yml} đóng gói đã thực hiện import.
+\end{enumerate}
+
+Hai hệ quả dễ trả lời sai trong phỏng vấn. Thứ nhất, tài liệu được
+import đứng trên file đã import nó: config-server ghi đè được mọi thứ
+đóng gói trong jar, nhưng không bao giờ ghi đè được thứ nền tảng đặt.
+Thứ hai, placeholder \code{\${VAR:default}} \emph{không} phải quy tắc ưu
+tiên; nó được phân giải sau khi ưu tiên đã chọn xong tài liệu. Biến môi
+trường \code{APP\_S3\_SECRET\_KEY} thắng giá trị mặc định không phải vì
+biến môi trường đứng trên config-server, mà vì chính văn bản của
+config-server đã yêu cầu nó.
+
+\begin{handson}[đọc thứ server phục vụ]
+Config-server không có xác thực và Compose publish cổng của nó. Hỏi nó
+tài liệu của course-service đúng như client làm:
+\begin{lstlisting}[language=bash]
+$ curl -s http://localhost:8888/course-service/default | \
+    python -m json.tool | head -20
+{
+    "name": "course-service",
+    "profiles": ["default"],
+    "label": null,
+    "version": null,
+    "propertySources": [
+        {
+            "name": "classpath:/configurations/course-service.yml",
+            "source": {
+                "server.port": 8082,
+                "spring.datasource.url": "jdbc:postgresql://localhost...",
+                "spring.datasource.username": "postgres",
+                "spring.datasource.password": "root",
+\end{lstlisting}
+Để ý \code{version: null} --- backend native không có commit id để báo.
+Backend git điền vào đó mã SHA, và đó là cách bạn trả lời ``pod này
+đang chạy cấu hình nào?'' trong production.
+\end{handson}
+
+\section{Ưu và nhược, thành thật}
+
+\begin{center}
+\begin{tabular}{@{}p{0.3\linewidth}p{0.62\linewidth}@{}}
+\toprule
+\textbf{Điểm mạnh} & \textbf{Trong dự án này} \\
+\midrule
+Một tài liệu cho mỗi service & Thật: năm file, không trùng lặp địa chỉ Kafka hay Zipkin. \\
+Placeholder theo môi trường & Thật: cùng các file phục vụ Compose và Kubernetes không sửa gì. \\
+Lấy lúc khởi động, không phụ thuộc lúc chạy & Thật: đã lên rồi, service không nói chuyện với server nữa. \\
+\midrule
+\textbf{Điểm yếu} & \\
+\midrule
+Không xác thực & Ai với tới 8888 đọc được mọi tài liệu, kể cả mặc định và mật khẩu. \\
+Native = build lại để đổi & Chỉnh một timeout là một lượt build image config-server và rollout. \\
+Mặc định dùng được cho secret & \code{JWT\_SECRET} và \code{root} có giá trị dự phòng dùng được trong git. \\
+Ràng buộc thứ tự & Mọi pod phụ thuộc vào một pod không còn việc gì sau khi boot. \\
+Chỉ một profile & \code{default} ở mọi nơi; môi trường chỉ khác nhau bằng biến môi trường. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Dòng cuối đáng một câu. Profile của Spring được thiết kế đúng cho việc
+tách dev/staging/prod, và config-server tự động phục vụ
+\code{course-service-prod.yml} chồng lên \code{course-service.yml} khi
+\code{SPRING\_PROFILES\_ACTIVE=prod}. Dự án không bao giờ dùng việc này;
+mọi khác biệt môi trường là một biến môi trường. Đó là một đơn giản hóa
+bảo vệ được --- một cơ chế thay vì hai --- nhưng nghĩa là các tài liệu
+được phục vụ không bao giờ nói được ``giá trị này chỉ cho development''.
+
+\section{Cái gì gãy}
+
+\begin{pitfall}[khóa ký nằm trong repository]
+Triệu chứng: không có, và đó chính là vấn đề. Mở \code{api-gateway.yml}
+và \code{auth-service.yml} được phục vụ:
+\begin{lstlisting}[language=yaml]
+app:
+  jwt:
+    secret: ${JWT_SECRET:mySecretKeyThatIsAtLeast256Bits...}
+\end{lstlisting}
+Nguyên nhân: giá trị mặc định là một khóa HS256 \emph{hợp lệ}, commit
+vào một repository công khai, và \code{create-secrets.sh} mặc định
+\code{JWT\_SECRET} thành đúng chuỗi đó. Bất kỳ triển khai nào quên đặt
+biến sẽ ký token bằng khóa cả internet đọc được --- và với HS256
+(Chương~28) đọc được khóa nghĩa là đúc được token cho bất kỳ user nào.
+Cách sửa có hai nửa: bỏ giá trị mặc định để biến thiếu thì thất bại lúc
+khởi động (\code{\${JWT\_SECRET}} không có dấu hai chấm --- Spring từ
+chối phân giải), và coi mọi \code{\${VAR:value}} trong tài liệu được
+phục vụ như một câu hỏi: ``tôi có ổn không nếu production chạy với giá
+trị này?'' Mật khẩu và khóa không bao giờ qua được bài kiểm tra đó;
+cổng và hostname thường qua.
+\end{pitfall}
+
+\begin{pitfall}[refresh một service, hỏng tất cả]
+Triệu chứng: sau khi ``xoay JWT secret'' bằng \code{POST
+/actuator/refresh} trên auth-service, mọi request qua gateway trả về
+401 cho tới khi gateway khởi động lại. Nguyên nhân: refresh là
+\emph{theo từng instance}. Auth-service đã dựng lại các bean
+\code{@RefreshScope} và giờ ký bằng khóa mới; gateway vẫn xác minh bằng
+khóa cũ. Kể cả khi cả hai được refresh, không có cửa sổ chồng lấn ---
+mọi token phát trước lần refresh trở nên vô hiệu ngay khoảnh khắc
+gateway refresh. Một khóa đối xứng dùng chung giữa bên ký và bên xác
+minh không thể hot-swap được; nó cần nghi thức dựa trên \code{kid} của
+Chương~28. Quy tắc chung: refresh dành cho các giá trị mà bản cũ và bản
+mới cùng tồn tại được (một feature flag, một mức log, một timeout),
+không phải cho các giá trị hai bên phải thống nhất.
+\end{pitfall}
+
+\begin{pitfall}[khỏe mạnh nhưng sai]
+Triệu chứng: config-server báo \code{UP}, service khởi động, giá trị
+sai đang có hiệu lực. Nguyên nhân: health indicator của config-server
+kiểm tra \emph{backend} có trả lời --- với native, là thư mục classpath
+có tồn tại. Nó không nói gì về nội dung. Một lỗi chính tả ở tên khóa
+YAML (\code{acess-key}) được phục vụ vui vẻ và bị client bỏ qua vui vẻ,
+rồi client dùng giá trị mặc định của nó. Không bên nào log lỗi. Phòng
+thủ nằm ở client: bind cấu hình vào một record
+\code{@ConfigurationProperties} với \code{@Validated} và
+\code{@NotBlank} trên các trường bắt buộc, để khóa thiếu hay sai chính
+tả thất bại lúc khởi động với tên thuộc tính trong thông báo.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Pod config-server bị evict lúc 3 giờ sáng; không gì khác bị.
+
+\begin{itemize}
+  \item \textbf{Service đang chạy: không sao.} Mỗi cái đã lấy tài liệu
+  một lần lúc boot và giữ trong bộ nhớ. Không đường request nào chạm
+  tới config-server. Đây là tính chất biện minh cho một replica duy
+  nhất.
+  \item \textbf{Service khởi động lại trong lúc sự cố: crash loop.}
+  Import của nó không optional; lấy thất bại; JVM thoát; kubelet khởi
+  động lại với back-off lũy thừa (Chương~24). Khi config-server trở
+  lại, lần khởi động kế tiếp thành công --- sau tối đa năm phút chờ
+  back-off. Hệ thống hội tụ; nó không hội tụ nhanh.
+  \item \textbf{Rolling update trong lúc sự cố: đứng.} Pod mới không bao
+  giờ Ready, pod cũ tiếp tục phục vụ (\code{maxUnavailable} của
+  Chương~15), và rollout chờ. Hành vi đúng, nhưng pipeline deploy sẽ
+  báo timeout.
+  \item \textbf{Khôi phục \code{optional:}: tệ hơn.} Pod khởi động lại
+  boot từ giá trị mặc định đóng gói --- \code{localhost:5432},
+  \code{localhost:9092} --- thành Ready (probe của nó là
+  \code{/v3/api-docs}, không cần cơ sở dữ liệu), nhận lưu lượng, và
+  thất bại mọi request. Sự cố trông như ``config-server chết'' giờ thành
+  ``course-service trả 500'', cách nguyên nhân hai bước nhảy.
+\end{itemize}
+
+Retry với back-off là điểm giữa: giữ import bắt buộc, nhưng cho client
+thử một lúc trước khi chết. Nó cần \code{spring-retry} và
+\code{spring-boot-starter-aop} trên classpath, rồi:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    config:
+      fail-fast: true          # unreachable server is fatal ...
+      retry:
+        max-attempts: 20       # ... after 20 tries
+        initial-interval: 2000 # 2 s, then x1.5 each time
+        multiplier: 1.5
+        max-interval: 15000    # capped at 15 s: ~4 minutes total
+\end{lstlisting}
+
+So với để kubelet làm việc retry: khởi động lại JVM tốn hai mươi giây
+nạp class mỗi lần và back-off tăng tới năm phút; retry trong tiến trình
+không tốn gì và chặn trên ở mười lăm giây. Cả hai đều hội tụ; một cái
+lãng phí một CPU mà chiếc máy hai nhân không có.
+
+\section{Nâng cấp giải pháp}
+\label{sec:config-enhance}
+
+Hai nâng cấp, theo thứ tự một doanh nghiệp sẽ làm.
+
+\subsection{Nâng cấp 1: backend git với giá trị mã hóa}
+
+Giữ config-server, chuyển tài liệu của nó vào một repository, và ngừng
+commit secret dạng cleartext. Phía server:
+
+\begin{lstlisting}[language=yaml]
+# config-server/src/main/resources/application.yml
+server:
+  port: 8888
+spring:
+  application:
+    name: config-server
+  profiles:
+    active: git                                        (*@\co{1}@*)
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://git.example.com/ts/config-repo.git
+          default-label: main                          (*@\co{2}@*)
+          search-paths: '{application}'                (*@\co{3}@*)
+          clone-on-start: true                         (*@\co{4}@*)
+          username: ${CONFIG_GIT_USER}
+          password: ${CONFIG_GIT_TOKEN}
+encrypt:
+  key: ${CONFIG_ENCRYPT_KEY}                           (*@\co{5}@*)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Profile chọn backend. \code{native} và \code{git} là hai
+  cái có sẵn; Vault và JDBC cũng tồn tại.
+  \item[\co{2}] Label là một branch hay tag. Ghim môi trường production
+  vào \code{release-2026.09} và một thay đổi cấu hình là một lượt merge,
+  không phải một lượt sửa.
+  \item[\co{3}] Một thư mục cho mỗi service trong repository:
+  \code{course-service/application.yml}. Cùng tên file như hôm nay, sâu
+  hơn một thư mục.
+  \item[\co{4}] Clone lúc khởi động thay vì lúc có request đầu tiên, để
+  health check chứng minh credential dùng được trước khi client nào
+  hỏi.
+  \item[\co{5}] Một khóa đối xứng cho các endpoint \code{/encrypt} và
+  \code{/decrypt}. Đó là secret duy nhất config-server phải giữ, và nó
+  phải đến từ nền tảng (một Secret của Kubernetes), không bao giờ từ một
+  file trong bất kỳ repository nào.
+\end{description}
+
+Có khóa rồi, mã hóa một giá trị là một request, và repository chỉ lưu
+bản mã:
+
+\begin{lstlisting}[language=bash]
+$ curl -s -X POST http://localhost:8888/encrypt \
+       -d 'a-real-256-bit-signing-key-generated-with-openssl'
+AQBt3s6...b3f0e   # ciphertext; safe to commit
+\end{lstlisting}
+
+\begin{lstlisting}[language=yaml]
+# config-repo/api-gateway/application.yml
+app:
+  jwt:
+    secret: '{cipher}AQBt3s6...b3f0e'   # decrypted by the server on serve
+\end{lstlisting}
+
+Tiền tố \code{\{cipher\}} bảo server giải mã trước khi phục vụ.
+Repository giờ không chứa secret dùng được nào, bẫy giá trị mặc định
+biến mất (không có mặc định), và \code{git log -- api-gateway/} trả lời
+ai đổi khóa và khi nào. Thứ nó \emph{không} sửa: tài liệu được phục vụ
+vẫn đi qua mạng dạng cleartext tới một endpoint không xác thực. Thêm
+\code{spring-boot-starter-security} vào config-server với credential
+HTTP basic, và cấp cho mỗi client
+\code{spring.cloud.config.username/password} từ Secret riêng của nó.
+
+\subsection{Nâng cấp 2: cho server nghỉ hưu}
+
+Trên Kubernetes nền tảng có thể tự phục vụ các tài liệu. Kustomize sinh
+một ConfigMap cho mỗi service thẳng từ các file hiện có, nên lịch sử
+git không đổi:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/kustomization.yaml (excerpt)
+configMapGenerator:
+  - name: course-service-config
+    files:
+      # key in the ConfigMap = application.yml, value = the file
+      - application.yml=../../config-server/src/main/resources/configurations/course-service.yml
+generatorOptions:
+  disableNameSuffixHash: false   # hash suffix: a changed file = a
+                                 # new ConfigMap name = a rollout
+\end{lstlisting}
+
+Deployment mount nó như một thư mục và trỏ Spring vào thư mục thay vì
+server:
+
+\begin{lstlisting}[language=yaml]
+# deploy/k8s/base/course-service.yaml (excerpt)
+spec:
+  template:
+    spec:
+      containers:
+        - name: course-service
+          env:
+            # replaces configserver:http://config-server:8888
+            - { name: SPRING_CONFIG_IMPORT, value: "file:/config/" }
+            - { name: SPRING_DATASOURCE_URL,
+                value: "jdbc:postgresql://postgres-course:5432/ts_course" }
+          envFrom:
+            - secretRef: { name: postgres-course-app }
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: course-service-config }
+\end{lstlisting}
+
+Spring Boot coi dấu gạch chéo cuối là import thư mục và nạp
+\code{application.yml} từ đó, với đúng thứ tự ưu tiên mà tài liệu từ
+config-server từng có: trên file đóng gói, dưới biến môi trường. Không
+gì trong code hay jar của service thay đổi; Compose vẫn chạy vì import
+\code{optional:configserver:} đóng gói vẫn trỏ tới server (vẫn chạy,
+trong Compose). Rồi xóa \code{config-server.yaml} khỏi base, và cụm bớt
+một JVM, bớt một phụ thuộc khởi động, bớt một endpoint không xác thực.
+
+Hậu tố hash trong tên là chi tiết khiến cách này tốt hơn server, chứ
+không chỉ tương đương. Một ConfigMap tên
+\code{course-service-config-7b9c4} đổi tên khi nội dung đổi; Deployment
+tham chiếu tên mới là một pod template mới; Kubernetes roll các pod.
+Thay đổi cấu hình, rollout và rollback là cùng một thao tác với thay đổi
+code --- đúng thứ mục GitOps của Chương~27 muốn.
+
+\begin{decision}[khi nào bỏ hẳn config-server]
+Bỏ khi ba điều đúng: mọi runtime đều là Kubernetes, không service nào
+cần giá trị đổi mà không khởi động lại pod, và secret đã sống trong nền
+tảng (đúng thế --- Chương~16). Giữ khi bất kỳ điều nào sai: service
+trên VM hay trong Compose ở production, một yêu cầu refresh lúc chạy
+thật sự (hiếm; feature flag được phục vụ tốt hơn bởi hệ thống chuyên
+dụng), hay một tổ chức mà dấu vết audit cấu hình phải độc lập với
+repository triển khai. Người phỏng vấn hỏi ``bạn có dùng Spring Cloud
+Config trên Kubernetes không?'' đang chờ nghe danh sách này, và câu
+``nền tảng đã cung cấp sẵn''.
+\end{decision}
+
+\section{Ngoài dự án}
+
+Config-server backend git với giá trị \code{\{cipher\}} là chuẩn từ
+khoảng 2015 tới 2020 và vẫn là thứ bạn gặp ở phần lớn công ty Java. Hai
+thứ đã thay thế từng phần của nó. HashiCorp Vault (và các bản tương
+đương trên cloud, AWS Secrets Manager, Azure Key Vault) giữ secret với
+lease và xoay vòng; Spring Cloud Vault hay External Secrets Operator
+đưa chúng vào pod, và repository cấu hình chỉ giữ tham chiếu. Các dịch
+vụ feature flag (LaunchDarkly, Unleash, OpenFeature) tiếp quản trường
+hợp refresh lúc chạy với quy tắc nhắm mục tiêu và audit mà
+\code{@RefreshScope} chưa bao giờ có. Thứ sống sót nguyên vẹn là kỷ
+luật: cấu hình ngoài image, thứ tự ưu tiên bạn thuộc lòng, và không
+secret dùng được trong bất kỳ file nào bạn commit.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Bạn phải xoay mật khẩu cơ sở dữ liệu cho năm mươi
+service mà không có downtime. Trình bày từng bước.}
+
+Xoay vòng không bao giờ là một lần ghi; nó là một sự chồng lấn. Thứ
+nhất, tạo credential mới trong cơ sở dữ liệu trong khi cái cũ vẫn dùng
+được --- Postgres cho phép hai role hay hai mật khẩu cùng tồn tại, và
+các dịch vụ được quản lý (RDS, Cloud SQL) có ``dual password'' đúng cho
+việc này. Thứ hai, đưa giá trị mới vào Secret của nền tảng (hoặc vào
+repository cấu hình dưới dạng \code{\{cipher\}}) và kích hoạt các bên
+tiêu thụ: trên Kubernetes là một lượt \code{rollout restart} cho mỗi
+Deployment, việc mà mẹo hash tên ConfigMap làm hộ bạn; với Spring Cloud
+Bus là một \code{POST /actuator/busrefresh} mà mọi instance nhận qua
+Kafka. Thứ ba, theo dõi log kết nối của cơ sở dữ liệu cho tới khi không
+session nào dùng role cũ, rồi thu hồi. Cạm bẫy của dự án ở Chương~16
+--- ``đổi Secret rồi, không có gì xảy ra'' --- là thứ bước hai ngăn
+chặn. Câu trả lời senior gọi tên sự chồng lấn một cách tường minh và
+nói bước nào được phép thất bại: thu hồi, thứ bạn chỉ cần hoãn lại.
+
+\subsection*{Q: Một thay đổi cấu hình phải tới mọi instance trong vòng
+một phút. Khởi động lại thì quá chậm. Bạn làm gì?}
+
+Phân biệt loại giá trị trước. Một mức log, một rate limit, một feature
+flag: đánh dấu bean \code{@RefreshScope}, mở \code{/actuator/busrefresh},
+thêm \code{spring-cloud-starter-bus-kafka} --- dự án đã có Kafka --- và
+một POST phát sóng một \code{RefreshRemoteApplicationEvent}; mỗi
+instance lấy lại tài liệu và dựng lại các bean refresh-scoped trong vài
+giây. Một URL cơ sở dữ liệu, một địa chỉ bootstrap Kafka, một khóa ký:
+\emph{đừng} refresh những thứ đó, vì connection pool, producer hay bên
+xác minh giữ giá trị cũ trong các object không được dựng lại sạch sẽ;
+khởi động lại thay vào đó. Nếu yêu cầu thực ra là ``flag cho thử
+nghiệm sản phẩm'', hãy nói rằng một dịch vụ feature flag (Unleash,
+LaunchDarkly) với SDK poll vài giây một lần là công cụ chuyên dụng, còn
+\code{@RefreshScope} là cách chữa cháy mười năm tuổi.
+
+\subsection*{Q: Config server là điểm lỗi đơn. Bạn xử lý thế nào?}
+
+Bắt đầu bằng thu hẹp nó là điểm lỗi đơn \emph{cho cái gì}: khởi động,
+không phải lưu lượng. Service đang chạy không bao giờ gọi lại nó, nên
+sự cố config-server chỉ ảnh hưởng khởi động lại và scale-out. Rồi giảm
+cả điều đó: hai replica sau Service (nó phi trạng thái với backend
+native hay git --- mỗi replica một bản clone git là ổn),
+\code{fail-fast} cộng retry để pod đang boot chờ tới vài phút thay vì
+chết, và một readiness probe trên config-server để Service không bao
+giờ định tuyến tới replica còn đang clone. Câu trả lời mạnh nhất loại
+bỏ phụ thuộc: phục vụ tài liệu từ ConfigMap, và ``điểm lỗi đơn'' trở
+thành API server của Kubernetes, thứ bạn đã phụ thuộc cho mọi thứ khác.
+
+\subsection*{Q: Làm sao giữ secret ngoài git mà cấu hình vẫn trong git?}
+
+Ba tầng, mỗi tầng chấp nhận được ở một quy mô khác nhau. Nhỏ nhất:
+\code{/encrypt} của config-server với khóa đối xứng chỉ server giữ; git
+lưu văn bản \code{\{cipher\}}, và repository bị lộ vô dụng nếu không có
+khóa. Trung bình: Secret của Kubernetes tạo ngoài luồng
+(\code{create-secrets.sh} của dự án) và được tham chiếu theo tên trong
+manifest, nên git giữ hình dạng nhưng không bao giờ giữ giá trị. Lớn
+nhất: một trình quản lý secret --- Vault, AWS Secrets Manager --- với
+External Secrets Operator đồng bộ vào Secret của Kubernetes, để xoay
+vòng và audit sống ở nơi secret sống. Cái bẫy cần gọi tên: một
+\code{\${VAR:default}} với giá trị mặc định dùng được là một secret
+trong git bất kể bạn chọn tầng nào.
+
+\subsection*{Q: Hai pod của cùng một service đang chạy với cấu hình
+khác nhau. Sao lại thế, và ngăn bằng cách nào?}
+
+Nguyên nhân thường gặp: một rolling update kẹt nửa chừng (pod cũ với
+tài liệu cũ, pod mới với tài liệu mới --- bình thường và tạm thời); một
+config-server có bản clone git cũ trên một replica vì
+\code{clone-on-start} tắt và replica đó không bao giờ làm mới; hay,
+tinh vi nhất, một \code{/actuator/refresh} gửi tới một instance qua load
+balancer tình cờ chọn nó. Phòng ngừa là biến cấu hình thành một phần
+của pod template: mount từ ConfigMap có tên mang hash nội dung, để
+``cấu hình nào'' được trả lời bằng ``ReplicaSet nào''. Phát hiện là
+phơi phiên bản cấu hình --- mã SHA git mà config-server trả về dưới
+dạng \code{version}, hoặc tên ConfigMap --- trong \code{/actuator/info},
+và so sánh giữa các pod trước khi tin bất kỳ báo cáo ``nó chạy trên
+một trong số chúng'' nào.
+
+\begin{quiz}
+\begin{enumerate}
+  \item \code{course-service.yml} được phục vụ nói \code{password: root}
+  và Secret của Deployment nói khác. Nêu cái nào thắng và vì sao, rồi mô
+  tả chuyện gì xảy ra nếu Secret bị xóa và pod khởi động lại.
+  \item Giải thích vì sao \code{\${APP\_S3\_SECRET\_KEY:minioadmin}}
+  trong tài liệu được phục vụ không phải quy tắc ưu tiên, và
+  config-server thực sự gửi gì cho client với khóa đó.
+  \item Một đồng nghiệp chạy \code{POST /actuator/refresh} trên cả
+  auth-service và api-gateway sau khi đổi \code{JWT\_SECRET}. Liệt kê
+  hai cửa sổ lỗi riêng biệt và nêu cơ chế từ Chương~28 mà xoay khóa
+  nóng thực sự cần.
+  \item Config-server chết; course-service được scale từ một lên hai
+  replica trong lúc sự cố. Mô tả pod mới làm gì với \code{configserver:}
+  (không optional), với \code{optional:configserver:}, và với
+  \code{fail-fast} cộng retry.
+  \item Sau khi chuyển sang ConfigMap, cái gì khiến pod khởi động lại
+  khi một giá trị đổi, và vì sao điều đó khiến việc chuyển đổi \emph{có
+  năng lực hơn} server nó thay thế chứ không chỉ tương đương?
+  \item Phỏng vấn: ``Bạn có triển khai Spring Cloud Config trên
+  Kubernetes không?'' Nêu ba điều kiện để bạn bỏ nó và một điều kiện để
+  bạn giữ.
+\end{enumerate}
+\end{quiz}

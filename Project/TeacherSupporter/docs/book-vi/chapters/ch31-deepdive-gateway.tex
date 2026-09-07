@@ -1,0 +1,617 @@
+\chapter{Đào sâu: Gateway dưới tải --- bên trong stack reactive, rate limit và việc của biên}
+\label{ch:dd-gateway}
+
+Chương~4 dạy gateway như một bảng route: predicate, URI \code{lb://},
+\code{StripPrefix}, một filter JWT. Đó là gateway vào một ngày yên ả.
+Chương này là gateway vào một ngày tệ --- course-service chậm, một
+client kẹt trong vòng lặp retry, một pod khởi động lại đúng lúc không
+nên --- và hỏi stack reactive thực sự mua được gì, biên của dự án đang
+thiếu gì, và ranh giới giữa việc của biên và việc của mọi người khác
+nằm ở đâu.
+
+Ba câu hỏi sắp xếp chương này:
+
+\begin{enumerate}
+  \item \textbf{Vì sao gateway không chặn (non-blocking)}, và chính
+  xác chuyện gì hỏng nếu một filter chặn?
+  \item \textbf{Cái gì gãy trước dưới tải} --- và vì sao câu trả lời là
+  ``thứ không có timeout''?
+  \item \textbf{Cái gì thuộc về biên} --- rate limit, circuit breaker,
+  CORS --- và cái gì không bao giờ nên?
+\end{enumerate}
+
+\section{Vì sao cần gateway, và nó giải quyết gì}
+
+Không có gateway, frontend phải giữ sáu địa chỉ, mỗi service phải tự
+xác minh JWT, và CORS, rate limit, header truy vết sẽ được làm sáu lần
+hoặc không lần nào. Gateway gom tất cả về một địa chỉ và một chỗ cho
+mọi mối quan tâm \emph{xuyên suốt} --- những thứ thuộc về \emph{mọi}
+request chứ không thuộc về khóa học hay người dùng. Dạng phỏng vấn của
+câu hỏi là ``API gateway làm được gì mà load balancer không làm được?''
+và câu trả lời senior là: load balancer chọn một backend; gateway
+\emph{hiểu request} --- nó có thể xác thực, viết lại, giới hạn tốc độ
+và chuyển hướng theo từng route, vì nó chạy code ứng dụng trên đường
+đi. Sức mạnh đó cũng là rủi ro: bất cứ thứ gì bạn đặt lên đường đó, mọi
+request đều phải trả giá.
+
+\begin{decision}[gateway ứng dụng phía sau router hạ tầng]
+Cụm đã có Traefik (Chương~18). Vì sao vẫn giữ Spring Cloud Gateway
+phía sau? Vì hai thứ làm hai việc khác nhau: Traefik sở hữu host, TLS
+và việc chia nhánh theo path; gateway sở hữu những thứ chỉ ứng dụng
+mới biết --- tên Eureka nào phục vụ \code{/api/courses}, JWT hợp lệ
+trông ra sao, header nào cần chèn. Gộp chúng nghĩa là dạy Traefik
+secret JWT và hợp đồng header, việc khả thi (middleware ForwardAuth)
+nhưng đưa bảo mật ứng dụng vào cấu hình hạ tầng. Quyết định sẽ lật nếu
+nền tảng tự cung cấp danh tính (API Gateway cloud với Cognito hay IAP):
+lúc đó gateway Spring là một chặng thứ hai trả tiền mà không được gì.
+\end{decision}
+
+\section{Stack reactive, đọc từ filter}
+\label{sec:reactive}
+
+Gateway khai báo \code{web-application-type: reactive} trong
+\code{application.yml} của nó. Một dòng đó đổi mô hình mỗi request một
+thread của Tomcat lấy vòng lặp sự kiện (event loop) của Reactor Netty,
+và mọi dòng của filter JWT được viết cho mô hình đó:
+
+\begin{lstlisting}[language=Java]
+@Override
+public Mono<Void> filter(ServerWebExchange exchange,
+                         GatewayFilterChain chain) {           (*@\co{1}@*)
+    String path = exchange.getRequest().getURI().getPath();
+    if (isPublicPath(path)) {
+        return chain.filter(exchange);                          (*@\co{2}@*)
+    }
+    String authHeader = exchange.getRequest().getHeaders()
+            .getFirst(HttpHeaders.AUTHORIZATION);
+    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+        return unauthorizedResponse(exchange, "Missing ...");  (*@\co{3}@*)
+    }
+    String token = authHeader.substring(7);
+    try {
+        Claims claims = Jwts.parser().verifyWith(signingKey)
+                .build().parseSignedClaims(token).getPayload(); (*@\co{4}@*)
+        ServerHttpRequest mutated = exchange.getRequest().mutate()
+                .header(JwtConstants.HEADER_USER_ID, claims.getSubject())
+                .header(JwtConstants.HEADER_USER_ROLE,
+                        claims.get(JwtConstants.CLAIM_ROLE, String.class))
+                .build();
+        return chain.filter(exchange.mutate().request(mutated).build());
+    } catch (Exception e) {
+        return unauthorizedResponse(exchange, "Invalid or expired token");
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Kiểu trả về là toàn bộ câu chuyện. Một filter servlet
+  trả về \code{void} \emph{sau khi} request đã xong; cái này trả về một
+  \code{Mono<Void>} --- một \emph{mô tả} công việc sẽ hoàn thành sau.
+  Thread gọi \code{filter} được tự do ngay khi phương thức này trả về.
+  \item[\co{2}] \code{chain.filter(exchange)} không chuyển tiếp request;
+  nó trả về \code{Mono} của chặng kế tiếp. Chưa có gì xảy ra. Chuỗi
+  được lắp ráp trước và subscribe một lần.
+  \item[\co{3}] Ngay cả nhánh lỗi cũng reactive: \code{writeWith} trả
+  về một \code{Mono} hoàn thành khi Netty đã flush xong body.
+  \item[\co{4}] Mẩu công việc thật duy nhất, và nó thuộc loại tốn CPU
+  chỉ vài micro giây: một HMAC trên vài trăm byte. Đây là loại việc
+  \emph{được phép} chạy trên thread event loop. Một lời gọi cơ sở dữ
+  liệu thì không.
+\end{description}
+
+\subsection{Thread: bốn, không phải bốn trăm}
+
+Tomcat trả lời tính đồng thời bằng thread: mặc định 200, mỗi request
+đang bay một thread, mỗi thread đứng chờ trong lúc backend trả lời.
+Request của một proxy gần như toàn là chờ, nên một proxy Tomcat với
+1.000 request đang bay cần 1.000 thread và khoảng một gigabyte cho
+stack. Reactor Netty chạy một nhóm nhỏ, cố định các thread
+\emph{event loop}, mỗi thread ghép kênh hàng nghìn socket bằng I/O
+không chặn: một request đến, chuỗi filter được lắp ráp, lệnh ghi lên
+upstream được phát đi, và thread đi tiếp. Khi upstream trả lời, vòng
+lặp nào sở hữu socket đó sẽ tiếp tục chuỗi.
+
+\begin{hardware}
+Reactor Netty định cỡ vòng lặp bằng \code{max(availableProcessors, 4)}.
+Trên hai lõi của ts-server, đó là \textbf{bốn} thread event loop cho
+toàn bộ gateway. Bốn thread phục vụ mọi request là lý do Deployment của
+gateway xin ít bộ nhớ hơn một service MVC (384\,Mi so với 512\,Mi,
+Chương~17) --- và là lý do một thread bị chặn không phải vấn đề
+0,5\,\% mà là vấn đề 25\,\%.
+\end{hardware}
+
+\subsection{Chặn làm gì một event loop}
+
+Giả sử ai đó ``cải tiến'' filter bằng cách kiểm tra danh sách cấm trong
+Postgres:
+
+\begin{lstlisting}[language=Java]
+// DO NOT: a JDBC call inside a WebFlux filter
+boolean revoked = jdbcTemplate.queryForObject(
+        "select exists(select 1 from revoked where jti = ?)",
+        Boolean.class, claims.getId());
+\end{lstlisting}
+
+JDBC chặn theo đặc tả: thread gọi đứng chờ socket. Thread đó là một
+trong bốn event loop, và trong lúc chờ nó không phục vụ hàng trăm
+socket khác mà nó sở hữu. Request của chúng khựng lại --- không thất
+bại, \emph{khựng} --- cho tới khi truy vấn trả về. Dưới một cơ sở dữ
+liệu chậm, cả bốn vòng lặp bị ghim trong vài giây và gateway nhận kết
+nối mà nó không xử lý nổi: mọi route, mọi user, một triệu chứng. Điều
+tương tự đúng với \code{.block()} trên một \code{Mono},
+\code{Thread.sleep}, một lời gọi \code{RestTemplate} đồng bộ, hay đọc
+file. Phương án reactive dời công việc ra khỏi vòng lặp và
+\emph{ghép} nó vào chuỗi:
+
+\begin{lstlisting}[language=Java]
+return Mono.fromCallable(() -> deny.isRevoked(claims.getId()))
+        .subscribeOn(Schedulers.boundedElastic())   // off the loop
+        .flatMap(revoked -> revoked
+                ? unauthorizedResponse(exchange, "Token revoked")
+                : chain.filter(exchange.mutate().request(mutated).build()));
+\end{lstlisting}
+
+Tốt hơn nữa là một client không chặn (Redis reactive, R2DBC) để không
+thread nào phải chờ cả. Quy tắc cho bất cứ thứ gì trên đường đi của
+gateway: \emph{nếu phương thức của thư viện trả về một giá trị thay vì
+một} \code{Mono}\emph{/}\code{Flux}\emph{, nó không thuộc về filter.}
+Agent BlockHound của Reactor biến quy tắc đó thành một test thất bại.
+
+\subsection{Predicate, thứ tự, và phép tính \code{StripPrefix}}
+
+Route được thử theo thứ tự khai báo (tất cả có \code{order} mặc định
+là 0, và phép sắp xếp là ổn định); predicate khớp đầu tiên thắng. Bảng
+của dự án không có chồng lấn, nhưng một route bắt-tất-cả
+\code{Path=/api/**} trong tương lai đặt \emph{phía trên} các route cụ
+thể sẽ nuốt chúng trong im lặng --- đặt route bắt-tất-cả ở cuối hoặc
+cho nó \code{order} cao. Các filter gắn vào một route được đánh số tuần
+tự và chạy \emph{sau} các global filter có order thấp hơn;
+\code{getOrder()} của filter JWT bằng $-1$ đặt nó trước mọi filter của
+route, và đó là điều cho phép rate limiter của route (bên dưới) đọc
+header \code{X-User-Id} mà filter JWT vừa ghi.
+
+\begin{pitfall}[đoạn path lặp đôi]
+Triệu chứng: frontend gọi \code{/api/courses/courses/5} và chạy được,
+nhưng gõ tay \code{/api/courses/5} thì course-service trả 404. Nguyên
+nhân: \code{StripPrefix=2} bỏ đúng hai đoạn, \code{/api} và
+\code{/courses}, nên \code{/api/courses/5} tới nơi thành \code{/5} ---
+và không controller nào được ánh xạ ở đó. \code{courses} đầu tiên chọn
+\emph{route}; \code{courses} thứ hai sống sót qua phép bỏ và khớp
+\code{@RequestMapping("/courses")}. Frontend cố ý lặp đoạn đó. Thiết
+kế sạch hơn là \code{StripPrefix=1} với controller giữ tiền tố tài
+nguyên của mình; dự án chọn giữ cho service không biết tới \code{/api}
+với cái giá là URL lặp đôi.
+\end{pitfall}
+
+\section{CORS ở biên}
+
+\code{CorsConfig} đăng ký một \code{CorsWebFilter} cho \code{/**}:
+origin \code{localhost:3000} và \code{5173}, sáu phương thức, header
+bất kỳ, cho phép credentials. Ba điều cần hiểu về chỗ nó sống.
+
+\emph{Vì sao ở đây mà không ở từng service.} CORS là quy tắc của trình
+duyệt về \emph{origin}, và origin mà trình duyệt nói chuyện là gateway.
+Một service trả lời \code{Access-Control-Allow-Origin} là trả lời một
+câu hỏi không ai hỏi nó; và nếu hai service bất đồng, trình duyệt sẽ
+thấy chính sách không nhất quán cho một API. Mối quan tâm của biên đặt
+ở biên.
+
+\emph{Preflight tốn gì.} Với bất kỳ request nào không ``đơn giản'' ---
+một \code{POST} JSON, bất cứ thứ gì có header \code{Authorization} ---
+trình duyệt gửi trước một request \code{OPTIONS} và đợi câu trả lời.
+Đó là thêm một vòng đi-về cho mỗi lời gọi, và mọi lời gọi API trong dự
+án này đều mang \code{Authorization}. Gateway tự trả lời preflight mà
+không đụng tới route nào, rất rẻ, nhưng vòng đi-về đó là người dùng
+trả. \code{Access-Control-Max-Age} cho trình duyệt cache câu trả lời;
+\code{CorsConfig} không đặt nó, nên Chrome rơi về năm giây. Một dòng,
+\code{config.setMaxAge(3600L)}, loại gần hết preflight khỏi một phiên.
+
+\emph{Khi nào nó không bao giờ được hỏi tới.} Trong cụm, frontend và
+\code{/api} chung một origin phía sau Traefik (Chương~26), nên không
+request nào là xuyên origin và filter đứng không. Dev là nơi duy nhất
+nó chạy --- và proxy của Vite có thể khiến ngay cả dev cũng cùng
+origin. Vì thế cấu hình CORS ở đây không phải tính năng bảo mật; nó là
+tiện nghi phát triển không được mở rộng cẩu thả:
+\code{allowCredentials(true)} với origin ký tự đại diện bị trình duyệt
+từ chối chính vì nó sẽ cho bất kỳ site nào gọi API với cookie của
+người dùng.
+
+\section{Việc của biên, và việc không phải}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.44\linewidth}p{0.48\linewidth}@{}}
+\toprule
+Thuộc về biên & Không thuộc \\
+\midrule
+Xác thực, header danh tính & Quy tắc phân quyền theo từng tài nguyên \\
+Rate limit, hạn ngạch & Kiểm tra hợp lệ nghiệp vụ \\
+Timeout, retry (lũy đẳng), circuit breaker & Gộp response từ nhiều service \\
+CORS, kết thúc TLS, nén & Gọi cơ sở dữ liệu \\
+Header truy vết, log truy cập & Biến đổi dữ liệu ngoài header/path \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Cột bên phải là anti-pattern ``smart pipes'' mà thời ESB đã dạy: khi
+gateway biết quy tắc nghiệp vụ, mọi tính năng phải ship ở hai nơi và
+đội gateway thành nút thắt của tất cả. Ngoại lệ chính đáng duy nhất
+--- ghép nhiều lời gọi service thành một response theo hình dạng màn
+hình --- là một service riêng (\emph{backend for frontend}), triển
+khai và mở rộng tách khỏi biên.
+
+\section{Ưu và nhược, thẳng thắn}
+
+\begin{itemize}
+  \item \textbf{Ưu:} một địa chỉ, một filter JWT, một chính sách CORS;
+  route là cấu hình, đổi được mà không cần build lại (Chương~2).
+  \item \textbf{Ưu:} mô hình reactive giữ hàng nghìn request đang bay
+  trên bốn thread và khởi động trong vài giây.
+  \item \textbf{Nhược:} gateway của dự án \emph{không} đặt timeout nào
+  cho HTTP client. Mặc định của Reactor Netty là 30 giây để kết nối và
+  \emph{không có} timeout phản hồi.
+  \item \textbf{Nhược:} không circuit breaker, không rate limiter ---
+  client nào cũng gửi nhanh tùy thích, và một service chết được từng
+  request phát hiện riêng lẻ.
+  \item \textbf{Nhược:} \code{replicas: 1} trong Kubernetes. Thành phần
+  mọi request đều đi qua lại là thứ chỉ có một bản.
+  \item \textbf{Nhược:} starter nó dùng
+  (\code{spring-cloud-starter-gateway}) bị đánh dấu lỗi thời trong
+  Spring Cloud 2025.0, thay bằng starter
+  \code{gateway-server-webflux}; việc đổi tên hôm nay vô hại và sẽ là
+  lỗi build ở một lần nâng cấp tương lai.
+\end{itemize}
+
+\section{Cái gì gãy}
+
+\begin{pitfall}[một downstream chậm kéo cả route theo]
+Triệu chứng: course-service chậm (một lock, một GC dài), và trong vòng
+một phút \emph{mọi} request tới \code{/api/courses/**} thất bại với 503
+hoặc treo --- kể cả những request rẻ đáng lẽ thành công. Nguyên nhân:
+gateway giữ một connection pool theo từng host, cỡ
+\code{max(cores, 8) $\times$ 2} = 16 trên máy này. Không có timeout
+phản hồi, mỗi request chậm giữ một kết nối trong pool lâu bằng thời
+gian course-service cần; request thứ mười bảy đợi trong hàng
+acquire 45 giây rồi thất bại. Mọi user xếp hàng sau người chậm nhất.
+Sửa: một timeout phản hồi (Mục~\ref{sec:gw-enhance}) để kết nối kẹt
+được thu hồi, và một circuit breaker để route thất bại nhanh khi lỗi
+dồn cụm.
+\end{pitfall}
+
+\begin{pitfall}[431 Request Header Fields Too Large]
+Triệu chứng: một user có nhiều cookie, hoặc một token với claim béo
+(Chương~28), nhận ngay 431 từ gateway mà log service không có gì.
+Nguyên nhân: Netty giới hạn \emph{khối header} request ở 8\,KB theo mặc
+định; gateway từ chối request trước khi bất kỳ filter nào chạy. Sửa:
+giữ token mỏng. Tăng \code{server.max-http-request-header-size} là câu
+trả lời hạng nhì, vì mỗi chặng phía sau gateway có giới hạn riêng.
+\end{pitfall}
+
+\begin{pitfall}[gateway là điểm lỗi đơn]
+Triệu chứng: một lần rolling update gateway, một lần reboot node, hoặc
+một OOM kill --- và toàn bộ ứng dụng sập, trong khi mọi service phía
+sau đều khỏe. Nguyên nhân: một replica. Gateway là phi trạng thái, nên
+cách sửa là \code{replicas: 2} cộng một \code{PodDisruptionBudget};
+thứ duy nhất làm việc mở rộng khó hơn là trạng thái theo từng instance
+như một rate limiter trong bộ nhớ, và đó chính là lý do phần nâng cấp
+bên dưới giữ trạng thái đó trong Redis.
+\end{pitfall}
+
+\section{Chuyện gì gãy lúc 3 giờ sáng}
+
+Postgres của course-service bắt đầu một đợt autovacuum dài; truy vấn
+từng mất 20\,ms giờ mất 4\,s. Đi theo đường đi.
+
+\begin{enumerate}
+  \item Frontend bắn sáu request của một dashboard. Bốn cái chạm
+  course-service và mất 4\,s mỗi cái. Gateway giữ bốn kết nối trong
+  pool suốt 4\,s.
+  \item User bấm lại. Hai mươi user, mỗi người bốn request: 80 request
+  tranh 16 kết nối. Hàng acquire dài ra; sau 45\,s các request đang đợi
+  thất bại với 503.
+  \item Request tới auth-service và dictionary-service \emph{không bị
+  ảnh hưởng} --- pool là theo host --- cho tới khi access token của user
+  hết hạn và \code{/refresh} thành công nhưng dashboard vẫn lỗi, nên họ
+  đăng xuất rồi đăng nhập lại, thêm tải.
+  \item Không ai bị gọi, vì gateway ``khỏe'': \code{/actuator/health}
+  trả 200 và event loop của nó không bị chặn. Sự cố vô hình ở biên và
+  chỉ hiện ra dưới dạng độ trễ trong Zipkin (Chương~24).
+\end{enumerate}
+
+Với timeout phản hồi 5\,s và circuit breaker trên route, bước~2 trở
+thành: các lời gọi chậm bị cắt ở 5\,s và tính là thất bại; sau mười
+lần, breaker mở; trong 10\,s tiếp theo mọi request \code{/api/courses}
+thất bại dưới một mili giây với một body fallback; pool không bao giờ
+cạn; auth và dictionary vẫn chạy; thay đổi trạng thái của breaker là
+một metric bạn có thể đặt cảnh báo. Cơ sở dữ liệu vẫn chậm --- khả
+năng chịu lỗi không sửa nguyên nhân --- nhưng bán kính thiệt hại là một
+route thay vì cả site.
+
+\section{Nâng cấp giải pháp}
+\label{sec:gw-enhance}
+
+Ba bổ sung, toàn bộ là cấu hình cộng một bean. Dependency trước
+(\code{pom.xml} của gateway):
+
+\begin{lstlisting}[language=yaml]
+# spring-cloud-starter-circuitbreaker-reactor-resilience4j
+#   -> the reactive CircuitBreaker gateway filter
+# spring-boot-starter-data-redis-reactive
+#   -> backing store for RequestRateLimiter (non-blocking client)
+\end{lstlisting}
+
+Rồi \code{api-gateway.yml} trong config-server:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}            # redis:6379 in compose
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 2000                  (*@\co{1}@*)
+        response-timeout: 5s
+        pool:
+          max-connections: 64                  (*@\co{2}@*)
+          acquire-timeout: 2000
+      default-filters:
+        - RemoveRequestHeader=X-User-Id        (*@\co{3}@*)
+        - RemoveRequestHeader=X-User-Role
+      routes:
+        - id: course-service-courses
+          uri: lb://course-service
+          predicates:
+            - Path=/api/courses/**
+          filters:
+            - StripPrefix=2
+            - name: CircuitBreaker             (*@\co{4}@*)
+              args:
+                name: courseCb
+                fallbackUri: forward:/fallback/course
+                statusCodes: "500,502,503,504"
+            - name: RequestRateLimiter         (*@\co{5}@*)
+              args:
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 40
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@userKeyResolver}"
+resilience4j:
+  circuitbreaker:
+    instances:
+      courseCb:
+        sliding-window-size: 10
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 3s       (*@\co{6}@*)
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+  timelimiter:
+    instances:
+      courseCb:
+        timeout-duration: 5s                   (*@\co{7}@*)
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] Kết nối trong 2\,s hoặc bỏ cuộc; phản hồi đầy đủ trong
+  5\,s hoặc kết nối bị đóng và trả về pool. Có thể ghi đè theo route
+  qua \code{metadata} của route cho một endpoint chậm đã biết như tải
+  file lên.
+  \item[\co{2}] Mười sáu kết nối mỗi host là chật một khi timeout làm
+  request ngắn lại; 64 là thoải mái trên máy này mà vẫn có giới hạn.
+  \item[\co{3}] Cách sửa của Chương~28: header danh tính chỉ có thể do
+  gateway ghi.
+  \item[\co{4}] Filter Resilience4j reactive. Thất bại (và các mã trạng
+  thái liệt kê) tính vào breaker; khi mở, request được chuyển tiếp tới
+  \code{/fallback/course} \emph{bên trong gateway}.
+  \item[\co{5}] Token bucket trong Redis: nạp lại 20 token mỗi giây,
+  tích tối đa 40, mỗi request tiêu một. Vượt quá thì trả 429 với
+  \code{X-RateLimit-Remaining: 0}. Redis chứ không phải bộ nhớ, để hai
+  replica gateway dùng chung một bucket cho mỗi user.
+  \item[\co{6}] Không có dòng này, lời gọi chậm không phải thất bại ---
+  ngưỡng chậm mặc định là 60\,s. Ba giây nghĩa là ``chậm hơn thiết
+  kế''.
+  \item[\co{7}] Breaker của gateway bọc mỗi lời gọi trong một
+  TimeLimiter có mặc định là \textbf{một giây}. Bỏ trống, một lần tải
+  lên khỏe mạnh 1,2\,s sẽ làm breaker nhảy. Đặt tường minh và giữ nó
+  $\ge$ timeout phản hồi.
+\end{description}
+
+Key resolver và endpoint fallback:
+
+\begin{lstlisting}[language=Java]
+@Configuration
+public class RateLimitConfig {
+
+    /** Bucket per authenticated user; anonymous callers share
+     *  a bucket per client IP (public paths: login, refresh). */
+    @Bean
+    public KeyResolver userKeyResolver() {
+        return exchange -> {
+            String user = exchange.getRequest().getHeaders()
+                    .getFirst(JwtConstants.HEADER_USER_ID);
+            if (user != null) {
+                return Mono.just("u:" + user);
+            }
+            var addr = exchange.getRequest().getRemoteAddress();
+            return Mono.just("ip:" + (addr == null ? "unknown"
+                    : addr.getAddress().getHostAddress()));
+        };
+    }
+}
+
+@RestController
+public class FallbackController {
+
+    /** Served by the gateway itself when a breaker is open.
+     *  503 + Retry-After tells clients (and browsers) to back off. */
+    @GetMapping("/fallback/course")
+    public ResponseEntity<Map<String, String>> course() {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "10")
+                .body(Map.of("error", "course-service unavailable",
+                             "retryAfterSeconds", "10"));
+    }
+}
+\end{lstlisting}
+
+\begin{decision}[giới hạn tốc độ theo khóa nào]
+Theo \emph{user id} là mặc định đúng cho một API đã xác thực: nó khớp
+với thứ bạn đang bảo vệ (phần công bằng của một tenant) và không né
+được bằng cách đổi IP. Theo \emph{IP} là lựa chọn duy nhất trước khi
+xác thực --- login và refresh --- và là lựa chọn đúng ở đó, vì mối đe
+dọa là nhồi credential từ một nguồn; nó sai phía sau NAT công ty, nơi
+một IP là một nghìn người dùng. Theo \emph{API key} dành cho client máy
+và đối tác, nơi key là hợp đồng. Biên production thường xếp chồng hai
+lớp: giới hạn thô theo IP trên đường dẫn công khai và giới hạn theo
+user trên mọi thứ còn lại.
+\end{decision}
+
+\begin{handson}[đập vào bucket]
+Với Redis đã thêm vào \code{docker-compose.yml} và gateway khởi động
+lại, bắn 50 request với tư cách một user nhanh hơn bucket nạp lại:
+\begin{lstlisting}[language=bash]
+$ for i in $(seq 1 50); do
+    curl -s -o /dev/null -w "%{http_code} " \
+      -H "Authorization: Bearer $TOKEN" \
+      http://localhost:8080/api/courses/courses
+  done; echo
+200 200 200 ... 200 429 429 429 429 429 429 429 429 429 429
+$ curl -si -H "Authorization: Bearer $TOKEN" \
+    http://localhost:8080/api/courses/courses | grep -i ratelimit
+X-RateLimit-Remaining: 0
+X-RateLimit-Burst-Capacity: 40
+X-RateLimit-Replenish-Rate: 20
+\end{lstlisting}
+Bốn mươi cái thành công (phần burst), rồi 429 cho tới khi một giây
+trôi qua và hai mươi token quay lại. Dừng course-service và lặp lại:
+sau mười thất bại, cùng lệnh đó trả về JSON fallback dưới một mili
+giây, và \code{/actuator/circuitbreakers} cho thấy \code{courseCb} ở
+trạng thái \code{OPEN}.
+\end{handson}
+
+\section{Ngoài dự án}
+
+Kong, Envoy (và ingress của Istio xây trên nó), nginx, và các gateway
+cloud (AWS API Gateway, Apigee) hiện thực cùng bốn ý tưởng --- timeout,
+breaker, rate limit, viết lại header --- dưới dạng cấu hình gốc thay vì
+filter Spring, với token bucket thường nằm trong bộ nhớ riêng của proxy
+trên từng node cộng một kho chung cho giới hạn toàn cục. ``Outlier
+detection'' của Envoy là circuit breaker; filter ``local rate limit''
+của nó là bucket. Điều bạn học ở đây chuyển thẳng sang: những câu hỏi
+người phỏng vấn hỏi về bất kỳ thứ nào trong số đó --- trạng thái nằm ở
+đâu, chuyện gì xảy ra khi kho chết, thứ bậc timeout là gì --- có cùng
+câu trả lời.
+
+\section{Câu hỏi từ phỏng vấn thật}
+
+\subsection*{Q: Lưu lượng tăng 10$\times$ sáng thứ Hai. Cái gì gãy trước trong gateway, và bạn tinh chỉnh gì?}
+
+Không phải event loop. Bốn vòng lặp làm I/O không chặn xử lý được
+nhiều hơn mười lần lưu lượng của dự án này rất xa; CPU trên gateway là
+xác minh HMAC và chép header, chỉ vài micro giây. Cái gãy trước là bất
+cứ thứ gì \emph{không có giới hạn}: connection pool theo host (mặc định
+16 ở đây) đầy ngay khi bất kỳ downstream nào chậm, và không có timeout
+phản hồi thì nó không bao giờ rút. Nên thứ tự tinh chỉnh là: timeout
+phản hồi và kết nối để kết nối được thu hồi; nâng trần pool lên mức
+downstream thực sự phục vụ được (\code{max-connections}, và một
+\code{acquire-timeout} ngắn để request xếp hàng thất bại nhanh thay vì
+chất đống); circuit breaker theo route để service đang vật lộn bị cắt
+bớt thay vì xếp hàng; rồi mở rộng ngang --- hai hoặc ba replica phía
+sau Service với HPA theo CPU, việc tầm thường với một gateway phi trạng
+thái một khi trạng thái rate limit nằm trong Redis. Giới hạn bộ nhớ
+cũng quan trọng: Netty giữ buffer trực tiếp ngoài heap, nên giới hạn
+512\,Mi với \code{MaxRAMPercentage=75} chừa 128\,Mi cho chúng; dưới
+lượng đệm 10$\times$, đó là nơi một OOM kill sẽ đến từ.
+
+\subsection*{Q: Một downstream chậm và cả site treo. Vì sao, và bạn làm gì?}
+
+Vì site dùng chung thứ đang cạn kiệt. Nếu gateway có một connection
+pool theo host, chỉ route của host đó phải suy giảm --- nên ``cả site''
+nói lên có thứ khác đang dùng chung: một event loop bị chặn bởi lời
+gọi đồng bộ trong filter, một rate limiter toàn cục khóa sai thứ, hoặc
+frontend bắn mọi lời gọi trong một \code{Promise.all} nên một phản hồi
+chậm giữ cả trang. Sửa theo thứ tự đó: rà filter tìm lời gọi chặn
+(BlockHound trong test), cho route chậm một timeout và breaker để nó
+thất bại trong mili giây với body fallback, và cho frontend render
+trang từng phần. Điểm senior là khả năng chịu lỗi nói về \emph{cô lập}:
+mục tiêu không phải course-service không bao giờ chậm mà là sự chậm của
+nó không với tới được trang đăng nhập.
+
+\subsection*{Q: Làm sao rate limit theo user xuyên ba replica gateway?}
+
+Trạng thái phải dùng chung, nếu không giới hạn là theo từng replica và
+lệch ba lần. \code{RequestRateLimiter} của Spring Cloud Gateway chạy
+một token bucket dưới dạng script Lua trong Redis, nguyên tử, khóa theo
+bất cứ thứ gì \code{KeyResolver} trả về --- ở đây \code{u:<userId>} từ
+header mà filter JWT đã đặt, rơi về IP của client trên đường dẫn công
+khai. Các con số là chính sách: \code{replenishRate} là số request mỗi
+giây duy trì được, \code{burstCapacity} là thứ một lần tải trang được
+tiêu cùng lúc; đặt burst cỡ số lời gọi của một màn hình. Redis thành
+một phụ thuộc, nên quyết định chế độ lỗi của nó một cách có chủ ý: mặc
+định của filter là \emph{cho qua} khi Redis không với tới được, đúng
+với ứng dụng nội bộ và sai với ứng dụng công khai đối mặt lạm dụng. Với
+lưu lượng rất cao, một bucket cục bộ theo replica đặt trước bucket dùng
+chung hấp thụ phần lớn vòng đi-về tới Redis.
+
+\subsection*{Q: Bạn đặt xác thực ở đâu, và không đặt logic ở đâu?}
+
+Xác thực --- ``token này hợp lệ không và của ai'' --- ở biên, một lần,
+vì đó là cùng một câu hỏi cho mọi request và vì đó là nơi credential đi
+vào hệ thống. Phân quyền --- ``user này được chấm bài nộp này không''
+--- trong service sở hữu bài nộp, vì chỉ nó biết dữ liệu. Gateway có
+thể cưỡng chế các quy tắc thô vẫn còn hình dạng request
+(``\code{/api/admin/**} cần vai trò ADMIN'') nhưng khoảnh khắc một quy
+tắc cần một dòng trong cơ sở dữ liệu, nó thuộc về phía sau. Không gì có
+hình dạng nghiệp vụ nằm trong gateway: không gộp, không biến đổi body,
+không gọi kho dữ liệu. Phép thử tôi dùng khi review: nếu một thay đổi
+quy tắc miền đòi deploy gateway, ranh giới đã bị vượt.
+
+\subsection*{Q: Làm sao deploy gateway mà không rơi request nào?}
+
+Tối thiểu hai replica, một \code{PodDisruptionBudget} với
+\code{minAvailable: 1}, và rolling update với \code{maxUnavailable: 0}
+để pod mới Ready trước khi pod cũ bị gỡ. Readiness phải thật: probe
+nên thất bại khi registry Eureka còn rỗng, nếu không pod mới nhận
+request trước khi nó route được đi đâu. Lúc tắt, pod cũ phải ngừng
+nhận \emph{và} hoàn tất request đang bay: \code{server.shutdown:
+graceful} với \code{spring.lifecycle.timeout-per-shutdown-phase} dài
+hơn timeout phản hồi, và một \code{preStop} sleep vài giây để việc gỡ
+endpoint của kube-proxy lan truyền trước khi tiến trình nhận SIGTERM.
+Khoảng hở cuối đó --- danh sách endpoint và vòng đời pod do hai
+controller khác nhau cập nhật --- là thứ làm rơi các request mà người
+ta đổ cho ``rolling update''.
+
+\subsection*{Q: Một tích hợp đối tác cần một response ghép từ ba service. Gateway?}
+
+Không. Đó là một backend-for-frontend: một service nhỏ gọi ba service
+song song, chịu được một cái lỗi, và định hình response cho client đó.
+Nó mở rộng và deploy theo lịch riêng, sở hữu timeout riêng, và giữ
+gateway là một proxy. Đặt nó vào gateway thì mọi thay đổi của đối tác
+là một lần deploy biên, và event loop của gateway bắt đầu giữ trạng
+thái fan-out cho lời gọi chậm nhất trong ba.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Filter JWT trả về \code{chain.filter(exchange)} mà không đợi
+  gì. Giải thích cái gì đã và chưa xảy ra vào lúc dòng đó trả về, và vì
+  sao một filter servlet không thể viết theo cách này.
+  \item Một đồng nghiệp thêm một lượt tra Redis đồng bộ vào filter JWT
+  để kiểm tra danh sách cấm. Dưới một lần Redis khựng 200\,ms, chuyện
+  gì xảy ra với request tới các route \emph{khác}, và vì sao tác động
+  trên máy này là 25\,\% cho mỗi lời gọi bị khựng?
+  \item course-service treo ở 10\,\% request. Với cấu hình gateway hiện
+  tại của dự án, bao nhiêu request treo đồng thời sẽ chặn \emph{toàn
+  bộ} lưu lượng tới service đó, và thiết lập duy nhất nào thay đổi con
+  số ấy?
+  \item Filter \code{CircuitBreaker} của gateway được thêm vào một
+  route mà không có khối \code{timelimiter}. Một lần tải lên khỏe mạnh
+  mất 1,5\,s. Chuyện gì xảy ra, và vì sao?
+  \item Vì sao trạng thái của rate limiter nằm trong Redis thay vì bộ
+  nhớ của gateway, và đánh đổi là gì khi Redis chết?
+  \item Mọi request từ frontend đều mang \code{Authorization}. Điều đó
+  hàm ý gì cho preflight CORS khi dev, thiết lập duy nhất nào giảm
+  chúng, và vì sao tất cả không áp dụng trong cụm?
+\end{enumerate}
+\end{quiz}

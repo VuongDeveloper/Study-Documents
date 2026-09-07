@@ -516,3 +516,432 @@
   OpenShift's arbitrary-UID SCC admits them unmodified; only
   Ingress $\rightarrow$ Route remains.
 \end{enumerate}
+
+\section*{Chapter 28 --- Deep Dive: JWT at Scale}
+\begin{enumerate}
+  \item No. The config-server now holds only the public key, which
+  verifies but cannot sign. Forging requires the private PEM, which
+  lives solely in auth-service's Secret --- that Secret (or the
+  auth-service pod) is what would have to leak.
+  \item Publish the new public key in the JWKS under a new \code{kid}
+  while keeping the old; wait for verifier caches to refresh; switch
+  signing to the new private key; after the longest token lifetime,
+  remove the old key. In step~3 both generations of token are in
+  flight at once; \code{kid} tells each verifier \emph{which} public
+  key to apply, so old tokens keep verifying and the old key can later
+  be retired with certainty rather than by trial.
+  \item Users already holding an access token are unaffected until it
+  expires (15 minutes), because verifiers cached the public key. Then
+  \code{/refresh} fails and they are logged out; new logins fail from
+  the first minute. A verifier restarted during the outage boots with
+  an empty JWKS cache and, failing closed, rejects every token ---
+  which is why the public key should also be available from
+  configuration as a fallback.
+  \item Staleness: the claim is frozen at issue time, so a course
+  created after login is invisible until the token expires --- the
+  token cannot know about data it does not own. Ownership: course
+  membership is course-service's data; encoding it in an
+  auth-service-issued token couples the two services' schemas through
+  the token contract. (Size is the third reason, and the least
+  important.)
+  \item The header is forwarded, but no public endpoint reads
+  \code{X-User-Id}: \code{/refresh} authenticates by refresh token,
+  \code{/actuator} by nothing. So it cannot be exploited today, yet
+  the invariant ``only the gateway writes these headers'' is
+  unenforced. \code{default-filters: RemoveRequestHeader=X-User-Id}
+  (and \code{X-User-Role}) in \code{api-gateway.yml} enforces it.
+  \item Up to 15 minutes --- the access-token lifetime --- since the
+  gateway verifies locally and only \code{/refresh} consults the
+  database. A \code{jti} deny-list adds Redis (one lookup per request,
+  Redis down means fail-open or fail-closed by your choice); the
+  phantom-token pattern adds Redis on the critical path of every
+  request with no fail-open option --- Redis down is a full outage.
+\end{enumerate}
+
+\section*{Chapter 29 --- Deep Dive: Configuration}
+\begin{enumerate}
+  \item The Secret wins: it arrives as the env var
+  \code{SPRING\_DATASOURCE\_PASSWORD}, and OS environment outranks the
+  config-server document. If the Secret object is missing,
+  \code{envFrom} fails the pod; if only the key is missing, the pod
+  starts, the served file's literal \code{root} takes effect, and the
+  service connects as \code{root}, silently.
+  \item Precedence chooses \emph{which document} defines
+  \code{app.s3.secret-key}; the config-server's document does, and it
+  sends the literal text \code{\${APP\_S3\_SECRET\_KEY:minioadmin}}
+  unresolved. The client resolves the placeholder against its own
+  Environment afterwards, so the env var wins because the text asked
+  for it, not because of source order.
+  \item Window one: between the two refreshes, auth-service signs with
+  the new key while the gateway verifies with the old --- every login
+  yields a token the gateway rejects. Window two: after both refresh,
+  every token issued before the change is rejected until it would have
+  expired anyway. Hot rotation needs overlapping keys selected by
+  \code{kid}, which a single shared HS256 secret cannot express.
+  \item Non-optional: the fetch fails, the JVM exits, kubelet restarts
+  with growing back-off until the server returns. \code{optional:}:
+  boots from packaged defaults pointing at localhost, passes its
+  readiness probe, takes traffic, fails every request. \code{fail-fast}
+  with retry: retries in-process with back-off for the configured
+  window, then exits --- no wasted JVM starts, and no lying pod.
+  \item Kustomize's generator appends a content hash to the ConfigMap
+  name; a changed file is a new name, the Deployment referencing it is
+  a new pod template, and Kubernetes rolls the pods. Config, code and
+  rollback become one mechanism with history --- the server offered
+  none of that without Bus or restarts.
+  \item Remove it when every runtime is Kubernetes, no value must
+  change without a pod restart, and secrets already live in the
+  platform. Keep it when a non-Kubernetes runtime (VMs, Compose in
+  production) must share the same configuration source.
+\end{enumerate}
+
+\section*{Chapter 30 --- Deep Dive: Service Discovery}
+\begin{enumerate}
+  \item Registration is immediate on web-server start (Spring forces
+  it). Then the server's read-only response cache (30\,s), the
+  gateway's registry fetch interval (30\,s), and the LoadBalancer cache
+  TTL (35\,s): about 95\,s worst case, roughly half that typically.
+  \item Lease expiry 90\,s, then the eviction sweep (up to 60\,s), then
+  server cache 30\,s, client fetch 30\,s, LoadBalancer cache 35\,s ---
+  up to 245\,s. A graceful shutdown sends DELETE and skips the first two
+  (150\,s), leaving only the caches.
+  \item Expected renewals per minute: $5 \times 2 = 10$; threshold
+  $\lfloor 10 \times 0.85 \rfloor = 8$; the server stays healthy only
+  while renewals exceed 8. One dead client gives exactly 8, so
+  self-preservation engages and nothing is evicted.
+  \code{eureka.server.enable-self-preservation: false} (or a lower
+  \code{renewal-percent-threshold}) fixes it on a small fleet.
+  \item Eureka's self-reported status gates the gateway path, because
+  \code{lb://} resolves to a registered pod IP and never touches the
+  Kubernetes Service where readiness is enforced. Routing to
+  \code{http://course-service:8082} puts kube-proxy, and therefore
+  readiness, back on the path.
+  \item Compose activates no profile, so the base document applies:
+  Eureka client enabled, \code{lb://} routes, and the Feign
+  \code{url} resolves to an empty string, which Feign treats as ``use
+  load-balanced resolution by name''. Under \code{k8s} the property is
+  a Service URL and Feign bypasses the LoadBalancer entirely.
+  \item The registry knows an instance only through what the instance
+  says about itself, and learns of silence only after a lease it does
+  not sweep immediately; a Service's endpoints are maintained by the
+  kubelet, which actively probes the pod every few seconds and removes
+  it the moment a probe fails. Self-report with a grace period versus
+  external observation with none.
+\end{enumerate}
+
+\section*{Chapter 31 --- Deep Dive: The Gateway Under Load}
+\begin{enumerate}
+  \item Nothing has been sent yet: \code{chain.filter} returns a
+  \code{Mono} describing the rest of the chain; it runs only when the
+  framework subscribes, and the calling thread is already free. A
+  servlet filter's \code{doFilter} blocks until the downstream call
+  completes, so the thread is held for the whole request --- which is
+  the model the event loop exists to avoid.
+  \item Every request whose socket is owned by the stalled loop stops
+  --- including routes that never touch Redis --- because loops are
+  shared across routes, not per route. Reactor Netty runs
+  \code{max(cores, 4)} loops; on a 2-core box that is four, so one
+  blocked loop is a quarter of the gateway's capacity.
+  \item Sixteen: the default per-host pool is \code{max(cores, 8)
+  $\times$ 2}. With no response timeout, 16 hung requests hold all 16
+  connections and the 17th waits 45\,s in the acquire queue. Setting
+  \code{spring.cloud.gateway.httpclient.response-timeout} (or raising
+  \code{pool.max-connections}) changes the number; the timeout is the
+  one that fixes the cause.
+  \item The filter wraps each call in a Resilience4j TimeLimiter whose
+  default is 1\,s. The 1.5\,s upload is cut off, counted as a failure,
+  and after enough of them the breaker opens against a healthy
+  service. Set \code{resilience4j.timelimiter.instances.<name>.timeout-duration}
+  at least as long as the response timeout.
+  \item With two or more replicas an in-memory bucket gives each replica
+  its own limit, so a user gets $N\times$ the quota. Redis holds one
+  bucket per key, updated atomically by a Lua script. Trade-off: Redis
+  is a dependency on every request; the filter's default when Redis is
+  unreachable is to allow the request (fail-open), which must be a
+  deliberate choice.
+  \item Every request is non-simple, so in dev each API call is preceded
+  by an \code{OPTIONS} preflight. \code{setMaxAge} lets the browser
+  cache the preflight result (Chrome's default is 5\,s). In the cluster
+  the frontend and \code{/api} share one origin behind Traefik, so no
+  request is cross-origin and the CORS filter is never consulted.
+\end{enumerate}
+
+\section*{Chapter 32 --- Deep Dive: Synchronous Calls}
+\begin{enumerate}
+  \item (a) No code calls \code{AuthServiceClient} --- wire it into a
+  service such as \code{UserLookupService}. (b) Feign's breaker
+  integration is off --- set \code{circuitbreaker.enabled: true} under
+  \code{spring.cloud.openfeign}.
+  (c) No \code{CircuitBreakerFactory} bean exists --- add the
+  \code{spring-cloud-starter-circuitbreaker-resilience4j} dependency.
+  Separately, nothing references the \code{authService} instance ---
+  annotate the calling method with \code{@CircuitBreaker(name =
+  "authService")}.
+  \item Nine: \code{minimum-number-of-calls} defaults to the window
+  size, so the breaker does not evaluate until the tenth outcome. A
+  30\,s call is a success because \code{slow-call-duration-threshold}
+  defaults to 60\,s; only calls slower than that count as slow, and
+  only if the slow-call rate threshold (default 100\,\%) is met.
+  \item Browser (longest) $>$ gateway response timeout $>$ Feign read
+  timeout $\times$ retry attempts (plus backoff). Each hop must give up
+  before its caller does, or it works on abandoned requests; and the
+  retry count multiplies the innermost timeout, so it must fit inside
+  the gateway's budget --- 2\,s $\times$ 2 attempts under a 5\,s
+  gateway timeout, not 3.
+  \item A \code{NullPointerException} in every caller that forgets to
+  check, surfacing only during an outage; and the inability to tell a
+  404 (user genuinely missing) from a breaker rejection, so both get
+  the same treatment. \code{degraded(Long id, Throwable cause)} ---
+  the two-argument fallback --- receives the cause and can return a
+  cached or placeholder value for infrastructure failures while letting
+  a 4xx propagate.
+  \item auth-service's \code{SecurityConfig} permits only public paths;
+  \code{/users/\{id\}} needs an authenticated context that its
+  \code{GatewayHeaderAuthFilter} builds from \code{X-User-Id}, which
+  Feign does not send. Each 401 is an exception, so ten of them open
+  the breaker against a healthy service. Fix: a Feign
+  \code{RequestInterceptor} that forwards the identity headers, and
+  \code{ignore-exceptions} for 4xx so client errors never count as
+  dependency failures.
+  \item $0.999^3 \approx 99.7\,\%$. Raise it by removing dependencies
+  from the request path --- a local copy fed by events, or a cache in
+  front of the call --- and by making the remaining ones optional with
+  a typed fallback so their failure degrades the response instead of
+  failing it.
+\end{enumerate}
+
+\section*{Chapter 33 --- Deep Dive: Data Across Services}
+\begin{enumerate}
+  \item Order A: the transaction commits, then the JVM dies before the
+  producer buffer flushes --- user activated, no event, no student
+  ever. Order B: the buffer flushes and the broker acks, then the
+  commit fails --- course-service creates a student for a user that
+  was rolled back. B produces the phantom row.
+  \item The producer cannot fetch metadata, blocks for
+  \code{max.block.ms} (60\,000\,ms), then throws; the exception leaves
+  \code{register()}, the transaction rolls back, and the user is not
+  created. With the outbox the request writes a user row and an outbox
+  row in one commit and returns in milliseconds; the relay retries the
+  send in the background.
+  \item Two replicas run the same scheduler. Without the lock both
+  select the same unpublished rows and both publish them --- a
+  duplicate for every event, every second. \code{FOR UPDATE} makes the
+  second replica wait; \code{SKIP LOCKED} makes it take the next rows
+  instead, so they share the work without overlap.
+  \item Ordering per key. If row~1 for user~42 fails and the loop
+  \code{continue}s to row~2 for the same user, row~2 is published
+  first; the next tick publishes row~1 behind it, and the consumer sees
+  ``updated'' before ``activated''. Stopping the batch keeps the
+  partition's order equal to the outbox's order.
+  \item Nothing: \code{ts.user.activated} fires once, and no
+  \code{ts.user.updated} exists, so \code{student.email} is frozen at
+  activation. Changes: emit an outbox row with
+  \code{eventType=UserUpdated} wherever the profile is saved; make
+  \code{UserActivatedListener} upsert (find-or-create, then set
+  fields); subscribe it to both topics or add a second listener.
+  \item States: \code{ACTIVE} $\rightarrow$ \code{DELETING}
+  $\rightarrow$ deleted, or back to \code{ACTIVE}. Events:
+  \code{UserDeletionRequested} (auth, via outbox),
+  \code{StudentDataDeleted} / \code{StudentDataDeletionFailed} (course,
+  after removing student, enrollments, submissions, and MinIO objects).
+  Compensation: on failure auth restores \code{ACTIVE} and alerts.
+  \code{DELETING} is the semantic lock: it refuses logins and new
+  enrollments while the saga runs, so no step operates on data another
+  step is deleting.
+\end{enumerate}
+
+\section*{Chapter 34 --- Deep Dive: Kafka Delivery Guarantees}
+\begin{enumerate}
+  \item \code{enable.idempotence=true} (broker de-duplicates producer
+  retries), \code{acks=all}, unbounded \code{retries} within
+  \code{delivery.timeout.ms} --- all Kafka~3.x client defaults the
+  project never set. On Compose there is one broker and
+  \code{replicas: 1}, so ``all in-sync replicas'' is one disk; the
+  setting only buys durability once \code{replication.factor=3} and
+  \code{min.insync.replicas=2} exist.
+  \item A batch is polled; the listener sends mails one by one on the
+  poll thread; processing exceeds \code{max.poll.interval.ms}
+  (300\,000\,ms); the broker evicts the consumer and reassigns the
+  partition from the last committed offset; the new owner processes
+  the same records while the old one finishes its loop.
+  \item If the claim commits alone and the business write then fails,
+  the retry finds the id already claimed, returns, and the offset
+  advances --- the change is lost forever while the table says it
+  happened. In one transaction, failure rolls back the claim too, so
+  the retry can process it.
+  \item A wait only helps transient faults: an SMTP relay coming back,
+  a network blip. A \code{NullPointerException} or a deserialization
+  error is deterministic; retrying it three times delays the same
+  failure. It is excluded, so it goes straight to the DLT on the first
+  attempt.
+  \item Boot's \code{KafkaAutoConfiguration} backs off when a
+  \code{ProducerFactory} bean exists, so \code{spring.kafka.producer.*}
+  in \code{course-service.yml} is ignored by course-service. Fix:
+  delete \code{KafkaProducerConfig} (Boot's factory reads the same
+  serializers from YAML) --- or keep the bean and delete the YAML block.
+  \item Retention is 168 hours; nine days is longer. The group's
+  committed offset now points before the oldest retained record, so
+  \code{auto-offset-reset: earliest} applies and it resumes from the
+  oldest surviving record --- two days of events are gone. With a new
+  group id there is no committed offset at all; \code{earliest} makes
+  it process all seven retained days, re-sending every mail in them.
+\end{enumerate}
+
+\section*{Chapter 35 --- Deep Dive: Files at Scale}
+\begin{enumerate}
+  \item \code{endpointOverride}: the client uses \code{endpoint}
+  (\code{minio:9000}), the presigner uses \code{public-endpoint}. If
+  the presigner signed against the internal name, every download link
+  would embed a host the browser cannot resolve --- and rewriting it
+  afterwards breaks the signature.
+  \item SigV4 signs a canonical request that includes the signed
+  headers, and \code{Host} is always among them
+  (\code{X-Amz-SignedHeaders=host}). A link signed for
+  \code{minio:9000} and rewritten to another host presents a different
+  canonical request; MinIO recomputes the signature, it does not match,
+  and it returns \code{403 SignatureDoesNotMatch}.
+  \item The transaction covers the Postgres insert only; the
+  \code{putObject} is an HTTP call outside it. A failed \code{save}
+  rolls back the row while the object remains in the bucket under a
+  key no row records --- an orphan.
+  \item Cheap: listing every attempt by one student for one assignment
+  (one \code{ListObjectsV2} with the prefix). Expensive: finding all
+  files by one student across assignments (no prefix matches; full
+  scan or database query). The UUID makes every key unique, so no
+  upload ever overwrites another; versioning would only protect against
+  overwrites that cannot happen.
+  \item Text submission succeeds (no storage call). Listing succeeds and
+  returns links (presigning is local computation). Opening a link fails
+  (MinIO must serve it). Restarting course-service fails: the
+  \code{@PostConstruct} bucket check throws on connection refused.
+  \item The key is built server-side from \code{assignmentId} and the
+  caller's own \code{studentId}, and stored on a \code{PENDING\_FILE}
+  row owned by that student; \code{completeUpload} checks that the row
+  belongs to the caller and that a \code{HEAD} on \emph{that} row's key
+  succeeds. A URL for another student's key cannot be attached to a
+  different row because rows are never given a client-supplied key.
+\end{enumerate}
+
+\section*{Chapter 36 --- Deep Dive: The Dictionary on MongoDB}
+\begin{enumerate}
+  \item The \code{FETCH} stage's \code{filter} rejects them. The
+  \code{createdByUserId} index only narrows to the user's slice; an
+  unanchored, case-insensitive \code{\$regex} has no leading characters
+  to seek by, so every fetched document is tested. Anchoring the pattern
+  (\code{\^{}clou}) with a matching collation lets an index on
+  \code{word} serve it as a range.
+  \item All matches --- potentially all 3{,}000 --- come back from
+  Mongo; \code{toResponse} then runs two \code{word\_links} queries per
+  match (about 6{,}000); the page is built in Java by \code{subList}
+  after sorting the full list.
+  \item Multi-document transactions need a replica set; the project
+  runs a standalone \code{mongod}. A crash after deleting the definition
+  and before deleting its links leaves edges pointing at a missing word.
+  \code{findByIdAndCreatedByUserId(...).orElse(null)} followed by the
+  \code{filter(Objects::nonNull)} drops such nodes silently.
+  \item \code{BsonMaximumSizeExceededException} (16\,MB limit). Six
+  photos of about 2--3\,MB each, inflated by a third as base64, exceed
+  16{,}793{,}600 bytes. Chapter~35's rule: bytes in object storage,
+  keys in the database --- store the images in MinIO and keep their
+  keys in \code{images}.
+  \item A text index tokenizes and stems whole words; ``lou'' is not a
+  token of ``cloud'', so there is no hit. Infix matching needs a regex
+  scan or an n-gram/trigram index (Atlas Search, or \code{pg\_trgm} in
+  Postgres).
+  \item dictionary-service fails on every endpoint; every other service
+  and topic is unaffected (no shared connection, no caller, no event).
+  Adding a Mongo ping to the readiness probe would take the pod out of
+  the gateway's endpoints, turning 500s into a clean 503 at the edge.
+\end{enumerate}
+
+\section*{Chapter 37 --- Deep Dive: Observability}
+\begin{enumerate}
+  \item Producer side:
+  \code{spring.kafka.\allowbreak template.\allowbreak observation-enabled}
+  (absent in every config document); consumer side:
+  \code{spring.kafka.\allowbreak listener.\allowbreak observation-enabled}.
+  Properties
+  configure only the \emph{auto-configured} \code{KafkaTemplate};
+  auth-service uses that one, so the property fixes it.
+  Course-service builds its own template in \code{KafkaProducerConfig},
+  which ignores the property and needs
+  \code{setObservationEnabled(true)} in code.
+  \item It continues the trace: Boot~3's default is to \emph{consume}
+  W3C, B3 and B3-multi and to \emph{produce} W3C, decided by
+  \code{management.tracing.propagation} defaults. The header leaving
+  the gateway is \code{traceparent}, with the same trace id and a new
+  parent span id.
+  \item Exposure is a name list; the endpoint exists only when a
+  registry that renders that format is on the classpath. No service
+  depends on \code{micrometer-registry-prometheus}, so Actuator has
+  nothing to expose under that name. Adding that one artifact (Boot
+  BOM-managed) makes the existing exposure line real.
+  \item Latency: unchanged --- spans are queued and shipped by a
+  background thread. Heap: bounded --- the queue holds 10{,}000 spans
+  and drops on overflow with a counted warning. Spans: those produced
+  during the hour are lost; there is no replay. With a synchronous
+  reporter, \emph{latency} would change: every request would block on
+  a failing HTTP call to Zipkin until its timeout.
+  \item One percent --- head-based sampling decides at the root before
+  the outcome is known, so failures are kept at the same rate as
+  successes. Raising it to 1.0 for errors only requires tail-based
+  sampling, which needs an OpenTelemetry Collector buffering complete
+  traces before the store; the direct Brave-to-Zipkin path cannot do
+  it.
+  \item An e-mail is an unbounded tag value; each distinct value
+  creates a new time series in the metrics registry and a new indexed
+  value in the trace store. Memory grows with the user base until
+  \code{/actuator/metrics} crawls and the pod is \code{OOMKilled}. Rule:
+  tags carry \emph{templates and enums} (route template, status,
+  outcome); identifiers go into span annotations or log lines, which
+  are not indexed by value.
+\end{enumerate}
+
+\section*{Chapter 38 --- Deep Dive: The Browser Meets the Gateway}
+\begin{enumerate}
+  \item Key \code{auth-storage} in \code{localStorage}, written by
+  Zustand's \code{persist}. One line:
+  \code{JSON.parse(localStorage.\allowbreak getItem('auth-storage')).\allowbreak
+  state.refreshToken}.
+  With it, the script (or whoever it sends it to) can call
+  \code{/api/auth/refresh} for seven days and mint fresh access tokens
+  at will, from any machine.
+  \item A 401 from \code{/refresh} through \code{apiClient} would enter
+  the response interceptor; \code{\_retry} is unset on that new
+  request, so it would read the refresh token and POST \code{/refresh}
+  again through \code{apiClient}; that 401 enters the interceptor
+  again --- an unbounded chain of refresh calls, each spawning the
+  next, until the tab is closed. Bare \code{axios} has no interceptor,
+  so its 401 reaches the \code{catch} and logs out.
+  \item All four get 401 and each sets its own \code{\_retry}; four
+  POSTs to \code{/refresh} race. The first succeeds and rotates the
+  token; the second presents the now-invalid old token and gets 401
+  from auth-service; that lands in the \code{catch} --- step 4,
+  \code{logout()} and a hard redirect --- while the first request's
+  replay may even succeed. Single-flight: one promise, started by the
+  first 401, awaited by the rest; one POST, one rotation, four
+  replays with the same new token.
+  \item (a) A vulnerable or forgotten endpoint elsewhere under
+  \code{/api} never receives the cookie, so a CSRF or log-leak bug
+  there cannot touch it; (b) the cookie is not attached to ordinary
+  API calls, so it never appears in gateway access logs, proxies or
+  browser traffic for \code{/api/courses}. The browser matches
+  \code{Path} against the URL \emph{it} requests, which is the
+  gateway's \code{/api/auth/refresh}; auth-service's stripped
+  \code{/refresh} is never a browser-visible path.
+  \item In neither: Vite's dev proxy and Traefik in the cluster both
+  keep page and API on one origin, so no request is cross-origin and
+  no preflight occurs. Serving the built bundle from a different
+  origin --- a CDN, or a static host on another port without the
+  proxy --- would make every API call cross-origin and the config
+  decisive.
+  \item CORS is enforced by the browser after the response arrives:
+  the gateway processed the request and returned 200, then the browser
+  refused to hand the body to the script because the response lacked
+  an acceptable \code{Access-Control-Allow-Origin}. Compare: the
+  request's \code{Origin} header versus the allowed-origins list (exact
+  string, scheme and port); \code{Access-Control-Allow-Credentials}
+  versus whether the request was credentialed; and for the preflight,
+  \code{Access-Control-Allow-Headers} versus the headers the request
+  actually sends (\code{Authorization}, \code{Content-Type}).
+\end{enumerate}

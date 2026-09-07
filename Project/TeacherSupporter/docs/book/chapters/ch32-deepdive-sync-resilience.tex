@@ -1,0 +1,701 @@
+\chapter{Deep Dive: Synchronous Calls --- OpenFeign, Resilience4j, and Cascading Failure}
+\label{ch:dd-resilience}
+
+Chapter~6 drew the line between the two ways services talk: HTTP when
+the caller needs an answer now, events when it needs a fact recorded.
+This chapter stays on the HTTP side and asks the question that every
+distributed system eventually asks at 3\,a.m.: when the service I am
+calling is slow, what happens to \emph{me}? The project has the right
+libraries on its classpath --- OpenFeign for the call, Resilience4j for
+the protection --- and, as you will see, has wired them in a way that
+protects nothing. That makes it a better teaching case than a finished
+one would be.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{What does a synchronous call cost} beyond its latency ---
+  and why is a slow dependency worse than a dead one?
+  \item \textbf{How does a circuit breaker decide}, with the project's
+  actual numbers, and how do timeouts, retries and breakers interact?
+  \item \textbf{What should a fallback return}, and when should the call
+  not exist at all?
+\end{enumerate}
+
+\section{Why Feign, and what it solves}
+
+course-service occasionally needs to know who a user is --- a name to
+print on a submission, a role to check. auth-service owns that data. The
+options are: call auth-service over HTTP, copy the data into
+course-service via events, or put both in one database. The project
+keeps the databases separate (Chapter~7) and reserves events for facts
+that happened; a lookup by id is a question, so it is a call.
+
+OpenFeign turns that call into an interface:
+
+\begin{lstlisting}[language=Java]
+@FeignClient(name = "auth-service",
+             fallback = AuthServiceFallback.class)          (*@\co{1}@*)
+public interface AuthServiceClient {
+
+    @GetMapping("/users/{id}")                              (*@\co{2}@*)
+    UserDto getUserById(@PathVariable("id") Long id);        (*@\co{3}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] \code{name} is the Eureka application name. Feign asks
+  the discovery client for instances of \code{auth-service} and
+  load-balances across them on the client side --- no gateway, no
+  hard-coded host. \code{fallback} names the class to call instead when
+  the call fails. Hold that thought.
+  \item[\co{2}] The same Spring MVC annotations as a controller, read in
+  reverse: this is what to \emph{send}. The path is the service's own
+  (\code{/users/\{id\}}), not the gateway's (\code{/api/auth/users}),
+  because service-to-service calls bypass the gateway.
+  \item[\co{3}] The return type is a record from \code{common}. That
+  record is the \emph{contract}: auth-service must produce JSON that
+  deserializes into it.
+\end{description}
+
+What Feign solves is boilerplate and coupling to addresses. What it does
+not solve is the one property that matters under load: every call
+holds a Tomcat thread in course-service for as long as auth-service
+takes to answer.
+
+\begin{decision}[a call, not a copy --- for now]
+For a by-id lookup that is rare and whose answer changes rarely, a call
+is the simplest correct thing, and Feign makes it two lines. The
+decision flips when any of three things becomes true: the lookup sits
+on a hot path (every course listing needs a teacher's name), the data
+is needed while auth-service is down (grading must not stop because
+login is broken), or the shape of \code{UserDto} starts changing with
+auth-service's releases. Then course-service should keep its own copy
+of the fields it needs, fed by the events auth-service already
+publishes (\code{ts.user.registered}, \code{ts.user.activated}) --- the
+pattern Chapter~7 already applies to students.
+\end{decision}
+
+\section{The contract in \code{common}, and its versioning risk}
+
+\code{UserDto} is a record with five fields: \code{id}, \code{email},
+\code{firstName}, \code{lastName}, \code{role}. auth-service's
+\code{UserController} does not return it --- it returns its own
+\code{UserResponse}. The two classes agree today by coincidence of
+field names, and Jackson's default of ignoring unknown properties hides
+the gap: auth-service can add fields freely, and course-service will not
+notice. It \emph{will} notice a rename. Renaming \code{firstName} to
+\code{givenName} in \code{UserResponse} compiles on both sides, deploys
+on both sides, and leaves course-service reading \code{null} names ---
+no exception, no log line. The interview version: ``how do you version
+an internal API?'' and the answer is: additive changes only, never
+rename or remove; the consumer's DTO ignores unknowns; a consumer-driven
+contract test (Spring Cloud Contract, Pact) in auth-service's build that
+fails when \code{UserResponse} stops satisfying \code{UserDto}. A URL
+version (\code{/v2/users}) is for breaking changes you cannot avoid,
+and it means running both for as long as any consumer lags.
+
+\section{The circuit breaker, with the project's numbers}
+\label{sec:cb-math}
+
+Resilience4j's breaker is a state machine over a \emph{sliding window}
+of recent call outcomes. The project's configuration in
+\code{course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+resilience4j:
+  circuitbreaker:
+    instances:
+      authService:
+        sliding-window-size: 10                    (*@\co{1}@*)
+        failure-rate-threshold: 50                 (*@\co{2}@*)
+        wait-duration-in-open-state: 10s           (*@\co{3}@*)
+        permitted-number-of-calls-in-half-open-state: 3  (*@\co{4}@*)
+\end{lstlisting}
+
+\begin{figure}[htb]
+\centering
+\begin{tikzpicture}[node distance=13mm and 14mm]
+  \node[boxfill] (closed) {CLOSED\\calls pass, outcomes recorded};
+  \node[boxdark, right=of closed] (open) {OPEN\\calls rejected instantly};
+  \node[box, below=of $(closed)!0.5!(open)$] (half) {HALF\_OPEN\\3 trial calls};
+  \draw[flow] (closed) -- node[lbl,above]{$\ge$5 of 10 fail} (open);
+  \draw[flow] (open.east) -- ++(6mm,0) |- node[lbl,above,pos=0.75]{after 10\,s} (half.east);
+  \draw[flow] (half.north west) -- node[lbl,above,sloped]{trials ok} (closed.south);
+  \draw[flowdash] (half.north east) -- node[lbl,above,sloped]{trials fail} (open.south);
+\end{tikzpicture}
+\caption{The breaker's three states with this project's thresholds.
+Rejected calls in OPEN go to the fallback without touching the network.}
+\label{fig:cb-states}
+\end{figure}
+
+\begin{description}
+  \item[\co{1}] The window holds the last 10 outcomes (count-based;
+  the alternative is time-based, ``the last 60 seconds''). The breaker
+  does not evaluate until the window has
+  \code{minimum-number-of-calls} outcomes --- unset here, so it
+  defaults to the window size. Translation: the first 9 calls after
+  startup can \emph{all} fail and the breaker stays CLOSED.
+  \item[\co{2}] At 10 outcomes, if 5 or more failed, the breaker opens.
+  A ``failure'' is an exception the breaker does not ignore. Note what
+  is \emph{not} configured: \code{slow-call-duration-threshold}. Its
+  default is 60\,s, so a call that takes 30\,s is a \emph{success} to
+  this breaker. Slow dependencies --- the common case --- never trip
+  it.
+  \item[\co{3}] OPEN for 10\,s: every call is rejected with
+  \code{CallNotPermittedException} in microseconds and routed to the
+  fallback. auth-service gets a 10-second breather.
+  \item[\co{4}] Then HALF\_OPEN: 3 calls are let through as probes. If
+  their failure rate is $\ge$ 50\,\% (2 of 3), back to OPEN for another
+  10\,s; otherwise CLOSED with a fresh window.
+\end{description}
+
+Now the part that makes this chapter honest. That \code{authService}
+instance is bound to \emph{nothing}. No method carries
+\code{@CircuitBreaker(name = "authService")}, and Feign's own
+integration --- which would wrap \code{getUserById} in a breaker named
+\code{AuthServiceClient\#getUserById(Long)} --- is off, because the
+switch \code{openfeign.circuitbreaker.enabled} defaults to
+\code{false}, and the starter that provides the
+\code{CircuitBreakerFactory} it needs (the
+\code{circuitbreaker-resilience4j} starter) is not on the classpath.
+With that switch off, the \code{fallback} attribute in
+\co{1} is silently ignored. And \code{AuthServiceClient} is not called
+from any service class today. The project has a breaker configured for
+a call that does not happen, protecting nothing, with a fallback that
+would not run. It is a perfect specimen of how resilience is usually
+misconfigured in production: every piece present, no piece connected.
+
+\section{Timeouts stack}
+
+When the call is wired properly, three timers surround it, and they
+must be ordered or the outer ones are decorative.
+
+\begin{itemize}
+  \item \textbf{Feign's socket timeouts.} \code{connectTimeout} and
+  \code{readTimeout} on the HTTP client. Unset in the project, so the
+  defaults apply: 10\,s to connect, \textbf{60\,s} to read. A hung
+  auth-service pins a course-service thread for a minute.
+  \item \textbf{Resilience4j's TimeLimiter.} A deadline on the whole
+  decorated call, independent of the socket. It only applies to
+  asynchronous return types (\code{CompletableFuture}), which is why
+  synchronous Feign calls rely on the socket timeout instead.
+  \item \textbf{The caller's deadline.} The gateway's
+  \code{response-timeout} (Chapter~31), and behind it the browser's
+  patience. If the gateway gives up at 5\,s while Feign waits 60\,s, the
+  user sees an error at 5\,s and course-service keeps a thread busy for
+  55 more seconds serving nobody.
+\end{itemize}
+
+The rule: every hop's timeout is \emph{shorter} than the hop before it.
+Browser 10\,s $>$ gateway 5\,s $>$ course-service's Feign read 2\,s. A
+timeout that fires inside an already-abandoned request is wasted work;
+one that fires later than its caller's is a leak.
+
+\section{Retry: only for calls you can repeat}
+
+Resilience4j's \code{@Retry} re-issues a failed call. On a \code{GET
+/users/\{id\}} that is harmless: reading twice is the same as reading
+once. On a \code{POST /enrollments} it is a duplicate enrollment,
+because a timeout does not tell you whether the first request was
+processed. Retry is therefore for \emph{idempotent} operations only,
+or for operations made idempotent with a client-supplied key the server
+deduplicates on. Two more rules from production: retry with
+\emph{exponential backoff and jitter}, or every client retries at the
+same instant and the second wave is bigger than the first (the ``retry
+storm''); and retry \emph{inside} the breaker, so that an open breaker
+stops retries from being attempted at all. Resilience4j's default aspect
+order --- Retry outermost, then CircuitBreaker, then TimeLimiter, then
+Bulkhead --- gets this right: a retry goes through the breaker each
+time, and a rejected call is not retried.
+
+\section{Bulkhead: bounding the blast}
+
+A bulkhead caps how many concurrent calls may be in flight to one
+dependency. Semaphore bulkhead: a counter; the 26th concurrent call is
+rejected immediately. Thread-pool bulkhead: calls run on a dedicated
+pool so the caller's threads are never the ones waiting --- necessary
+for a servlet app whose Tomcat pool is finite. course-service runs
+Tomcat with 200 threads. Without a bulkhead, 200 slow auth-service calls
+consume every one of them, and course-service cannot answer a health
+probe, let alone a course listing. With a semaphore bulkhead of 25, at
+most 25 threads are ever waiting on auth-service and 175 remain for
+everything else. That is the isolation the chapter's title promises.
+
+\section{What the fallback returns}
+
+\begin{lstlisting}[language=Java]
+@Component
+public class AuthServiceFallback implements AuthServiceClient {
+    @Override
+    public UserDto getUserById(Long id) {
+        return null;                                       (*@\co{1}@*)
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A \code{null} that the caller must remember to check.
+  Every consumer of \code{getUserById} now has a hidden branch, and a
+  forgotten check is a \code{NullPointerException} that fires only when
+  auth-service is down --- exactly when you least want a new bug.
+\end{description}
+
+A fallback has four honest options, in order of preference: a
+\emph{cached} value from the last successful call (stale but real); a
+\emph{degraded} value that the UI can show (``Unknown teacher'') and
+that is typed as such; an \emph{empty} result where the domain allows
+one; or a \emph{typed error} the caller can map to 503 with
+\code{Retry-After}. \code{null} is none of these. It is the absence of a
+decision, pushed onto every caller. The fallback also needs the
+\emph{cause}: a two-argument fallback method (\code{Throwable last})
+can tell a breaker rejection from a 404, and a 404 --- the user does not
+exist --- must \emph{not} be turned into ``try later''.
+
+\section{Pros and cons, honestly}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.46\linewidth}p{0.46\linewidth}@{}}
+\toprule
+What the project has & What it is missing \\
+\midrule
+Declarative client, Eureka-resolved & The client is never called \\
+A breaker instance with sane thresholds & Nothing binds to it; Feign's breaker switch is off \\
+A fallback class registered & Ignored; and it returns \code{null} \\
+Resilience4j on the classpath & No timeouts, no retry, no bulkhead, no slow-call threshold \\
+Actuator exposed & Breaker endpoints not in the exposure list \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+And one more gap that is not about resilience at all: auth-service's
+\code{SecurityConfig} permits only the public paths; \code{/users/\{id\}}
+requires an authenticated context, which its
+\code{GatewayHeaderAuthFilter} builds from \code{X-User-Id}. Feign sends
+no such header. The call, once wired, would return 401 on every attempt
+--- and a 401 is an exception, so ten of them would open the breaker
+against a perfectly healthy service.
+
+\section{What breaks}
+
+\begin{pitfall}[the fallback that never runs]
+Symptom: auth-service is stopped, and instead of the fallback's
+\code{null} course-service throws \code{FeignException} with a stack
+trace through the load balancer, and the request returns 500. Cause:
+\code{@FeignClient(fallback = ...)} is only honored when
+\code{spring.cloud.openfeign.circuitbreaker.enabled=true} \emph{and} a
+\code{CircuitBreakerFactory} bean exists, which requires the
+\code{spring-cloud-starter-circuitbreaker-resilience4j} dependency. With
+either missing, Spring logs nothing and the attribute is inert. Fix in
+Section~\ref{sec:res-enhance}.
+\end{pitfall}
+
+\begin{pitfall}[healthy service, open breaker]
+Symptom: after a deploy of auth-service, course-service's breaker opens
+and stays open, cycling OPEN $\to$ HALF\_OPEN $\to$ OPEN, though
+auth-service answers \code{curl} fine. Cause: every call gets 401
+(missing identity headers), or 404 for a deleted user, and both count
+as failures. Fix: propagate identity on service-to-service calls (a
+\code{RequestInterceptor}, below), and tell the breaker which exceptions
+are \emph{not} dependency failures with \code{ignore-exceptions} ---
+client errors mean the request was wrong, not that the service is
+down.
+\end{pitfall}
+
+\begin{pitfall}[the 60-second thread]
+Symptom: auth-service hangs (deadlock, stuck GC); course-service's
+CPU is idle, yet it stops answering \emph{all} requests, and its
+readiness probe fails so Kubernetes stops routing to it. Cause:
+Feign's default 60\,s read timeout multiplied by Tomcat's 200 threads.
+Each hung lookup holds a thread for a minute; with a modest request
+rate every thread is waiting within seconds. The breaker cannot help
+--- with the default slow-call threshold, hung calls are not failures
+until they time out. Fix: a 2\,s read timeout, a slow-call threshold,
+and a bulkhead of 25.
+\end{pitfall}
+
+\section{What breaks at 3\,a.m.}
+
+auth-service's Postgres begins a long vacuum; \code{/users/\{id\}} goes
+from 20\,ms to 2\,s. Assume the Feign call has been wired into the
+course-listing endpoint, as the project's design invites, and nothing
+else is changed.
+
+\begin{enumerate}
+  \item Each course listing now takes 2\,s instead of 20\,ms. Tomcat
+  threads in course-service are busy 100$\times$ longer per request.
+  \item At 50 listings per second, 100 threads are waiting on
+  auth-service at any moment. At 100 per second, all 200 are, and
+  requests queue in Tomcat's accept backlog.
+  \item course-service's readiness probe (\code{/actuator/health} is
+  not even exposed here --- Chapter~17 uses a TCP probe) keeps passing,
+  because the socket accepts. The gateway keeps sending traffic.
+  \item The gateway's connection pool to course-service fills; its
+  \code{/api/courses} route degrades for everyone, including requests
+  that never needed auth-service. Chapter~31's cascade begins one hop
+  up.
+  \item auth-service, meanwhile, is receiving 100 requests per second
+  from a caller that will discard the answers after the gateway's
+  timeout --- load that makes the vacuum's contention worse.
+  \item The breaker never opens: 2\,s is under the 60\,s slow-call
+  default, and none of the calls fail. The one mechanism that could
+  shed load is watching for the wrong signal.
+\end{enumerate}
+
+With the configuration below: calls are cut at 2\,s (Feign read
+timeout) and counted as slow above 1\,s; after ten outcomes with
+$\ge$80\,\% slow, the breaker opens; listings return with the cached or
+degraded teacher name in under a millisecond; at most 25 threads were
+ever waiting; auth-service's load drops to three probe calls per ten
+seconds; and the breaker's state change is on a dashboard.
+
+\section{Enhancing the resolution}
+\label{sec:res-enhance}
+
+Dependency first: add \code{spring-cloud-starter-circuitbreaker-resilience4j}
+to course-service's POM (it brings the \code{CircuitBreakerFactory}
+Feign needs; \code{resilience4j-spring-boot3} stays for the annotations
+and metrics). Then \code{course-service.yml}:
+
+\begin{lstlisting}[language=yaml]
+spring:
+  cloud:
+    openfeign:
+      circuitbreaker:
+        enabled: true                            (*@\co{1}@*)
+      client:
+        config:
+          auth-service:                          (*@\co{2}@*)
+            connect-timeout: 1000
+            read-timeout: 2000
+            logger-level: basic
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      authService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 1s         (*@\co{3}@*)
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true          (*@\co{4}@*)
+        ignore-exceptions:                       (*@\co{5}@*)
+          - feign.FeignException.NotFound
+          - feign.FeignException.BadRequest
+  retry:
+    instances:
+      authService:
+        max-attempts: 3                          (*@\co{6}@*)
+        wait-duration: 200ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
+        retry-exceptions:
+          - java.net.SocketTimeoutException
+          - feign.RetryableException
+        ignore-exceptions:
+          - feign.FeignException.FeignClientException
+  bulkhead:
+    instances:
+      authService:
+        max-concurrent-calls: 25                 (*@\co{7}@*)
+        max-wait-duration: 0
+  timelimiter:
+    instances:
+      authService:
+        timeout-duration: 3s                     (*@\co{8}@*)
+        cancel-running-future: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,circuitbreakers,circuitbreakerevents
+  health:
+    circuitbreakers:
+      enabled: true
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] The switch that makes \code{fallback = ...} real. Feign
+  now wraps each method in a breaker named
+  \code{AuthServiceClient\#getUserById(Long)}; the explicit annotations
+  below use the \code{authService} instance for the caller-side policy.
+  \item[\co{2}] Per-client timeouts, keyed by the Feign \code{name}.
+  Two seconds is generous for a by-id lookup that normally takes
+  20\,ms, and strictly shorter than the gateway's 5\,s.
+  \item[\co{3}] Slow now counts. Above 1\,s is ``slower than designed'';
+  when 80\,\% of the window is slow, the breaker opens even if every
+  call eventually succeeds.
+  \item[\co{4}] The breaker's state appears in \code{/actuator/health}
+  and as a Micrometer gauge (\code{circuitbreaker.state}) --- the thing
+  you alert on.
+  \item[\co{5}] A missing user is an answer, not an outage. 4xx
+  responses neither count as failures nor trigger the fallback.
+  \item[\co{6}] Three attempts with 200\,ms, then 400\,ms, each
+  jittered by $\pm$50\,\%. Only transport failures are retried; any
+  HTTP 4xx is final. Total worst case: $3 \times 2\,\text{s} + 0.6\,\text{s}$,
+  still bounded and still under a minute --- but longer than the
+  gateway's 5\,s, which is the argument for at most 2 attempts on a
+  request path and 3 only in background work.
+  \item[\co{7}] Twenty-five threads may wait on auth-service; the 26th
+  call fails immediately with \code{BulkheadFullException} and takes the
+  fallback. \code{max-wait-duration: 0} means no queueing --- queueing
+  is what we are trying to avoid.
+  \item[\co{8}] Only used by the \code{CompletableFuture} variant
+  below; harmless otherwise.
+\end{description}
+
+The service-side wrapper, with identity propagation and a fallback that
+says what it is:
+
+\begin{lstlisting}[language=Java]
+/** Forwards the caller's identity on service-to-service calls so
+ *  auth-service's GatewayHeaderAuthFilter accepts them. */
+@Configuration
+public class FeignIdentityConfig {
+    @Bean
+    public RequestInterceptor identityPropagation() {
+        return template -> {
+            var auth = SecurityContextHolder.getContext()
+                    .getAuthentication();
+            if (auth != null && auth.getPrincipal() instanceof Long id) {
+                template.header(JwtConstants.HEADER_USER_ID, id.toString());
+                auth.getAuthorities().stream().findFirst().ifPresent(a ->
+                    template.header(JwtConstants.HEADER_USER_ROLE,
+                        a.getAuthority().replace("ROLE_", "")));
+            }
+        };
+    }
+}
+
+/** The one place course-service asks who a user is. */
+@Service
+@RequiredArgsConstructor
+public class UserLookupService {
+
+    private final AuthServiceClient authServiceClient;
+    private final Map<Long, UserDto> lastKnown =
+            new ConcurrentHashMap<>();                     (*@\co{1}@*)
+
+    @Retry(name = "authService")
+    @CircuitBreaker(name = "authService", fallbackMethod = "degraded")
+    @Bulkhead(name = "authService")
+    public UserDto findUser(Long id) {
+        UserDto user = authServiceClient.getUserById(id);
+        lastKnown.put(id, user);
+        return user;
+    }
+
+    /** Same signature plus the cause; called for breaker rejections,
+     *  bulkhead rejections, timeouts and 5xx -- never for 4xx. */
+    private UserDto degraded(Long id, Throwable cause) {   (*@\co{2}@*)
+        UserDto cached = lastKnown.get(id);
+        if (cached != null) {
+            return cached;                                 // stale, real
+        }
+        return new UserDto(id, null, "Unknown", "user", null);
+    }
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] A last-known-good cache. In one replica a map is
+  enough; with several, the same idea belongs in Redis with a TTL, or
+  --- the real fix --- in a local table fed by user events.
+  \item[\co{2}] The fallback is typed and visible: callers get a
+  \code{UserDto} whose name says ``Unknown'', never \code{null}. The
+  \code{Throwable} lets you log \emph{why} (breaker open vs.\ timeout)
+  at WARN once per state change rather than per call.
+\end{description}
+
+The metrics to watch, all exported to Prometheus by the existing
+Actuator setup: \code{resilience4j\_circuitbreaker\_state} (a gauge per
+state per instance; alert when \code{state="open"} is 1 for more than a
+minute), \code{resilience4j\_circuitbreaker\_calls\_seconds} by
+\code{kind} (successful, failed, ignored) for rates,
+\code{resilience4j\_bulkhead\_available\_concurrent\_calls} approaching
+zero as the leading indicator, and Feign's own
+\code{http\_client\_requests\_seconds} for the raw latency that started
+it all.
+
+\begin{decision}[when the call should not exist]
+Keep the synchronous call while it is off the hot path, rare, and
+tolerates a stale answer. Replace it with a local copy fed by events
+when a listing page needs it (latency and coupling), when grading must
+work while auth-service is down (availability), or when the two teams
+release on different cadences (contract drift). Replace it with a
+short-TTL cache in front of the call when the data is hot but must not
+be more than a minute old and eventual consistency via events is not
+worth a new consumer. The senior instinct is to count synchronous
+dependencies per request and treat each one as a multiplication of
+failure probability: three 99.9\,\% dependencies in series are a
+99.7\,\% endpoint.
+\end{decision}
+
+\begin{handson}[watch the breaker open]
+With the enhancement applied and the stack up, stop auth-service and
+call an endpoint that uses \code{UserLookupService} twelve times:
+\begin{lstlisting}[language=bash]
+$ docker compose stop auth-service
+$ for i in $(seq 1 12); do
+    curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+      -H "Authorization: Bearer $TOKEN" \
+      http://localhost:8080/api/courses/courses/1
+  done
+200 1.04s   ... (10 slow lines: retries then fallback)
+200 0.01s   <- breaker open: fallback without a network call
+200 0.01s
+$ curl -s http://localhost:8082/actuator/circuitbreakers | jq
+{ "circuitBreakers": { "authService": {
+    "failureRate": "100.0%", "slowCallRate": "0.0%",
+    "bufferedCalls": 10, "failedCalls": 10, "state": "OPEN" } } }
+\end{lstlisting}
+Every response is 200 with ``Unknown user'' as the teacher --- the page
+degrades instead of failing. Start auth-service again, wait 10\,s, and
+\code{/actuator/circuitbreakerevents} shows the three HALF\_OPEN probes
+succeed and the state return to CLOSED.
+\end{handson}
+
+\section{Outside the project}
+
+The same machinery under other names: Hystrix was Netflix's original
+and is retired; Resilience4j is its successor in the Java world;
+Envoy and Istio implement timeouts, retries with budgets, and outlier
+ejection in the sidecar so that application code contains none of it,
+which is the direction large fleets have gone. gRPC carries deadlines
+in the protocol --- a caller's deadline propagates to every hop, solving
+the ``timeouts stack'' problem by construction. Cloud SDKs (AWS, GCP)
+ship with exponential backoff and jitter built in for the same reason
+this chapter recommends them. The vocabulary is universal; an
+interviewer who says ``bulkhead'' or ``retry budget'' means exactly
+what this chapter means.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: auth-service latency goes from 20\,ms to 2\,s. Walk me through what happens in course-service, and how you would stop it.}
+
+Each request that touches auth-service now holds a Tomcat thread a
+hundred times longer. At a modest rate the pool of 200 saturates within
+seconds, the accept queue fills, and course-service stops answering
+everything --- including endpoints that never call auth-service and the
+readiness probe. Upstream, the gateway's per-host pool to course-service
+fills and its route degrades for all users. Nothing in the default
+configuration stops this: Feign waits 60\,s, and a 2\,s call is not
+slow to a breaker whose slow-call threshold is 60\,s. To stop it, in
+order of leverage: a read timeout of 2\,s so no thread waits longer
+than the gateway's deadline; a bulkhead of about 25 so the other 175
+threads keep serving; a slow-call threshold of 1\,s at 80\,\% so the
+breaker opens on latency, not just on errors; and a fallback that
+returns the last known name rather than \code{null}. Then, if the
+lookup is on a hot path, remove the call altogether with a local copy
+fed by user events. The senior framing: the goal is that auth-service's
+latency shows up as a stale name on a page, not as an outage of
+courses.
+
+\subsection*{Q: How do you size timeouts across three hops?}
+
+From the outside in, each shorter than the one before. The browser or
+mobile client is the outermost budget --- say 10\,s before the user
+gives up. The gateway's response timeout must be inside that, 5\,s,
+so the client gets a clean 503 instead of a hang. course-service's
+Feign read timeout must be inside \emph{that} and leave room for
+retries: 2\,s with at most one retry keeps the worst case around 4\,s.
+Any timeout longer than its caller's is a leak --- work done for a
+request that has already been abandoned --- and any retry policy must
+be included in the arithmetic, because three attempts at 2\,s is 6\,s
+plus backoff. In production you also set a \emph{connect} timeout
+separately and much shorter (1\,s), because failure to connect is
+diagnosed in one round trip. The best systems propagate a deadline
+header from the edge so each hop computes its own remaining budget;
+gRPC does this natively.
+
+\subsection*{Q: Retry storms --- how do you prevent them?}
+
+Three controls, all needed. First, jitter: exponential backoff alone
+lets every client that failed at the same moment retry at the same
+moment, so the second wave is synchronized and larger; randomizing the
+wait by $\pm$50\,\% spreads it. Second, a retry budget: retries as a
+percentage of traffic (Envoy's default is 20\,\%), so that when a
+dependency is truly down, retries cannot triple its load. Resilience4j
+approximates this by putting Retry outside the breaker --- an open
+breaker rejects attempts before they become retries. Third,
+idempotency: retry only \code{GET} and operations that carry an
+idempotency key the server deduplicates on; otherwise a timeout on a
+\code{POST} becomes a duplicate enrollment. And retry only transport
+failures and 503 --- a 400 or 404 is deterministic and will fail again.
+The tell-tale sign of a storm in metrics is a dependency whose request
+rate rises as its success rate falls.
+
+\subsection*{Q: The breaker is open, but users need the data. What does your fallback return?}
+
+The most truthful thing available, typed so the caller cannot mistake
+it for the real value. Order of preference: the last successful value
+from a short-lived cache (stale but real --- a teacher's name from ten
+minutes ago is fine); a clearly degraded placeholder the UI can render
+(``Unknown teacher'') that never masquerades as data; an empty
+collection where the domain permits; or a typed exception that becomes
+a 503 with \code{Retry-After}. Never \code{null}, which turns a
+resilience event into a \code{NullPointerException} somewhere else. The
+fallback must also see the cause: a 404 means the user does not exist
+and should surface as such, not be swallowed by ``try later''. And
+fallbacks should be cheap and local --- a fallback that calls another
+service is a second dependency on the failure path.
+
+\subsection*{Q: How do you know the breaker is open at 3\,a.m.?}
+
+Because it is a metric with an alert, not a log line. Resilience4j
+exports \code{resilience4j\_circuitbreaker\_state} as a gauge per
+state; a rule like ``\code{state="open"} equals 1 for more than 60
+seconds'' pages someone with the dependency name in the alert. Pair it
+with the leading indicators: \code{slow\_call\_rate} rising before the
+breaker trips, bulkhead available slots trending to zero, and the
+dependency's p99 from \code{http\_client\_requests\_seconds}. The
+breaker also feeds \code{/actuator/health} when
+\code{register-health-indicator} is on, so a readiness probe can be
+made to reflect it --- though usually you do \emph{not} want an open
+breaker to take a service out of rotation, since it is serving
+fallbacks precisely so it can stay in. And log the \emph{transition}
+at WARN once, not every rejected call, or the log becomes the next
+outage.
+
+\subsection*{Q: Would you put the breaker in the gateway or in the service?}
+
+Both, for different failures. The gateway's breaker (Chapter~31)
+protects users from a whole service being slow; it opens per route and
+serves a fallback body. The service's breaker protects the service's
+own thread pool from one of its dependencies and is where the
+domain-aware fallback lives --- only course-service knows that a
+missing teacher name is survivable. A gateway cannot know that. The
+mistake is having only the edge one and assuming services behind it
+are therefore safe; the cascade this chapter walks through happens
+entirely behind the gateway.
+
+\begin{quiz}
+\begin{enumerate}
+  \item The project configures a breaker named \code{authService}.
+  List the three separate reasons it currently protects no call, and
+  the one-line change that fixes each.
+  \item With \code{sliding-window-size: 10} and the other defaults,
+  how many consecutive failures can occur after startup before the
+  breaker opens, and why does a call that takes 30\,s not count?
+  \item Order these and justify: gateway response timeout, browser
+  timeout, Feign read timeout, retry count.
+  \item \code{AuthServiceFallback.getUserById} returns \code{null}. Name
+  two concrete defects that follow from this and the two-argument
+  signature that fixes the more subtle one.
+  \item auth-service returns 401 to every Feign call. Explain the cause
+  in the project's security configuration, the effect on the breaker,
+  and the two changes that resolve it.
+  \item Three synchronous dependencies each at 99.9\,\% availability
+  sit in series on one endpoint. What is its availability, and which
+  two design changes raise it without touching the dependencies?
+\end{enumerate}
+\end{quiz}

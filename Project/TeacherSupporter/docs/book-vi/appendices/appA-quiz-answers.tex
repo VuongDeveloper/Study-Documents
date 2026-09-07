@@ -529,3 +529,418 @@
   UID-tùy-ý của OpenShift chấp nhận chúng nguyên vẹn; chỉ còn
   Ingress $\rightarrow$ Route.
 \end{enumerate}
+
+\section*{Chương 28 --- Đào sâu: JWT ở quy mô lớn}
+\begin{enumerate}
+  \item Không. Config-server giờ chỉ giữ khóa công khai, thứ xác minh
+  được nhưng không ký được. Giả mạo cần PEM riêng, chỉ nằm trong Secret
+  của auth-service --- Secret đó (hoặc pod auth-service) mới là thứ
+  phải lộ.
+  \item Công bố khóa công khai mới trong JWKS dưới một \code{kid} mới
+  trong khi giữ khóa cũ; đợi cache của các bên xác minh làm mới; chuyển
+  ký sang khóa riêng mới; sau thời gian sống dài nhất của token, gỡ
+  khóa cũ. Ở bước~3 hai thế hệ token lưu hành cùng lúc; \code{kid} cho
+  mỗi bên xác minh biết \emph{khóa công khai nào} cần áp dụng, nên
+  token cũ vẫn xác minh được và khóa cũ về sau có thể nghỉ hưu một cách
+  chắc chắn chứ không phải bằng cách thử.
+  \item User đã cầm access token không bị ảnh hưởng cho tới khi nó hết
+  hạn (15 phút), vì các bên xác minh đã cache khóa công khai. Sau đó
+  \code{/refresh} thất bại và họ bị đăng xuất; đăng nhập mới thất bại
+  ngay từ phút đầu. Một bên xác minh khởi động lại trong lúc sự cố boot
+  với cache JWKS rỗng và, khi fail closed, từ chối mọi token --- đó là
+  lý do khóa công khai cũng nên có sẵn trong cấu hình làm phương án dự
+  phòng.
+  \item Lỗi thời: claim bị đóng băng lúc phát hành, nên một khóa học
+  tạo sau khi đăng nhập là vô hình cho tới khi token hết hạn --- token
+  không thể biết dữ liệu nó không sở hữu. Quyền sở hữu: thành viên khóa
+  học là dữ liệu của course-service; mã hóa nó vào token do auth-service
+  phát hành là ghép schema của hai service qua hợp đồng token. (Kích
+  thước là lý do thứ ba, và ít quan trọng nhất.)
+  \item Header được chuyển tiếp, nhưng không endpoint công khai nào đọc
+  \code{X-User-Id}: \code{/refresh} xác thực bằng refresh token,
+  \code{/actuator} không xác thực gì. Nên hôm nay không khai thác được,
+  nhưng bất biến ``chỉ gateway viết các header này'' không được cưỡng
+  chế. \code{default-filters: RemoveRequestHeader=X-User-Id} (và
+  \code{X-User-Role}) trong \code{api-gateway.yml} cưỡng chế nó.
+  \item Tối đa 15 phút --- thời gian sống của access token --- vì
+  gateway xác minh cục bộ và chỉ \code{/refresh} mới hỏi cơ sở dữ liệu.
+  Deny-list theo \code{jti} thêm Redis (một lượt tra mỗi request, Redis
+  chết thì fail-open hay fail-closed tùy bạn chọn); mẫu phantom token
+  thêm Redis trên đường găng của mọi request mà không có lựa chọn
+  fail-open --- Redis chết là sập toàn bộ.
+\end{enumerate}
+
+\section*{Chương 29 --- Đào sâu: Cấu hình}
+\begin{enumerate}
+  \item Secret thắng: nó tới dưới dạng biến môi trường
+  \code{SPRING\_DATASOURCE\_PASSWORD}, và môi trường OS đứng trên tài
+  liệu từ config-server. Nếu object Secret không tồn tại,
+  \code{envFrom} làm pod thất bại; nếu chỉ thiếu khóa, pod khởi động,
+  giá trị \code{root} nguyên văn trong file được phục vụ có hiệu lực,
+  và service kết nối bằng \code{root}, lặng lẽ.
+  \item Ưu tiên chọn \emph{tài liệu nào} định nghĩa
+  \code{app.s3.secret-key}; tài liệu của config-server định nghĩa, và
+  nó gửi nguyên văn \code{\${APP\_S3\_SECRET\_KEY:minioadmin}} chưa
+  phân giải. Client phân giải placeholder với Environment của chính nó
+  sau đó, nên biến môi trường thắng vì văn bản yêu cầu thế, không phải
+  vì thứ tự nguồn.
+  \item Cửa sổ một: giữa hai lần refresh, auth-service ký bằng khóa mới
+  còn gateway xác minh bằng khóa cũ --- mọi lần đăng nhập cho ra token
+  gateway từ chối. Cửa sổ hai: sau khi cả hai refresh, mọi token phát
+  trước thay đổi bị từ chối cho tới lúc đằng nào cũng hết hạn. Xoay
+  nóng cần các khóa chồng lấn chọn bằng \code{kid}, thứ một secret
+  HS256 dùng chung không diễn đạt được.
+  \item Không optional: lấy thất bại, JVM thoát, kubelet khởi động lại
+  với back-off tăng dần cho tới khi server trở lại. \code{optional:}:
+  boot từ mặc định đóng gói trỏ về localhost, qua readiness probe, nhận
+  lưu lượng, thất bại mọi request. \code{fail-fast} cộng retry: thử lại
+  trong tiến trình với back-off trong cửa sổ đã cấu hình, rồi thoát ---
+  không lãng phí lần khởi động JVM nào, và không có pod nói dối.
+  \item Generator của Kustomize gắn hash nội dung vào tên ConfigMap;
+  file đổi là tên mới, Deployment tham chiếu nó là pod template mới, và
+  Kubernetes roll các pod. Cấu hình, code và rollback thành một cơ chế
+  có lịch sử --- server không cho được điều đó nếu không có Bus hay
+  khởi động lại.
+  \item Bỏ khi mọi runtime là Kubernetes, không giá trị nào phải đổi mà
+  không khởi động lại pod, và secret đã sống trong nền tảng. Giữ khi
+  một runtime ngoài Kubernetes (VM, Compose ở production) phải dùng
+  chung cùng nguồn cấu hình.
+\end{enumerate}
+
+\section*{Chương 30 --- Đào sâu: Khám phá dịch vụ}
+\begin{enumerate}
+  \item Đăng ký tức thì khi web server khởi động (Spring ép việc đó).
+  Rồi cache phản hồi chỉ đọc của server (30\,s), chu kỳ tải registry
+  của gateway (30\,s), và TTL cache của LoadBalancer (35\,s): khoảng
+  95\,s xấu nhất, thường bằng một nửa.
+  \item Lease hết hạn 90\,s, rồi lượt quét loại bỏ (tới 60\,s), rồi
+  cache server 30\,s, tải của client 30\,s, cache LoadBalancer 35\,s
+  --- tới 245\,s. Tắt êm gửi DELETE và bỏ qua hai bước đầu (150\,s),
+  chỉ còn lại các cache.
+  \item Gia hạn kỳ vọng mỗi phút: $5 \times 2 = 10$; ngưỡng
+  $\lfloor 10 \times 0{,}85 \rfloor = 8$; server chỉ khỏe khi gia hạn
+  nhiều hơn 8. Một client chết cho đúng 8, nên tự bảo toàn kích hoạt
+  và không gì bị loại bỏ. \code{eureka.server.enable-self-preservation:
+  false} (hoặc \code{renewal-percent-threshold} thấp hơn) sửa việc đó
+  trên đội tàu nhỏ.
+  \item Trạng thái tự báo của Eureka gác đường của gateway, vì
+  \code{lb://} phân giải thành IP pod đã đăng ký và không bao giờ chạm
+  tới Service Kubernetes nơi readiness được cưỡng chế. Định tuyến tới
+  \code{http://course-service:8082} đưa kube-proxy, và do đó readiness,
+  trở lại đường đi.
+  \item Compose không kích hoạt profile nào, nên tài liệu gốc áp dụng:
+  Eureka client bật, route \code{lb://}, và \code{url} của Feign phân
+  giải thành chuỗi rỗng, thứ Feign hiểu là ``dùng phân giải cân bằng
+  tải theo tên''. Dưới \code{k8s} thuộc tính đó là URL Service và Feign
+  bỏ qua LoadBalancer hoàn toàn.
+  \item Registry biết một instance chỉ qua điều instance tự nói về
+  mình, và biết đến sự im lặng chỉ sau một lease nó không quét ngay;
+  endpoint của Service do kubelet duy trì, thứ chủ động probe pod vài
+  giây một lần và gỡ nó ngay khoảnh khắc probe thất bại. Tự báo với
+  thời gian ân hạn so với quan sát bên ngoài không có ân hạn.
+\end{enumerate}
+
+\section*{Chương 31 --- Đào sâu: Gateway dưới tải}
+\begin{enumerate}
+  \item Chưa có gì được gửi đi: \code{chain.filter} trả về một
+  \code{Mono} mô tả phần còn lại của chuỗi; nó chỉ chạy khi framework
+  subscribe, và thread gọi đã rảnh. \code{doFilter} của filter servlet
+  chặn tới khi lời gọi phía sau hoàn tất, nên thread bị giữ suốt
+  request --- chính mô hình mà event loop tồn tại để tránh.
+  \item Mọi request có socket thuộc vòng lặp đang khựng đều dừng ---
+  kể cả các route không hề chạm Redis --- vì vòng lặp dùng chung giữa
+  các route, không phải theo route. Reactor Netty chạy
+  \code{max(cores, 4)} vòng lặp; trên máy 2 lõi là bốn, nên một vòng
+  lặp bị chặn là một phần tư năng lực gateway.
+  \item Mười sáu: pool mặc định theo host là \code{max(cores, 8)
+  $\times$ 2}. Không có timeout phản hồi, 16 request treo giữ cả 16 kết
+  nối và request thứ 17 đợi 45\,s trong hàng acquire. Đặt
+  \code{spring.cloud.gateway.httpclient.response-timeout} (hoặc tăng
+  \code{pool.max-connections}) đổi con số; timeout mới là thứ sửa
+  nguyên nhân.
+  \item Filter bọc mỗi lời gọi trong một TimeLimiter Resilience4j có
+  mặc định 1\,s. Lần tải lên 1,5\,s bị cắt, tính là thất bại, và sau đủ
+  số lần, breaker mở chống lại một service khỏe mạnh. Đặt
+  \code{timeout-duration} của TimeLimiter instance đó ít nhất dài
+  bằng timeout phản hồi.
+  \item Với hai replica trở lên, bucket trong bộ nhớ cho mỗi replica
+  giới hạn riêng, nên một user được $N\times$ hạn ngạch. Redis giữ một
+  bucket cho mỗi khóa, cập nhật nguyên tử bằng script Lua. Đánh đổi:
+  Redis là phụ thuộc trên mọi request; mặc định của filter khi Redis
+  không với tới là cho request qua (fail-open), việc phải là lựa chọn
+  có chủ ý.
+  \item Mọi request đều không đơn giản, nên khi dev mỗi lời gọi API đi
+  sau một preflight \code{OPTIONS}. \code{setMaxAge} cho trình duyệt
+  cache kết quả preflight (mặc định của Chrome là 5\,s). Trong cụm,
+  frontend và \code{/api} chung một origin phía sau Traefik, nên không
+  request nào xuyên origin và filter CORS không bao giờ được hỏi tới.
+\end{enumerate}
+
+\section*{Chương 32 --- Đào sâu: Gọi đồng bộ}
+\begin{enumerate}
+  \item (a) Không code nào gọi \code{AuthServiceClient} --- nối nó vào
+  một service như \code{UserLookupService}. (b) Tích hợp breaker của
+  Feign đang tắt --- đặt \code{circuitbreaker.enabled: true} dưới
+  \code{spring.cloud.openfeign}. (c) Không
+  có bean \code{CircuitBreakerFactory} --- thêm dependency
+  \code{spring-cloud-starter-}\allowbreak\code{circuitbreaker-resilience4j}.
+  Riêng nữa, không gì tham chiếu instance \code{authService} --- gắn
+  \code{@CircuitBreaker} với \code{name = "authService"} lên phương
+  thức gọi.
+  \item Chín: \code{minimum-number-of-calls} mặc định bằng cỡ cửa sổ,
+  nên breaker không đánh giá cho tới kết quả thứ mười. Lời gọi 30\,s là
+  thành công vì \code{slow-call-duration-threshold} mặc định 60\,s;
+  chỉ lời gọi chậm hơn thế mới tính là chậm, và chỉ khi đạt ngưỡng tỷ
+  lệ chậm (mặc định 100\,\%).
+  \item Trình duyệt (dài nhất) $>$ timeout phản hồi của gateway $>$
+  Feign read timeout $\times$ số lần thử (cộng backoff). Mỗi chặng phải
+  bỏ cuộc trước bên gọi của nó, nếu không nó làm việc cho request đã bị
+  bỏ rơi; và số lần retry nhân với timeout trong cùng, nên phải nằm
+  trong ngân sách của gateway --- 2\,s $\times$ 2 lần dưới timeout
+  gateway 5\,s, không phải 3.
+  \item Một \code{NullPointerException} ở mọi bên gọi quên kiểm tra,
+  chỉ lộ ra khi có sự cố; và không phân biệt được 404 (user thực sự
+  không có) với một lần breaker từ chối, nên cả hai bị đối xử như nhau.
+  \code{degraded(Long id, Throwable cause)} --- fallback hai tham số
+  --- nhận nguyên nhân và có thể trả giá trị đã cache hay giá trị thay
+  thế cho lỗi hạ tầng trong khi để 4xx lan tiếp.
+  \item \code{SecurityConfig} của auth-service chỉ cho phép đường dẫn
+  công khai; \code{/users/\{id\}} cần ngữ cảnh đã xác thực mà
+  \code{GatewayHeaderAuthFilter} của nó dựng từ \code{X-User-Id}, thứ
+  Feign không gửi. Mỗi 401 là một ngoại lệ, nên mười lần mở breaker
+  chống lại một service khỏe. Sửa: một \code{RequestInterceptor} của
+  Feign chuyển tiếp header danh tính, và \code{ignore-exceptions} cho
+  4xx để lỗi phía client không bao giờ tính là lỗi phụ thuộc.
+  \item $0{,}999^3 \approx 99{,}7\,\%$. Nâng lên bằng cách bỏ phụ
+  thuộc khỏi đường request --- bản sao cục bộ nuôi bằng sự kiện, hoặc
+  cache đặt trước lời gọi --- và làm các phụ thuộc còn lại thành tùy
+  chọn với fallback có kiểu để lỗi của chúng làm suy giảm response thay
+  vì làm nó thất bại.
+\end{enumerate}
+
+\section*{Chương 33 --- Đào sâu: Dữ liệu xuyên service}
+\begin{enumerate}
+  \item Thứ tự A: transaction commit, rồi JVM chết trước khi bộ đệm
+  producer flush --- user đã kích hoạt, không có sự kiện, không bao giờ
+  có học viên. Thứ tự B: bộ đệm flush và broker ack, rồi commit thất
+  bại --- course-service tạo học viên cho một user đã bị rollback. B
+  tạo ra dòng ma.
+  \item Producer không lấy được metadata, chặn trong
+  \code{max.block.ms} (60\,000\,ms), rồi ném ngoại lệ; ngoại lệ thoát
+  khỏi \code{register()}, transaction rollback, và user không được tạo.
+  Với outbox, request ghi một dòng user và một dòng outbox trong một
+  commit và trả về sau vài mili giây; relay thử lại việc gửi ở nền.
+  \item Hai replica chạy cùng scheduler. Không có khóa, cả hai chọn
+  cùng các dòng chưa phát và cả hai phát chúng --- một bản sao cho mọi
+  sự kiện, mỗi giây. \code{FOR UPDATE} bắt replica thứ hai chờ;
+  \code{SKIP LOCKED} bắt nó lấy các dòng kế tiếp thay vào đó, nên chúng
+  chia việc mà không chồng lấn.
+  \item Thứ tự theo key. Nếu dòng~1 của user~42 thất bại và vòng lặp
+  \code{continue} sang dòng~2 cùng user, dòng~2 được phát trước; nhịp
+  kế phát dòng~1 phía sau nó, và consumer thấy ``updated'' trước
+  ``activated''. Dừng lô giữ thứ tự partition bằng thứ tự outbox.
+  \item Không gì: \code{ts.user.activated} bắn một lần, và không có
+  \code{ts.user.updated}, nên \code{student.email} đóng băng từ lúc
+  kích hoạt. Thay đổi: phát một dòng outbox với
+  \code{eventType=UserUpdated} ở bất cứ đâu lưu hồ sơ; làm
+  \code{UserActivatedListener} upsert (tìm-hoặc-tạo, rồi đặt trường);
+  cho nó đăng ký cả hai topic hoặc thêm listener thứ hai.
+  \item Trạng thái: \code{ACTIVE} $\rightarrow$ \code{DELETING}
+  $\rightarrow$ đã xóa, hoặc về lại \code{ACTIVE}. Sự kiện: auth phát
+  \code{UserDeletionRequested} qua outbox; course phát
+  \code{StudentDataDeleted} hoặc, khi hỏng,
+  \code{StudentDataDeletionFailed} sau khi xóa học viên, ghi danh, bài
+  nộp và object MinIO. Bù: khi
+  thất bại auth khôi phục \code{ACTIVE} và cảnh báo. \code{DELETING} là
+  khóa ngữ nghĩa: nó từ chối đăng nhập và ghi danh mới trong lúc saga
+  chạy, nên không bước nào thao tác trên dữ liệu bước khác đang xóa.
+\end{enumerate}
+
+\section*{Chương 34 --- Đào sâu: Bảo đảm giao nhận Kafka}
+\begin{enumerate}
+  \item \code{enable.idempotence=true} (broker khử trùng các lần thử
+  lại của producer), \code{acks=all}, \code{retries} không giới hạn
+  trong \code{delivery.timeout.ms} --- toàn bộ là mặc định của client
+  Kafka~3.x mà dự án chưa từng đặt. Trên Compose có một broker và
+  \code{replicas: 1}, nên ``mọi replica đồng bộ'' là một cái đĩa; thiết
+  lập này chỉ mua được độ bền khi \code{replication.factor=3} và
+  \code{min.insync.replicas=2} tồn tại.
+  \item Một lô được poll; listener gửi mail từng cái trên luồng poll;
+  xử lý vượt \code{max.poll.interval.ms} (300\,000\,ms); broker đuổi
+  consumer và gán lại partition từ offset đã commit cuối; chủ mới xử lý
+  cùng các record trong khi chủ cũ vẫn chạy nốt vòng lặp.
+  \item Nếu lượt giành commit một mình rồi lần ghi nghiệp vụ thất bại,
+  lần thử lại thấy id đã được giành, trả về, và offset tiến lên --- thay
+  đổi mất vĩnh viễn trong khi bảng nói nó đã xảy ra. Trong một
+  transaction, thất bại rollback cả lượt giành, nên lần thử lại xử lý
+  được.
+  \item Chờ đợi chỉ giúp lỗi tạm thời: một SMTP relay quay lại, một
+  nháy mạng. \code{NullPointerException} hay lỗi giải tuần tự là tất
+  định; thử lại ba lần chỉ trì hoãn cùng thất bại. Nó bị loại trừ, nên
+  đi thẳng tới DLT ngay lần thử đầu.
+  \item \code{KafkaAutoConfiguration} của Boot lùi lại khi có bean
+  \code{ProducerFactory}, nên \code{spring.kafka.producer.*} trong
+  \code{course-service.yml} bị course-service bỏ qua. Sửa: xóa
+  \code{KafkaProducerConfig} (factory của Boot đọc cùng các serializer
+  từ YAML) --- hoặc giữ bean và xóa khối YAML.
+  \item Retention là 168 giờ; chín ngày dài hơn. Offset đã commit của
+  group giờ trỏ trước record cũ nhất còn giữ, nên
+  \code{auto-offset-reset: earliest} có hiệu lực và nó tiếp tục từ record
+  còn sống cũ nhất --- hai ngày sự kiện đã mất. Với group id mới không có
+  offset commit nào; \code{earliest} khiến nó xử lý toàn bộ bảy ngày còn
+  giữ, gửi lại mọi mail trong đó.
+\end{enumerate}
+
+\section*{Chương 35 --- Đào sâu: File ở quy mô lớn}
+\begin{enumerate}
+  \item \code{endpointOverride}: client dùng \code{endpoint}
+  (\code{minio:9000}), presigner dùng \code{public-endpoint}. Nếu
+  presigner ký với tên nội bộ, mọi link tải xuống sẽ nhúng một host trình
+  duyệt không phân giải được --- và viết lại sau đó làm hỏng chữ ký.
+  \item SigV4 ký một canonical request bao gồm các header được ký, và
+  \code{Host} luôn nằm trong số đó (\code{X-Amz-SignedHeaders=host}).
+  Link ký cho \code{minio:9000} rồi viết lại sang host khác trình ra
+  một canonical request khác; MinIO tính lại chữ ký, không khớp, và trả
+  về \code{403 SignatureDoesNotMatch}.
+  \item Transaction chỉ bao phủ insert vào Postgres; \code{putObject}
+  là một lời gọi HTTP bên ngoài nó. \code{save} thất bại thì dòng bị
+  rollback trong khi object vẫn nằm trong bucket dưới một key không
+  dòng nào ghi lại --- một object mồ côi.
+  \item Rẻ: liệt kê mọi lần nộp của một học sinh cho một bài tập (một
+  \code{ListObjectsV2} với tiền tố). Đắt: tìm mọi file của một học sinh
+  qua các bài tập (không tiền tố nào khớp; quét toàn bộ hoặc truy vấn
+  cơ sở dữ liệu). UUID khiến mọi key duy nhất, nên không upload nào ghi
+  đè upload khác; versioning chỉ bảo vệ trước những lần ghi đè không
+  thể xảy ra.
+  \item Nộp text thành công (không gọi kho). Liệt kê thành công và trả
+  về link (ký là tính toán cục bộ). Mở link thất bại (MinIO phải phục
+  vụ nó). Khởi động lại course-service thất bại: kiểm tra bucket trong
+  \code{@PostConstruct} ném lỗi khi connection refused.
+  \item Key được dựng phía server từ \code{assignmentId} và
+  \code{studentId} của chính người gọi, và lưu trên một dòng
+  \code{PENDING\_FILE} thuộc học sinh đó; \code{completeUpload} kiểm tra
+  dòng thuộc về người gọi và \code{HEAD} trên key của \emph{chính} dòng
+  đó thành công. URL cho key của học sinh khác không gắn được vào dòng
+  khác vì dòng không bao giờ nhận key do client cung cấp.
+\end{enumerate}
+
+\section*{Chương 36 --- Đào sâu: Từ điển trên MongoDB}
+\begin{enumerate}
+  \item \code{filter} của stage \code{FETCH} loại chúng. Index
+  \code{createdByUserId} chỉ thu hẹp về lát của người dùng; một
+  \code{\$regex} không neo, không phân biệt hoa thường không có ký tự
+  đầu nào để seek, nên mọi document đã nạp đều bị thử. Neo pattern
+  (\code{\^{}clou}) với collation phù hợp cho phép index trên
+  \code{word} phục vụ nó như một khoảng.
+  \item Mọi kết quả khớp --- có thể là cả 3{,}000 --- trở về từ Mongo;
+  \code{toResponse} rồi chạy hai truy vấn \code{word\_links} mỗi kết
+  quả (khoảng 6{,}000); trang được dựng trong Java bằng \code{subList}
+  sau khi sort toàn bộ danh sách.
+  \item Transaction nhiều document cần replica set; dự án chạy một
+  \code{mongod} standalone. Crash sau khi xóa định nghĩa và trước khi
+  xóa các liên kết để lại cạnh trỏ vào một từ đã mất.
+  \code{findByIdAndCreatedByUserId(...).orElse(null)} rồi
+  \code{filter(Objects::nonNull)} âm thầm bỏ các node như vậy.
+  \item \code{BsonMaximumSizeExceededException} (giới hạn 16\,MB). Sáu
+  ảnh khoảng 2--3\,MB mỗi cái, phình thêm một phần ba khi base64, vượt
+  16{,}793{,}600 byte. Quy tắc của Chương~35: byte trong kho đối tượng,
+  key trong cơ sở dữ liệu --- lưu ảnh trong MinIO và giữ key của chúng
+  trong \code{images}.
+  \item Text index tách token và rút gốc các từ trọn vẹn; ``lou'' không
+  phải token của ``cloud'', nên không có kết quả. Khớp giữa từ cần quét
+  regex hoặc index n-gram/trigram (Atlas Search, hay \code{pg\_trgm}
+  trong Postgres).
+  \item dictionary-service hỏng trên mọi endpoint; mọi service và topic
+  khác không bị ảnh hưởng (không kết nối chung, không bên gọi, không sự
+  kiện). Thêm một lệnh ping Mongo vào readiness probe sẽ đưa pod ra
+  khỏi danh sách endpoint của gateway, biến 500 thành một 503 sạch sẽ ở
+  biên.
+\end{enumerate}
+
+\section*{Chương 37 --- Đào sâu: Khả năng quan sát}
+\begin{enumerate}
+  \item Phía producer:
+  \code{spring.kafka.\allowbreak template.\allowbreak observation-enabled}
+  (vắng mặt trong mọi tài liệu cấu hình); phía consumer:
+  \code{spring.kafka.\allowbreak listener.\allowbreak observation-enabled}.
+  Thuộc tính chỉ cấu
+  hình \code{KafkaTemplate} \emph{tự cấu hình}; auth-service dùng cái
+  đó, nên thuộc tính sửa được nó. Course-service tự dựng template trong
+  \code{KafkaProducerConfig}, thứ bỏ qua thuộc tính và cần
+  \code{setObservationEnabled(true)} trong code.
+  \item Nó tiếp tục trace: mặc định của Boot~3 là \emph{đọc} W3C, B3
+  và B3-multi và \emph{phát} W3C, quyết định bởi các mặc định của
+  \code{management.tracing.propagation}. Header rời gateway là
+  \code{traceparent}, cùng trace id và một span id cha mới.
+  \item Exposure là danh sách tên; endpoint chỉ tồn tại khi một
+  registry hiển thị định dạng đó nằm trên classpath. Không service nào
+  phụ thuộc \code{micrometer-registry-prometheus}, nên Actuator không
+  có gì để lộ ra dưới tên đó. Thêm đúng một artifact ấy (BOM Boot quản
+  lý phiên bản) làm dòng exposure hiện có thành thật.
+  \item Độ trễ: không đổi --- span được xếp hàng và gửi bởi thread nền.
+  Heap: bị chặn --- hàng đợi giữ 10.000 span và bỏ khi tràn kèm cảnh
+  báo có đếm. Span: những cái sinh ra trong giờ đó mất; không có
+  replay. Với reporter đồng bộ, \emph{độ trễ} sẽ đổi: mọi request sẽ
+  chặn trên một lời gọi HTTP thất bại tới Zipkin cho tới khi timeout.
+  \item Một phần trăm --- lấy mẫu head-based quyết định tại gốc trước
+  khi biết kết quả, nên lỗi được giữ cùng tỷ lệ với thành công. Nâng
+  lên 1.0 chỉ cho lỗi đòi lấy mẫu tail-based, thứ cần một OpenTelemetry
+  Collector đệm trọn trace trước kho; đường trực tiếp Brave-tới-Zipkin
+  không làm được.
+  \item E-mail là giá trị tag không giới hạn; mỗi giá trị khác nhau tạo
+  một chuỗi thời gian mới trong registry metric và một giá trị được
+  đánh index mới trong kho trace. Bộ nhớ lớn theo số người dùng cho tới
+  khi \code{/actuator/metrics} bò lê và pod bị \code{OOMKilled}. Quy
+  tắc: tag mang \emph{mẫu và enum} (mẫu route, status, outcome); định
+  danh đi vào annotation của span hay dòng log, những thứ không được
+  đánh index theo giá trị.
+\end{enumerate}
+
+\section*{Chương 38 --- Đào sâu: Trình duyệt gặp gateway}
+\begin{enumerate}
+  \item Khóa \code{auth-storage} trong \code{localStorage}, do
+  \code{persist} của Zustand ghi. Một dòng:
+  \code{JSON.parse(localStorage.\allowbreak getItem('auth-storage')).\allowbreak
+  state.refreshToken}.
+  Có nó, script (hay bất kỳ ai nó gửi tới) có thể gọi
+  \code{/api/auth/refresh} suốt bảy ngày và đúc access token mới tùy
+  ý, từ bất kỳ máy nào.
+  \item Một 401 từ \code{/refresh} đi qua \code{apiClient} sẽ vào
+  interceptor phản hồi; \code{\_retry} chưa đặt trên request mới đó,
+  nên nó sẽ đọc refresh token và POST \code{/refresh} lần nữa qua
+  \code{apiClient}; 401 đó lại vào interceptor --- một chuỗi lời gọi
+  refresh không giới hạn, mỗi cái sinh ra cái tiếp, cho tới khi đóng
+  tab. \code{axios} trần không có interceptor, nên 401 của nó tới
+  \code{catch} và đăng xuất.
+  \item Cả bốn nhận 401 và mỗi cái tự đặt \code{\_retry}; bốn POST tới
+  \code{/refresh} đua nhau. Cái đầu thành công và xoay token; cái thứ
+  hai đưa ra token cũ giờ đã vô hiệu và nhận 401 từ auth-service; nó
+  rơi vào \code{catch} --- bước 4, \code{logout()} và chuyển hướng
+  cứng --- trong khi lần replay của request đầu thậm chí có thể thành
+  công. Single-flight: một promise, khởi động bởi 401 đầu tiên, các
+  cái còn lại await nó; một POST, một lần xoay, bốn lần replay cùng
+  token mới.
+  \item (a) Một endpoint có lỗ hổng hay bị lãng quên ở nơi khác dưới
+  \code{/api} không bao giờ nhận cookie, nên lỗi CSRF hay rò rỉ log ở
+  đó không chạm được nó; (b) cookie không đính kèm các lời gọi API
+  thường, nên nó không bao giờ xuất hiện trong access log của gateway,
+  proxy hay lưu lượng trình duyệt cho \code{/api/courses}. Trình duyệt
+  so \code{Path} với URL \emph{nó} yêu cầu, tức
+  \code{/api/auth/refresh} của gateway; \code{/refresh} đã bỏ tiền tố
+  của auth-service không bao giờ là đường dẫn trình duyệt thấy.
+  \item Không mode nào: proxy dev của Vite và Traefik trong cụm đều
+  giữ trang và API trên một origin, nên không request nào là
+  cross-origin và không preflight nào xảy ra. Phục vụ bundle đã build
+  từ một origin khác --- một CDN, hay một static host ở cổng khác không
+  qua proxy --- sẽ làm mọi lời gọi API thành cross-origin và cấu hình
+  đó thành quyết định.
+  \item CORS được trình duyệt cưỡng chế sau khi phản hồi tới: gateway
+  đã xử lý request và trả 200, rồi trình duyệt từ chối trao body cho
+  script vì phản hồi thiếu \code{Access-Control-Allow-Origin} chấp
+  nhận được. So sánh: header \code{Origin} của request với danh sách
+  allowed-origins (chuỗi chính xác, cả scheme và cổng);
+  \code{Access-Control-Allow-Credentials} với việc request có
+  credentialed hay không; và cho preflight,
+  \code{Access-Control-Allow-Headers} với các header request thực sự
+  gửi (\code{Authorization}, \code{Content-Type}).
+\end{enumerate}

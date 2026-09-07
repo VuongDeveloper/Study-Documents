@@ -1,0 +1,577 @@
+\chapter{Deep Dive: Kafka Delivery Guarantees --- At-Least-Once, Idempotent Consumers, and Dead Letters}
+\label{ch:dd-kafka}
+
+Chapter~10 gave the rule of thumb --- Kafka is at-least-once, so make
+consumers idempotent --- and Chapter~11 showed the poison-pill defense.
+This deep dive reads the producer and consumer settings the project
+actually runs, most of which it never wrote down, and follows one
+message through every place it can be duplicated or lost. Then it adds
+the two things a production consumer needs and the project lacks: a
+deduplication record and a retry path that ends in a dead-letter topic
+instead of a log line.
+
+Three questions organize the chapter:
+
+\begin{enumerate}
+  \item \textbf{Where does the project sit} on the at-most-once /
+  at-least-once / exactly-once scale --- not by intent, but by the
+  defaults it inherited?
+  \item \textbf{Exactly when is a message delivered twice}, and what
+  must a consumer do to make that harmless?
+  \item \textbf{What happens to a message that cannot be processed},
+  and where should it go instead of nowhere?
+\end{enumerate}
+
+\section{Why this, and what it solves}
+
+The project uses Kafka for one job: decoupling a business write from
+its side effects. A user registers; a mail must go out; a student row
+must appear in another database. Doing those inline would make
+registration as slow and as fragile as SMTP and a second Postgres.
+Doing them through a log makes them \emph{eventually} happen, survive
+consumer restarts, and be replayable. Chapter~6 covered the sync-vs-async
+split; what it did not say is that ``eventually'' has a precise
+meaning in Kafka, made of five or six settings, and the defaults of
+those settings are what the project is running today.
+
+\begin{decision}[events, not commands --- and when a call is right after all]
+\code{ts.user.registered} says ``this happened''; it does not say ``send
+an e-mail''. Notification-service decides what a registration means
+for it, and course-service ignores the topic entirely. That is the
+event style, and it is why a fourth consumer can be added without
+touching auth-service. The command style --- a \code{SendEmail} message
+addressed to one handler --- couples the sender to the receiver's
+existence and is usually a sign that a synchronous call was wanted. And
+sometimes it was: when the caller needs the \emph{result} now (does this
+user exist? is this file scanned?), a Feign call with a circuit breaker
+is the honest design, and dressing it as request-reply over Kafka only
+adds two hops and a correlation id. The project's rule: events for
+facts other services react to; calls for questions the caller must have
+answered before it can continue.
+\end{decision}
+
+\section{The settings the project never wrote}
+
+\subsection{Producer}
+
+Course-service builds its producer by hand in \code{KafkaProducerConfig}:
+
+\begin{lstlisting}[language=Java]
+Map<String, Object> configProps = new HashMap<>();
+configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+        StringSerializer.class);                              (*@\co{1}@*)
+configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+        JsonSerializer.class);
+return new DefaultKafkaProducerFactory<>(configProps);
+\end{lstlisting}
+
+Three lines --- and everything else is the Kafka~3.9 client default.
+Since Kafka~3.0 those defaults are the safe ones:
+
+\begin{lstlisting}[language=properties]
+acks=all
+enable.idempotence=true
+retries=2147483647
+max.in.flight.requests.per.connection=5
+delivery.timeout.ms=120000
+max.block.ms=60000
+linger.ms=0
+\end{lstlisting}
+
+Auth-service and notification-service use Spring Boot's auto-configured
+factory from the YAML, which sets the same two serializers and nothing
+else, so all three producers behave alike.
+
+\begin{description}
+  \item[\co{1}] The key serializer matters more than it looks. Every
+  publisher in the project passes a key: \code{event.userId()} in
+  \code{UserRegisteredPublisher} and \code{UserActivatedPublisher},
+  \code{assignmentId} in \code{AssignmentCreatedPublisher}. Kafka hashes
+  the key to choose a partition; equal keys, equal partition, and the
+  broker preserves order within a partition. That is the entire
+  per-user ordering guarantee, and it is one string.
+\end{description}
+
+What the defaults mean, one at a time:
+
+\begin{itemize}
+  \item \textbf{\code{acks=all}}: the leader waits for every in-sync
+  replica before acknowledging. With \code{replicas: 1} in
+  \code{kafka-topics.yaml} and a single broker in Compose, ``all'' is
+  one --- durability equals one disk. In production this pairs with
+  \code{replication.factor=3} and \code{min.insync.replicas=2}: a
+  write survives one broker dying, and if two die the producer gets
+  \code{NotEnoughReplicas} rather than a silent single-copy write.
+  \item \textbf{Idempotent producer}: each producer gets an id and
+  numbers its messages per partition; a retry after a lost ack is
+  recognized by the broker and not appended twice. This closes the
+  \emph{producer-side} duplicate from Chapter~10. It does nothing for
+  the consumer side.
+  \item \textbf{\code{retries} unbounded, bounded by
+  \code{delivery.timeout.ms}}: the producer retries transient errors for
+  up to two minutes, then fails the future. \code{send()} returned long
+  ago; nobody in the project reads that future.
+\end{itemize}
+
+\begin{pitfall}[the YAML that does nothing]
+Symptom: you add \code{spring.kafka.producer.acks: 1} to
+\code{course-service.yml} to speed up a load test, and nothing changes.
+Cause: \code{KafkaProducerConfig} declares its own
+\code{ProducerFactory} bean, which switches off Boot's
+auto-configuration for that factory --- the YAML producer block is read
+by nobody in course-service. Auth-service, with no such bean,
+\emph{would} honour it. Two services, one YAML convention, two
+behaviours. Fix: delete the hand-written bean (Boot's factory does the
+same thing) or move every property into it; never both.
+\end{pitfall}
+
+\subsection{Consumer}
+
+The consumer YAML in \code{notification-service.yml} and
+\code{course-service.yml} names a group, \code{auto-offset-reset:
+earliest}, and the error-handling deserializers. Everything about
+\emph{committing} is again a default, this time Spring Kafka's:
+
+\begin{itemize}
+  \item \code{enable.auto.commit=false}. Spring switches the client's
+  own timer-based commit off and commits itself.
+  \item \code{AckMode.BATCH}. After the listener has returned for
+  \emph{every} record of one \code{poll()}, Spring commits the highest
+  offset of the batch. Processing and commit are separated by the
+  batch's processing time.
+  \item \code{DefaultErrorHandler} with \code{FixedBackOff(0, 9)}: a
+  listener that throws is retried nine more times with no delay, then
+  the record is \emph{logged and skipped}. Not sent anywhere. Not
+  counted anywhere the project reads.
+  \item \code{max.poll.records=500}, \code{max.poll.interval.ms=300000}:
+  a batch of up to 500 records must be fully processed within five
+  minutes or the consumer is presumed dead.
+\end{itemize}
+
+Put those four together and the project's position is: at-least-once,
+with duplicates possible on any crash or rebalance, and with silent loss
+after ten failed attempts. Neither the ordering nor the loss is written
+in any file you can \code{grep}.
+
+\section{Exactly when a duplicate happens}
+
+The timeline that produces one, with \code{notification-group} running
+two instances A and B on a topic with two partitions:
+
+\begin{lstlisting}
+t0   A polls partition 0, gets offsets 40..49   (committed: 40)
+t1   A processes 40..47: eight e-mails sent
+t2   A is killed (rolling update, OOMKilled, SIGKILL)
+     -- offset 40 is still the committed position --
+t3   group rebalances; partition 0 is assigned to B
+t4   B polls from the committed offset: 40
+t5   B processes 40..49: ten e-mails sent
+     -- users 40..47 receive their activation mail twice --
+\end{lstlisting}
+
+Nothing here is a bug. It is the contract: Kafka promises the offset
+will not advance past a record you did not finish; the price is that a
+record you \emph{did} finish, but did not commit, comes back. Every
+consumer that does anything non-reversible --- send mail, insert a row,
+charge a card --- must be written for \code{t5}.
+
+Two variants matter for this project. \code{AckMode.RECORD} commits
+after each record instead of each batch: fewer duplicates on a crash
+(one instead of up to 500), more commit round-trips. And the
+\emph{slow-consumer} variant needs no crash at all: if processing a
+batch takes longer than \code{max.poll.interval.ms}, the broker removes
+the consumer from the group, another instance takes the partition from
+the last commit, and \emph{both} end up processing the same records ---
+the first one has not noticed it was evicted yet.
+
+\begin{pitfall}[one assignment, a storm of duplicate e-mails]
+Symptom: a teacher creates an assignment in a course with 300 students;
+some students receive the notification three times; the consumer log
+shows \code{Member ... has left the group} and a rebalance. Cause:
+\code{AssignmentCreatedListener} loops over
+\code{enrolledStudentEmails} and calls \code{javaMailSender.send()} for
+each, synchronously, on the poll thread. At one second per SMTP
+round-trip, 300 e-mails is five minutes --- exactly
+\code{max.poll.interval.ms}. The consumer is evicted mid-loop, the
+partition is reassigned, and the new owner starts the loop again from
+the first student. Fix, in order of cost: raise
+\code{max.poll.interval.ms} (a patch), publish one
+\code{ts.notification.email} record per recipient so each mail is its
+own unit of work (the right shape), and make the send idempotent per
+recipient (Section~\ref{sec:enhancing-kafka}).
+\end{pitfall}
+
+\section{Pros and cons, candidly}
+
+\begin{center}
+\begin{tabular}{@{}p{0.28\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+ & The project today & Production baseline \\
+\midrule
+Producer durability & \code{acks=all}, 1 replica & 3 replicas, \code{min.insync}=2 \\
+Producer duplicates & none (idempotent) & none (idempotent) \\
+Consumer duplicates & possible, unhandled & possible, deduplicated \\
+Failed record & log and skip after 10 & retry topics, then DLT \\
+Ordering & per key, 1 partition & per key, N partitions \\
+Slow work & on the poll thread & fanned out, or async \\
+Observability & none on lag & lag alerts, DLT alerts \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The project's honest weak points: silent loss after ten retries; e-mail
+fan-out on the poll thread; no dedup where the side effect is not
+naturally idempotent (mail); no lag metric anyone looks at; and
+single-partition topics, which make ordering trivial and parallelism
+impossible.
+
+\section{Enhancing the resolution}
+\label{sec:enhancing-kafka}
+
+\subsection{An idempotent consumer with a record of what it has seen}
+
+\code{UserActivatedListener} is already idempotent by natural key --- a
+second delivery finds the student and returns. Where there is no
+natural key, record the event id. The outbox of Chapter~33 puts a
+unique \code{eventId} header on every message; the consumer keeps a
+table of ids it has finished, and writes that row \emph{in the same
+transaction} as the business change. Flyway
+\code{V3\_\_create\_processed\_events.sql} in course-service:
+
+\begin{lstlisting}[language=SQL]
+CREATE TABLE processed_events (
+    event_id     UUID PRIMARY KEY,
+    consumer     VARCHAR(64) NOT NULL,     -- listener name
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- retention: rows older than the topic's retention are useless
+CREATE INDEX idx_processed_events_at ON processed_events (processed_at);
+\end{lstlisting}
+
+The listener, rewritten to read the header and to claim the id first:
+
+\begin{lstlisting}[language=Java]
+@KafkaListener(topics = "ts.user.activated", groupId = "course-group")
+@Transactional                                              (*@\co{1}@*)
+public void onUserActivated(
+        UserActivatedEvent event,
+        @Header("eventId") String eventId) {
+
+    int claimed = jdbc.update("""
+        INSERT INTO processed_events (event_id, consumer)
+        VALUES (?::uuid, 'UserActivatedListener')
+        ON CONFLICT (event_id) DO NOTHING""", eventId);      (*@\co{2}@*)
+    if (claimed == 0) {
+        log.info("duplicate event {} ignored", eventId);
+        return;                                             (*@\co{3}@*)
+    }
+    if (!ROLE_STUDENT.equalsIgnoreCase(event.role())) {
+        return;
+    }
+    Long userId = Long.parseLong(event.userId());
+    Student student = studentRepository.findByUserId(userId)
+            .orElseGet(() -> Student.builder().userId(userId).build());
+    student.setFirstName(event.firstName());               (*@\co{4}@*)
+    student.setLastName(event.lastName());
+    student.setEmail(event.email());
+    studentRepository.save(student);
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] One database transaction around claim and change. If
+  \code{save()} fails, the claim rolls back too, and the retry can claim
+  again. If the JVM dies after commit but before the Kafka offset
+  commit, the redelivery hits \co{3}.
+  \item[\co{2}] \code{ON CONFLICT DO NOTHING} is the whole dedup
+  algorithm: an atomic insert-if-absent. No read-then-write race between
+  two consumer instances that got the same record after a rebalance.
+  \item[\co{3}] Return normally, not by throwing: the offset must
+  advance past a duplicate.
+  \item[\co{4}] While here, upsert instead of insert-if-missing, so the
+  same listener also serves the \code{ts.user.updated} event Chapter~33
+  adds.
+\end{description}
+
+Notification-service has no database, and mail is the one side effect
+you cannot un-send. Options, honest about cost: accept an occasional
+duplicate mail (what the project implicitly does); or give the service a
+tiny store --- Redis \code{SET eventId 1 NX EX 604800} before sending,
+which is the same claim in one command; or make the mail itself
+idempotent by including the event id in a \code{Message-ID} header, so
+a mailbox de-duplicates what the consumer could not.
+
+\subsection{Retry topics and a dead-letter topic}
+
+Replace ``retry ten times in a millisecond, then forget'' with retries
+that wait, and a destination for what still fails. Spring Kafka's
+\code{@RetryableTopic} does this with topics instead of threads, so a
+stuck record does not block the partition behind it:
+
+\begin{lstlisting}[language=Java]
+@RetryableTopic(
+        attempts = "4",                                     (*@\co{1}@*)
+        backoff = @Backoff(delay = 2_000, multiplier = 3),  (*@\co{2}@*)
+        include = { MailSendException.class,
+                    MailAuthenticationException.class },    (*@\co{3}@*)
+        dltStrategy = DltStrategy.FAIL_ON_ERROR)
+@KafkaListener(topics = "ts.user.registered",
+               groupId = "notification-group")
+public void onUserRegistered(UserRegisteredEvent event) {
+    emailService.sendActivationEmail(
+            event.email(), event.firstName(), event.activationCode());
+}
+
+@DltHandler                                                 (*@\co{4}@*)
+public void onDeadLetter(UserRegisteredEvent event,
+        @Header(KafkaHeaders.EXCEPTION_MESSAGE) String reason,
+        @Header(KafkaHeaders.ORIGINAL_OFFSET) long offset) {
+    log.error("DLT ts.user.registered offset={} user={} reason={}",
+            offset, event.userId(), reason);
+    meter.counter("kafka.dlt", "topic", "ts.user.registered")
+         .increment();                                      (*@\co{5}@*)
+}
+\end{lstlisting}
+
+\begin{description}
+  \item[\co{1}] One try on the main topic, three on retry topics.
+  \item[\co{2}] Delays of 2, 6, and 18 seconds --- about half a minute
+  for MailDev or an SMTP relay to come back. Spring creates the topics
+  \code{ts.user.registered-retry-2000}, \code{-retry-6000},
+  \code{-retry-18000} and \code{ts.user.registered-dlt}; under Strimzi
+  (Chapter~25) declare them as \code{KafkaTopic} objects or leave
+  auto-creation on.
+  \item[\co{3}] Retry only what a wait can fix. A deserialization
+  failure or a \code{NullPointerException} goes straight to the DLT;
+  retrying it three times is theatre.
+  \item[\co{4}] The dead-letter handler is a normal listener on the
+  \code{-dlt} topic. It \emph{must not} throw.
+  \item[\co{5}] A counter, so that ``DLT non-empty'' is an alert
+  (Chapter~27's observability) instead of a discovery.
+\end{description}
+
+What to do with a dead letter is an operational decision, not code: an
+alert fires; someone reads the \code{EXCEPTION\_MESSAGE} header; the fix
+ships; and the records are \emph{replayed} --- copied from the DLT back
+to the main topic with a small admin tool or Kafka UI --- where the
+idempotent consumer guarantees the ones that did succeed are ignored.
+
+\begin{handson}[see the retry ladder and the dead letter]
+Break SMTP, register a user, and read the topics:
+\begin{lstlisting}[language=bash]
+$ docker compose stop maildev
+$ curl -s -X POST localhost:8080/api/auth/register -H \
+  'Content-Type: application/json' -d '{"email":"dlt@test.io", \
+  "password":"Passw0rd!","firstName":"D","lastName":"L", \
+  "activationMethod":"EMAIL"}'
+$ docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:19092 --list | grep registered
+ts.user.registered
+ts.user.registered-dlt
+ts.user.registered-retry-18000
+ts.user.registered-retry-2000
+ts.user.registered-retry-6000
+\end{lstlisting}
+About 26 seconds after the request, notification-service logs
+\code{DLT ts.user.registered offset=0 user=... reason=Mail server
+connection failed}. Start MailDev again, copy the record from the DLT to
+\code{ts.user.registered} in Kafka UI (\code{localhost:9090}), and the
+activation mail arrives.
+\end{handson}
+
+\subsection{Exactly-once, and what it does not cover}
+
+Kafka's transactions give exactly-once for one specific shape:
+consume from topic A, produce to topic B, commit both offsets and
+output atomically (\code{isolation.level=read\_committed} on the reader).
+Stream processors need it; the project has no such stage. Transactions
+do \emph{not} span Kafka and Postgres, or Kafka and SMTP --- the moment
+the side effect leaves the broker, you are back to at-least-once plus
+idempotency. An interviewer who asks ``can you get exactly-once?''
+wants exactly that distinction: yes inside Kafka, no across systems,
+and the outbox plus a dedup table is how you get the effect across
+systems anyway.
+
+\section{What breaks at 3\,a.m.}
+
+\begin{itemize}
+  \item \textbf{notification-service down for four hours.} Nothing is
+  lost: records accumulate on the topic, retention is 168 hours in
+  Compose and Strimzi's default seven days. Consumer lag ---
+  the gap between the partition's last offset and the group's committed
+  offset --- grows to a few thousand. On restart the service drains them
+  at SMTP speed; every activation mail is late, none is missing. What
+  \emph{would} lose them: an outage longer than retention, or a
+  redeploy under a \emph{new} group id, which starts from
+  \code{earliest} and resends every mail in seven days of history.
+  \item \textbf{The broker is down.} Producers block for
+  \code{max.block.ms} on their first metadata fetch, then throw --- the
+  sixty-second registration failure of Chapter~33. Producers that were
+  already connected buffer up to \code{buffer.memory} (32\,MB) and retry
+  within \code{delivery.timeout.ms}; after two minutes the future fails
+  and, since nobody reads it, the event is gone. Consumers simply poll
+  nothing. The outbox converts all of this into a growing
+  \code{attempts} column.
+  \item \textbf{A replay from yesterday.} An operator resets
+  \code{course-group} to a timestamp with
+  \code{kafka-consumer-groups.sh --reset-offsets --to-datetime}. Every
+  event since then is redelivered; with the \code{processed\_events}
+  claim each one costs one failed insert. Without it, mail goes out
+  twice and student rows are attempted twice (saved only by the
+  \code{UNIQUE(user\_id)} constraint).
+  \item \textbf{A hot key.} Every event for one very large course lands
+  on one partition; adding partitions does not help because the key
+  chooses the partition. Re-key --- by recipient instead of by
+  assignment --- or accept that one key's throughput is one consumer's
+  throughput.
+\end{itemize}
+
+\section{Outside the project}
+
+Every managed Kafka --- Confluent Cloud, AWS MSK, Aiven --- ships
+\code{acks=all}, three replicas, and \code{min.insync.replicas=2} as the
+starting point, and sells lag dashboards as the first thing you look at.
+Retry topics and DLTs are so standard that Confluent's Parallel
+Consumer, Uber's consumer proxy, and Spring's \code{@RetryableTopic}
+all implement the same ladder; the differences are in how they preserve
+per-key ordering across retries (Spring does not, by default --- a
+retried record can be processed after a later one for the same key,
+which is fine for mail and not for ledger entries). RabbitMQ and SQS
+give you per-message acknowledgement and a dead-letter queue as a broker
+feature rather than a library pattern; what they cannot give you is
+replay, which is the reason a log was chosen in the first place.
+
+\section{Questions from real interviews}
+
+\subsection*{Q: How do you increase the number of messages Kafka can handle per unit of time?}
+
+I start with the consumer, because that is where the project's limit
+is. Partitions are the unit of parallelism: a group cannot have more
+active consumers than the topic has partitions, and every topic in
+\code{kafka-topics.yaml} has one. So the first change is partition
+count --- 6 or 12, chosen with headroom because partitions can be added
+but never removed, and adding them later changes the key-to-partition
+hash, which breaks per-key ordering for in-flight data. Then match
+consumers to partitions: \code{spring.kafka.listener.concurrency=3} per
+pod times two replicas gives six threads over six partitions. Next,
+get slow work off the poll thread: one \code{AssignmentCreated} that
+sends 300 e-mails synchronously is a five-minute batch that trips
+\code{max.poll.interval.ms}; publish one record per recipient instead,
+so throughput scales with partitions. On the producer, batching:
+\code{linger.ms=5--20} and \code{batch.size=64--256\,KB} let the client
+send hundreds of records per request, and
+\code{compression.type=lz4} or \code{zstd} cuts bytes on the wire by
+three to five times for JSON. \code{acks=1} roughly doubles producer
+throughput at the cost of losing a write when the leader dies before
+replicating --- I keep \code{acks=all} for anything I cannot
+regenerate. On the consumer, \code{max.poll.records} and
+\code{fetch.min.bytes} trade latency for fewer round-trips, bounded by
+what fits in \code{max.poll.interval.ms}. And I watch for a hot key:
+if one partition carries 80\,\% of the load because of a bad key
+choice, none of the above helps and the fix is a different key.
+
+\subsection*{Q: Consumer lag is growing. How do you diagnose it?}
+
+First I establish which of three things it is: the consumer is slow,
+the consumer is dead, or the producer got faster. \code{kafka-consumer-
+groups.sh --describe --group notification-group} shows lag per
+partition and which member owns each; lag on \emph{all} partitions with
+members present means slow processing; lag on \emph{some} with missing
+members means an instance is down or stuck in rebalance; lag that
+appeared at a clear time with steady consumption means a producer
+burst. For slow processing I look at the listener's per-record time
+--- in this project SMTP latency --- and at rebalance churn in the logs
+(\code{Member ... has left}), which means \code{max.poll.interval.ms} is
+being hit and the group is thrashing. Fixes follow the diagnosis: more
+partitions and concurrency, move the slow call off the thread, or,
+if the burst is legitimate, let it drain and alert only when lag is
+older than the SLO in seconds, not larger than a number of records. The
+metric to graph is lag in \emph{time}, not count.
+
+\subsection*{Q: A message was processed twice. Why, and how do you make that safe?}
+
+Because Kafka commits offsets after processing, and the process died,
+or was evicted for being slow, between the two. That is at-least-once
+working as designed. Making it safe means every consumer either has a
+natural idempotency key --- \code{UserActivatedListener}'s
+\code{findByUserId} --- or claims a unique event id in the same
+transaction as its side effect: \code{INSERT ... ON CONFLICT DO
+NOTHING} into \code{processed\_events}, return if zero rows. The id has
+to come from the producer, minted once and carried through retries,
+which is what the outbox row gives you. For side effects with no
+transaction --- e-mail --- I put the id in the message's
+\code{Message-ID} or claim it in Redis with \code{SET NX}. What I do
+not do is switch to \code{AckMode.RECORD} and call it fixed; that
+narrows the window from a batch to one record and leaves the bug in
+place.
+
+\subsection*{Q: How do you guarantee ordering for one user?}
+
+Key every event about that user by the user id, so the hash puts them
+on one partition, and keep one consumer thread per partition. That is
+the whole guarantee, and it has three ways to break: an idempotent
+producer disabled with \code{max.in.flight} above one, which lets a
+retried batch land after a later one; a partition count change, which
+re-hashes keys; and retry topics, which re-inject a failed record
+behind its successors. For the project, \code{userId} keys on
+\code{ts.user.*} already do this. If the business needs a stronger
+statement --- ``the update is applied after the create, always'' --- I
+add a version number to the event and have the consumer reject anything
+older than what it has, which is what turns ordering from a broker
+property into a consumer invariant.
+
+\subsection*{Q: A broker dies. What does the producer do?}
+
+With three brokers and \code{replication.factor=3}, the controller
+elects a new leader from the in-sync replicas for each affected
+partition within seconds; the producer gets
+\code{NotLeaderOrFollower}, refreshes metadata, and retries ---
+invisible to the application because \code{retries} is unbounded and
+\code{delivery.timeout.ms} is two minutes. If the dead broker took the
+ISR below \code{min.insync.replicas}, the producer gets
+\code{NotEnoughReplicas} and keeps retrying; with \code{acks=all} that
+is the correct refusal to write a single copy. On the project's
+single-broker Compose stack there is no failover: sends buffer, the
+future fails after two minutes, and the outbox row is what saves the
+event. The one thing I check in a review is whether anyone reads the
+future --- in this project nobody does, so a producer-side failure is
+silent.
+
+\subsection*{Q: How do you replay a topic from yesterday?}
+
+Stop the consumer group, reset its offsets, start it again:
+\code{kafka-consumer-groups.sh --reset-offsets --group course-group
+--topic ts.user.activated --to-datetime 2026-09-06T00:00:00.000
+--execute}. The group must be inactive or the command refuses. Before
+running it I answer two questions: is the consumer idempotent for
+everything since that time --- because every record comes back --- and
+is the data still there, which depends on retention (\code{168h} here)
+and on whether the topic is compacted. For a single record I replay
+from the DLT instead of resetting the whole group. And I never replay
+into a group that sends e-mail without first confirming the dedup path,
+because ``we resent 40\,000 activation mails'' is the incident that
+follows a confident reset.
+
+\begin{quiz}
+\begin{enumerate}
+  \item Name the producer settings that make the project's producers
+  idempotent and durable, and explain why \code{acks=all} on the Compose
+  stack is weaker than it sounds.
+  \item Draw (in words) the timeline in which \code{notification-group}
+  sends the same activation mail twice without any crash, and name the
+  setting whose value defines the trigger.
+  \item Why must the \code{processed\_events} insert and the business
+  write share one transaction? Describe the interleaving that goes
+  wrong if the insert commits first on its own.
+  \item In the \code{@RetryableTopic} configuration, explain why
+  \code{include} lists only mail exceptions and what happens to a
+  \code{NullPointerException}.
+  \item Course-service declares its own \code{ProducerFactory} bean.
+  State the consequence for the \code{spring.kafka.producer} block in
+  its YAML, and the one-line fix.
+  \item Notification-service has been down for nine days. State what
+  happens on restart, which setting decides it, and what would be
+  different if it restarted with \code{group-id: notification-v2}.
+\end{enumerate}
+\end{quiz}
