@@ -1,0 +1,44 @@
+# Garage configuration for TeacherSupporter (single node, dev + homelab).
+# Reference: https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/
+#
+# Garage replaces MinIO (community edition archived in early 2026). course-service
+# talks plain S3 to it through the AWS SDK; nothing in the Java code knows which
+# backend answers. See docs/MIGRATION-GARAGE.md.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+
+# sqlite: zero tuning, portable files, fine for one node with a few GB.
+# lmdb (the default) is faster but memory-maps the whole DB; overkill here.
+db_engine = "sqlite"
+
+# One node, one copy. Raise only when there is more than one node to copy to;
+# Garage refuses a factor larger than the node count.
+replication_factor = 1
+
+# Inter-node RPC. Also used by the `garage` CLI to reach the daemon, so the
+# public address must resolve from wherever the CLI runs (compose network).
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "garage:3901"
+# DEV ONLY. Shared secret between nodes and the CLI; 32 random bytes as hex.
+# Regenerate with `openssl rand -hex 32` for anything reachable from outside.
+rpc_secret = "1799bccfd7411eddcf9ebd316bc1f5287ad12a68094e1c6ac6abde7e6feae1ec"
+
+[s3_api]
+# The S3 endpoint course-service and presigned URLs use (mapped to host :9000).
+api_bind_addr = "[::]:3900"
+# SigV4 signs the region into every request ("credential scope"). The AWS SDK
+# must be configured with exactly this value (APP_S3_REGION=garage) or Garage
+# answers 400 AuthorizationHeaderMalformed. There is no AWS involved; the
+# string is simply part of the signature.
+s3_region = "garage"
+# Path-style only (http://garage:3900/bucket/key). Setting root_domain would
+# enable vhost-style, which needs wildcard DNS -- not worth it here.
+
+[admin]
+# Admin API: /health (no token) for probes, /metrics for Prometheus, and the
+# management endpoints (token required).
+api_bind_addr = "[::]:3903"
+# DEV ONLY tokens. Regenerate with `openssl rand -base64 32`.
+admin_token = "ts-dev-admin-token-change-me"
+metrics_token = "ts-dev-metrics-token-change-me"

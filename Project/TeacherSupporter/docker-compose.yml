@@ -76,20 +76,38 @@ services:
       - "1080:1080"
       - "1025:1025"
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+  # S3-compatible object storage for submission files. Garage replaced MinIO
+  # (community edition archived in 2026 -- see docs/MIGRATION-GARAGE.md).
+  # course-service speaks plain S3 through the AWS SDK; only endpoint, region
+  # and credentials changed. Host port 9000 is kept so presigned URLs signed
+  # for http://localhost:9000 keep working unchanged.
+  garage:
+    # Pinned: Garage publishes semver tags; `latest` is not a tag here at all.
+    image: dxflrs/garage:v2.4.0
+    # --single-node: assign a one-node layout automatically on first start.
+    # --default-bucket: create GARAGE_DEFAULT_BUCKET and a key from the
+    # GARAGE_DEFAULT_* variables with read/write/owner on it (and permission
+    # to create further buckets), idempotently on every start. No init
+    # container, no `mc alias`, no console.
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    hostname: garage          # must match rpc_public_addr in garage.toml
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
+      - "9000:3900"   # S3 API (host :9000 -> Garage :3900)
+      - "9003:3903"   # Admin API: /health, /metrics (no console)
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      # DEV ONLY key pair, mirrored in config-server's course-service.yml.
+      # Garage key IDs are "GK" + 24 characters; secrets are 64 hex chars.
+      GARAGE_DEFAULT_ACCESS_KEY: GKts0000000000000000dev0
+      GARAGE_DEFAULT_SECRET_KEY: ts0000000000000000000000000000000000000000000000000000000000dev0
+      GARAGE_DEFAULT_BUCKET: ts-submissions
     volumes:
-      - minio-data:/data
+      - ./deploy/garage/garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # The image has no shell or curl; the CLI's `status` RPC is the probe.
+      test: ["CMD", "/garage", "-c", "/etc/garage.toml", "status"]
       interval: 10s
+      timeout: 5s
       retries: 5
 
   # ===== SPRING CLOUD =====
@@ -177,18 +195,22 @@ services:
         condition: service_healthy
       kafka:
         condition: service_started
-      minio:
-        condition: service_started
+      garage:
+        # S3StorageService's @PostConstruct calls headBucket at startup, so
+        # wait for Garage to answer RPC, not just for the container to exist.
+        condition: service_healthy
     environment:
       SPRING_CONFIG_IMPORT: configserver:http://config-server:8888
       EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-course:5432/ts_course
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
-      APP_S3_ENDPOINT: http://minio:9000
+      APP_S3_ENDPOINT: http://garage:3900
       APP_S3_PUBLIC_ENDPOINT: http://localhost:9000
-      APP_S3_ACCESS_KEY: minioadmin
-      APP_S3_SECRET_KEY: minioadmin
+      # Must equal s3_region in deploy/garage/garage.toml (SigV4 signs it).
+      APP_S3_REGION: garage
+      APP_S3_ACCESS_KEY: GKts0000000000000000dev0
+      APP_S3_SECRET_KEY: ts0000000000000000000000000000000000000000000000000000000000dev0
       JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5082"
 
   dictionary-service:
@@ -235,4 +257,4 @@ volumes:
   postgres-auth-data:
   postgres-course-data:
   mongo-data:
-  minio-data:
+  garage-data:

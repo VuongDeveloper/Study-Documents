@@ -13,8 +13,11 @@ set -euo pipefail
 NS="${NS:-ts}"
 PG_USER="${PG_USER:-postgres}"
 PG_PASSWORD="${PG_PASSWORD:-root}"
-MINIO_USER="${MINIO_USER:-minioadmin}"
-MINIO_PASSWORD="${MINIO_PASSWORD:-minioadmin}"
+# Garage (S3) key pair. Garage key IDs are "GK" + 24 chars, secrets 64 hex
+# chars; Garage's --default-bucket mode creates this key on start. Defaults
+# match docker-compose.yml / config-server so dev behaviour is unchanged.
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-GKts0000000000000000dev0}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-ts0000000000000000000000000000000000000000000000000000000000dev0}"
 # Default matches the fallback baked into config-server's api-gateway.yml /
 # auth-service.yml so dev behaviour is unchanged. Override in anything public.
 JWT_SECRET="${JWT_SECRET:-mySecretKeyThatIsAtLeast256BitsLongForHS256Algorithm123456}"
@@ -43,16 +46,16 @@ kubectl -n "$NS" create secret generic postgres-course-app \
   --from-literal=SPRING_DATASOURCE_PASSWORD="$PG_PASSWORD" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# --- minio, server side ---
-kubectl -n "$NS" create secret generic minio \
-  --from-literal=MINIO_ROOT_USER="$MINIO_USER" \
-  --from-literal=MINIO_ROOT_PASSWORD="$MINIO_PASSWORD" \
+# --- garage, server side (the key --default-bucket creates on start) ---
+kubectl -n "$NS" create secret generic garage \
+  --from-literal=GARAGE_DEFAULT_ACCESS_KEY="$S3_ACCESS_KEY" \
+  --from-literal=GARAGE_DEFAULT_SECRET_KEY="$S3_SECRET_KEY" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# --- minio, client side (course-service) ---
-kubectl -n "$NS" create secret generic minio-app \
-  --from-literal=APP_S3_ACCESS_KEY="$MINIO_USER" \
-  --from-literal=APP_S3_SECRET_KEY="$MINIO_PASSWORD" \
+# --- garage, client side (course-service) ---
+kubectl -n "$NS" create secret generic garage-app \
+  --from-literal=APP_S3_ACCESS_KEY="$S3_ACCESS_KEY" \
+  --from-literal=APP_S3_SECRET_KEY="$S3_SECRET_KEY" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # --- postgres-auth, server side ---

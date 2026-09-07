@@ -13,8 +13,18 @@ import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import java.net.URI;
 
 /**
- * S3 clients pointed at a MinIO endpoint. Path-style access is required because
- * MinIO does not support virtual-host-style bucket addressing by default.
+ * S3 clients pointed at a Garage endpoint (S3-compatible; replaced MinIO, see
+ * docs/MIGRATION-GARAGE.md). Nothing here is Garage-specific: the same beans
+ * work against MinIO or AWS S3 with different endpoint/region/credentials.
+ *
+ * <p>Path-style access ({@code http://host/bucket/key}) is required because
+ * virtual-host style ({@code http://bucket.host/key}) needs wildcard DNS for
+ * the endpoint, which neither Compose nor the homelab cluster provides.
+ *
+ * <p>The region is not an AWS region. SigV4 embeds it in the credential scope
+ * of every signature, and Garage rejects signatures whose region differs from
+ * its {@code s3_region} setting -- so {@code app.s3.region} must be
+ * {@code garage} to match {@code deploy/garage/garage.toml}.
  */
 @Configuration
 public class S3Config {

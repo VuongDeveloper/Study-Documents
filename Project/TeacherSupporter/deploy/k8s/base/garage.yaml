@@ -1,0 +1,151 @@
+# Garage: S3-compatible object storage for submission files (replaced MinIO,
+# whose community edition was archived in 2026 -- see docs/MIGRATION-GARAGE.md).
+#
+# Garage is a hard startup dependency for course-service: S3StorageService's
+# @PostConstruct calls headBucket and only catches NoSuchBucketException, so an
+# unreachable Garage fails bean creation. Kubernetes has no depends_on -- course
+# service will CrashLoopBackOff until this pod is serving, then recover.
+#
+# Single node, single copy (replication_factor = 1). Garage's --single-node
+# mode assigns the layout itself and --default-bucket creates the bucket and
+# the access key from environment variables on every start (idempotent), so
+# there is no init Job and no CLI ceremony. Multi-node Garage would instead use
+# a StatefulSet plus the kubernetes_discovery CRD (Garage cookbook).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+data:
+  # Keep in sync with deploy/garage/garage.toml (the Compose copy). Only
+  # rpc_public_addr and the tokens would differ in a real multi-node setup.
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+
+    rpc_bind_addr = "[::]:3901"
+    # Resolves through the `garage` Service below; used by `garage` CLI calls
+    # made with `kubectl exec` and by the healthcheck-style status RPC.
+    rpc_public_addr = "garage:3901"
+    # DEV value. Anything reachable from outside the cluster: move to a Secret
+    # (GARAGE_RPC_SECRET env var is honoured) and regenerate: openssl rand -hex 32
+    rpc_secret = "1799bccfd7411eddcf9ebd316bc1f5287ad12a68094e1c6ac6abde7e6feae1ec"
+
+    [s3_api]
+    api_bind_addr = "[::]:3900"
+    # SigV4 credential scope; APP_S3_REGION on course-service must be identical.
+    s3_region = "garage"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    admin_token = "ts-dev-admin-token-change-me"
+    metrics_token = "ts-dev-metrics-token-change-me"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garage
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # RWO volume: never two pods holding it at once
+  selector:
+    matchLabels: { app: garage }
+  template:
+    metadata:
+      labels: { app: garage }
+    spec:
+      # Garage's image runs as root by default and the data dir is a fresh
+      # PVC; the OpenShift-portability rule (arbitrary UID, group 0) applies
+      # here exactly as it did to MinIO -- see STACK-K3S-JENKINS.md.
+      containers:
+        - name: garage
+          # Pinned semver tag; Garage publishes no `latest`.
+          image: dxflrs/garage:v2.4.0
+          args: ["server", "--single-node", "--default-bucket"]
+          ports:
+            - { name: s3, containerPort: 3900 }
+            - { name: admin, containerPort: 3903 }
+          env:
+            - { name: GARAGE_DEFAULT_BUCKET, value: "ts-submissions" }
+          envFrom:
+            # GARAGE_DEFAULT_ACCESS_KEY / GARAGE_DEFAULT_SECRET_KEY
+            - secretRef: { name: garage }
+          volumeMounts:
+            - { name: config, mountPath: /etc/garage.toml, subPath: garage.toml, readOnly: true }
+            - { name: data, mountPath: /var/lib/garage }
+          # Admin API /health needs no token: 200 when the node has quorum
+          # (on one node: when it is up), 503 otherwise.
+          readinessProbe:
+            httpGet: { path: /health, port: admin }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: admin }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            # Garage idles around 30-60 MiB with sqlite; far below MinIO.
+            requests: { memory: 64Mi, cpu: 50m }
+            limits: { memory: 256Mi }
+      volumes:
+        - name: config
+          configMap: { name: garage-config }
+        - name: data
+          persistentVolumeClaim: { claimName: garage-data }
+---
+# New claim on purpose: MinIO's on-disk layout is not Garage's. Objects are
+# copied with `rclone sync` (MIGRATION-GARAGE.md), after which the old
+# `minio-data` PVC can be deleted by an admin.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: garage-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+spec:
+  selector: { app: garage }
+  ports:
+    - { name: s3, port: 3900, targetPort: 3900 }
+    - { name: rpc, port: 3901, targetPort: 3901 }
+    - { name: admin, port: 3903, targetPort: 3903 }
+---
+# Presigned download URLs are opened by the BROWSER, so the S3 endpoint they
+# are signed for must be reachable from outside the cluster. Before this
+# Ingress there was none, and course-service signed URLs for localhost:9000 --
+# broken on the cluster (book, ch. 35). SigV4 signs the Host header and the
+# path, so the proxy must not rewrite either: the bucket name itself is the
+# path prefix, forwarded untouched to Garage's path-style API. Traefik picks
+# the longest matching prefix, so /ts-submissions wins over the frontend's /.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garage-s3
+spec:
+  rules:
+    - host: ts.local
+      http:
+        paths:
+          - path: /ts-submissions
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port: { number: 3900 }
+    - host: ts-server.tailbfe002.ts.net
+      http:
+        paths:
+          - path: /ts-submissions
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port: { number: 3900 }

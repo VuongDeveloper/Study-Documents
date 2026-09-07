@@ -204,7 +204,7 @@ mvn clean package -DskipTests
 **Terminal 1 -- Infrastructure (bundled, rarely needs per-service debugging)**
 
 ```bash
-docker compose up postgres-auth postgres-course mongodb kafka kafka-ui zipkin maildev minio
+docker compose up postgres-auth postgres-course mongodb kafka kafka-ui zipkin maildev garage
 ```
 
 Wait until Postgres and Kafka are ready.

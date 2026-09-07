@@ -13,7 +13,7 @@ resources:
   - postgres-course.yaml
   - postgres-auth.yaml
   - mongodb.yaml
-  - minio.yaml
+  - garage.yaml
   # kafka.yaml requires the Strimzi operator (one-time admin step:
   # ../install-strimzi.sh) -- without its CRDs, apply fails on kind Kafka.
   - kafka.yaml
