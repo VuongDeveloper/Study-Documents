@@ -38,13 +38,19 @@ spring:
         spring.json.trusted.packages: com.ts.common.dto
 app:
   s3:
+    # Object storage is Alarik (S3-compatible; see docs/MIGRATION-ALARIK.md).
+    # Defaults target the docker-compose service published on host port 9000.
     endpoint: ${APP_S3_ENDPOINT:http://localhost:9000}
     # Browser-reachable endpoint used to sign download URLs. When the service runs
-    # inside Docker the internal endpoint is minio:9000, which a browser cannot resolve.
+    # inside Docker the internal endpoint is alarik:8080, which a browser cannot
+    # resolve -- and SigV4 signs the Host header, so the two must be signed apart.
     public-endpoint: ${APP_S3_PUBLIC_ENDPOINT:http://localhost:9000}
+    # Must equal ALARIK_REGION on the server: the region is part of the SigV4
+    # credential scope, and Alarik rejects a mismatch with HTTP 400.
     region: ${APP_S3_REGION:us-east-1}
-    access-key: ${APP_S3_ACCESS_KEY:minioadmin}
-    secret-key: ${APP_S3_SECRET_KEY:minioadmin}
+    # The key Alarik provisions from DEFAULT_ACCESS_KEY / DEFAULT_SECRET_KEY.
+    access-key: ${APP_S3_ACCESS_KEY:tsaccesskey}
+    secret-key: ${APP_S3_SECRET_KEY:tssecretkey123}
     bucket: ${APP_S3_BUCKET:ts-submissions}
     presigned-url-expiry-minutes: ${APP_S3_PRESIGNED_EXPIRY_MIN:15}
 resilience4j:

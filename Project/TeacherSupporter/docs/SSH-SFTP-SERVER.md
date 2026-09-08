@@ -599,7 +599,7 @@ public address.
 Useful for **operator tasks**: shipping the built React `dist/`, copying a `.env` onto the box,
 pulling database dumps off it.
 
-**Not** the right tool for application file storage. The stack already has MinIO for course
+**Not** the right tool for application file storage. The stack already has Alarik (S3-compatible object storage) for course
 materials (`DEPLOYMENT-ARCHITECTURE.md` §2), and that's the correct choice: the app gets an S3 API,
 presigned URLs, and bucket policies, none of which SFTP offers. Resist the temptation to have a
 Spring service shell out to SFTP — you'd be reimplementing object storage over a file protocol.

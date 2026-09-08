@@ -13,8 +13,11 @@ import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import java.net.URI;
 
 /**
- * S3 clients pointed at a MinIO endpoint. Path-style access is required because
- * MinIO does not support virtual-host-style bucket addressing by default.
+ * S3 clients pointed at an Alarik endpoint (S3-compatible; replaced MinIO, see
+ * docs/MIGRATION-ALARIK.md). Path-style access is required because a self-hosted
+ * store without wildcard DNS cannot resolve virtual-host-style bucket names.
+ * Nothing here is Alarik-specific: endpoint, region and credentials come from
+ * configuration, which is the whole point of coding against the S3 API.
  */
 @Configuration
 public class S3Config {

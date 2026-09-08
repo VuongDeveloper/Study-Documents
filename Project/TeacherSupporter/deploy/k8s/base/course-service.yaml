@@ -26,7 +26,14 @@ spec:
             - { name: SPRING_CONFIG_IMPORT, value: "configserver:http://config-server:8888" }
             - { name: EUREKA_CLIENT_SERVICEURL_DEFAULTZONE, value: "http://discovery-server:8761/eureka/" }
             - { name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://postgres-course:5432/ts_course" }
-            - { name: APP_S3_ENDPOINT, value: "http://minio:9000" }
+            # Alarik (S3-compatible) -- in-cluster address for uploads.
+            - { name: APP_S3_ENDPOINT, value: "http://alarik:8080" }
+            # Presigned download URLs are opened by the browser, so they are
+            # signed for the public host. alarik.yaml's Ingress routes
+            # /ts-submissions (the bucket) there unmodified, which is what
+            # keeps the SigV4 signature valid. Unset before this branch: every
+            # download link was signed for localhost:9000 and dead.
+            - { name: APP_S3_PUBLIC_ENDPOINT, value: "http://ts-server.tailbfe002.ts.net" }
 
             # Eureka on Kubernetes needs this or nothing can call anything.
             # By default a client registers its *hostname*, which inside a pod is
@@ -44,14 +51,14 @@ spec:
             - { name: JAVA_TOOL_OPTIONS, value: "-XX:MaxRAMPercentage=75.0" }
           envFrom:
             - secretRef: { name: postgres-course-app }
-            - secretRef: { name: minio-app }
+            - secretRef: { name: alarik-app }
 
           # ---- Health probes ---------------------------------------------------
           # No actuator in this service, so /actuator/health is a 404. The one
           # unauthenticated HTTP path that exists is springdoc's /v3/api-docs
           # (permitAll in SecurityConfig). It only answers 200 once the whole
           # Spring context is up -- which is AFTER Flyway has migrated and the
-          # MinIO bucket check has run. That makes it a true "ready" signal,
+          # S3 bucket check (Alarik) has run. That makes it a true "ready" signal,
           # unlike a tcpSocket check that passes as soon as Tomcat binds.
 
           # startupProbe: "give the JVM time to boot, then hand over."

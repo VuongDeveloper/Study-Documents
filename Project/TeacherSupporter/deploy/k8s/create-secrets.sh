@@ -13,8 +13,14 @@ set -euo pipefail
 NS="${NS:-ts}"
 PG_USER="${PG_USER:-postgres}"
 PG_PASSWORD="${PG_PASSWORD:-root}"
-MINIO_USER="${MINIO_USER:-minioadmin}"
-MINIO_PASSWORD="${MINIO_PASSWORD:-minioadmin}"
+# Alarik (S3-compatible object store; replaced MinIO -- docs/MIGRATION-ALARIK.md).
+# Two credential pairs: the console login, and the S3 access key that Alarik
+# provisions on first start and course-service authenticates with.
+ALARIK_ADMIN_USERNAME="${ALARIK_ADMIN_USERNAME:-alarik}"
+ALARIK_ADMIN_PASSWORD="${ALARIK_ADMIN_PASSWORD:-alarikadmin}"
+ALARIK_JWT="${ALARIK_JWT:-change-me-alarik-console-jwt-secret}"
+ALARIK_ACCESS_KEY="${ALARIK_ACCESS_KEY:-tsaccesskey}"
+ALARIK_SECRET_KEY="${ALARIK_SECRET_KEY:-tssecretkey123}"
 # Default matches the fallback baked into config-server's api-gateway.yml /
 # auth-service.yml so dev behaviour is unchanged. Override in anything public.
 JWT_SECRET="${JWT_SECRET:-mySecretKeyThatIsAtLeast256BitsLongForHS256Algorithm123456}"
@@ -43,16 +49,22 @@ kubectl -n "$NS" create secret generic postgres-course-app \
   --from-literal=SPRING_DATASOURCE_PASSWORD="$PG_PASSWORD" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# --- minio, server side ---
-kubectl -n "$NS" create secret generic minio \
-  --from-literal=MINIO_ROOT_USER="$MINIO_USER" \
-  --from-literal=MINIO_ROOT_PASSWORD="$MINIO_PASSWORD" \
+# --- alarik, server side ---
+# DEFAULT_ACCESS_KEY / DEFAULT_SECRET_KEY are honoured on FIRST start only
+# (the key is persisted under /app/Storage); rotating them later means
+# creating a new key in the console and updating alarik-app.
+kubectl -n "$NS" create secret generic alarik \
+  --from-literal=ADMIN_USERNAME="$ALARIK_ADMIN_USERNAME" \
+  --from-literal=ADMIN_PASSWORD="$ALARIK_ADMIN_PASSWORD" \
+  --from-literal=JWT="$ALARIK_JWT" \
+  --from-literal=DEFAULT_ACCESS_KEY="$ALARIK_ACCESS_KEY" \
+  --from-literal=DEFAULT_SECRET_KEY="$ALARIK_SECRET_KEY" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# --- minio, client side (course-service) ---
-kubectl -n "$NS" create secret generic minio-app \
-  --from-literal=APP_S3_ACCESS_KEY="$MINIO_USER" \
-  --from-literal=APP_S3_SECRET_KEY="$MINIO_PASSWORD" \
+# --- alarik, client side (course-service) ---
+kubectl -n "$NS" create secret generic alarik-app \
+  --from-literal=APP_S3_ACCESS_KEY="$ALARIK_ACCESS_KEY" \
+  --from-literal=APP_S3_SECRET_KEY="$ALARIK_SECRET_KEY" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # --- postgres-auth, server side ---

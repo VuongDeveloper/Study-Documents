@@ -331,7 +331,7 @@ sudo cloudflared service install   # runs at boot
 
 Two consequences specific to this stack:
 
-- **Cloudflare's free tier caps request bodies at ~100 MB.** Course-material uploads to MinIO above
+- **Cloudflare's free tier caps request bodies at ~100 MB.** Course-material uploads to Alarik (object storage) above
   that will fail at the edge, not in your app.
 - **Caddy no longer needs Let's Encrypt** — Cloudflare provides the public certificate. Keep Caddy
   for routing (`/api/*`, `/files/*`, SPA fallback) and let it serve plain HTTP on :80 behind the

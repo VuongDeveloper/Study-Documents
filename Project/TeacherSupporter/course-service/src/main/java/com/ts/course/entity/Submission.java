@@ -35,7 +35,7 @@ public class Submission {
     @Column(name = "link_url", length = 500)
     private String linkUrl;
 
-    /** Object key in MinIO/S3; null when no file was uploaded. */
+    /** Object key in the S3-compatible store (Alarik); null when no file was uploaded. */
     @Column(name = "file_object_key", length = 500)
     private String fileObjectKey;
 

@@ -321,7 +321,7 @@ Never edit `docker-compose.yml` for prod; layer an override. It must:
    other by service name on the compose network (`postgres-auth:5432`, `kafka:19092`) — host port
    mappings exist only for local dev convenience.
 3. **Real secrets** from a server-side `.env` (`chmod 600 .env`, never committed):
-   `POSTGRES_PASSWORD`, MinIO credentials, `GOOGLE_CLIENT_ID/SECRET`, JWT signing key.
+   `POSTGRES_PASSWORD`, Alarik credentials, `GOOGLE_CLIENT_ID/SECRET`, JWT signing key.
 4. `restart: unless-stopped` everywhere.
 5. Cap each JVM: `JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=25.0"` plus compose `mem_limit` so one
    leaky service can't starve the box.
@@ -337,14 +337,14 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ### 4.4 App-specific fixups
 
 - **`APP_S3_PUBLIC_ENDPOINT`** currently `http://localhost:9000` — must become a public URL,
-  because presigned URLs are opened by the *browser*. Route `https://<domain>/files/*` → `minio:9000`
+  because presigned URLs are opened by the *browser*. Route `https://<domain>/ts-submissions/*` → `alarik:8080` (the bucket name, unstripped -- SigV4 signs the path)
   through the reverse proxy.
 - **Google OAuth**: add `https://<domain>/...` redirect URIs in Google Cloud Console; `localhost`
   URIs won't work from the internet.
 - **MailDev** accepts and displays all mail with zero auth. Either keep it unpublished (view via
   SSH tunnel) or switch `SPRING_MAIL_HOST` to a real free SMTP relay (Brevo free tier / Gmail app
   password).
-- **Kafka UI / Zipkin / MinIO console / Eureka dashboard**: never publish; use SSH tunnels (§5.4).
+- **Kafka UI / Zipkin / Alarik console / Eureka dashboard**: never publish; use SSH tunnels (§5.4).
 
 ---
 
@@ -377,8 +377,8 @@ yourdomain.com {
     handle /api/* {
         reverse_proxy api-gateway:8080
     }
-    handle /files/* {
-        reverse_proxy minio:9000
+    handle /ts-submissions/* {
+        reverse_proxy alarik:8080
     }
     handle {
         root * /srv
@@ -400,7 +400,7 @@ npm ci && npm run build      # output: dist/ -> copy to server as frontend-dist/
 Point the axios base URL at `/api` (relative) instead of `http://localhost:8080` — same origin,
 which also ends most CORS pain.
 
-### 5.4 Reaching internal UIs (Eureka, Kafka UI, Zipkin, MinIO, MailDev)
+### 5.4 Reaching internal UIs (Eureka, Kafka UI, Zipkin, Alarik, MailDev)
 
 Never expose them. From your Windows machine:
 

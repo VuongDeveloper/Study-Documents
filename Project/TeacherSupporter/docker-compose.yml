@@ -76,21 +76,56 @@ services:
       - "1080:1080"
       - "1025:1025"
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+  # ===== OBJECT STORAGE: Alarik (replaces MinIO, see docs/MIGRATION-ALARIK.md) =====
+  # S3-compatible store written in Swift (Apache 2.0). Pinned to a beta tag on
+  # purpose: the project is pre-1.0 and `latest` moves between incompatible
+  # betas. Host port 9000 is kept so nothing else in the stack changes.
+  alarik:
+    image: ghcr.io/achtungsoftware/alarik:1.0.0-beta-16
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
+      - "9000:8080"   # S3 API + internal admin API (/api/v1/*)
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      # URL the API prints in responses; must be the address clients use.
+      API_BASE_URL: http://localhost:9000
+      CONSOLE_BASE_URL: http://localhost:9001
+      # Console login (web UI on :9001). Not the S3 credentials.
+      ADMIN_USERNAME: ${ALARIK_ADMIN_USERNAME:-alarik}
+      ADMIN_PASSWORD: ${ALARIK_ADMIN_PASSWORD:-alarikadmin}
+      # Signs console session tokens. Override in anything public.
+      JWT: ${ALARIK_JWT:-change-me-alarik-console-jwt-secret}
+      # SigV4 credential scope: clients MUST sign for this exact region
+      # (a mismatch is rejected with HTTP 400). Matches app.s3.region.
+      ALARIK_REGION: us-east-1
+      # S3 access key provisioned for the admin account on first start --
+      # this is what course-service authenticates with (APP_S3_ACCESS_KEY).
+      DEFAULT_ACCESS_KEY: ${ALARIK_ACCESS_KEY:-tsaccesskey}
+      DEFAULT_SECRET_KEY: ${ALARIK_SECRET_KEY:-tssecretkey123}
+      # Created at startup, so course-service's headBucket succeeds on the
+      # first boot (its createBucket fallback still works if this is removed).
+      DEFAULT_BUCKETS: ts-submissions
+      ALLOW_ACCOUNT_CREATION: "false"
+      ALARIK_FSYNC: "true"
     volumes:
-      - minio-data:/data
+      - alarik-data:/app/Storage
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # Unauthenticated liveness endpoint of the internal API; verified 200.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/health"]
       interval: 10s
       retries: 5
+
+  # Web console (buckets, keys, users). Optional -- the app never talks to it.
+  # Reaches the API from the BROWSER, hence localhost:9000, not alarik:8080.
+  alarik-console:
+    image: ghcr.io/achtungsoftware/alarik-console:1.0.0-beta-16
+    ports:
+      - "9001:3000"
+    environment:
+      NUXT_PUBLIC_API_BASE_URL: http://localhost:9000
+      NUXT_PUBLIC_CONSOLE_BASE_URL: http://localhost:9001
+      NUXT_PUBLIC_ALLOW_ACCOUNT_CREATION: "false"
+    depends_on:
+      alarik:
+        condition: service_healthy
 
   # ===== SPRING CLOUD =====
   config-server:
@@ -177,18 +212,21 @@ services:
         condition: service_healthy
       kafka:
         condition: service_started
-      minio:
-        condition: service_started
+      alarik:
+        condition: service_healthy
     environment:
       SPRING_CONFIG_IMPORT: configserver:http://config-server:8888
       EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-server:8761/eureka/
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-course:5432/ts_course
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
       MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
-      APP_S3_ENDPOINT: http://minio:9000
+      # Alarik listens on 8080 inside the container; 9000 is the host mapping.
+      APP_S3_ENDPOINT: http://alarik:8080
+      # Presigned URLs are opened by the browser, so they are signed for the
+      # host-visible address. SigV4 binds the signature to the Host header.
       APP_S3_PUBLIC_ENDPOINT: http://localhost:9000
-      APP_S3_ACCESS_KEY: minioadmin
-      APP_S3_SECRET_KEY: minioadmin
+      APP_S3_ACCESS_KEY: ${ALARIK_ACCESS_KEY:-tsaccesskey}
+      APP_S3_SECRET_KEY: ${ALARIK_SECRET_KEY:-tssecretkey123}
       JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5082"
 
   dictionary-service:
@@ -235,4 +273,4 @@ volumes:
   postgres-auth-data:
   postgres-course-data:
   mongo-data:
-  minio-data:
+  alarik-data:
